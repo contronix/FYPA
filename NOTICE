@@ -1,0 +1,50 @@
+FYPA — IR-drop and current-density viewer for Altium PCB designs
+Copyright (C) 2025 CuTree Designs
+
+Licensed under the GNU Affero General Public License, version 3 or later.
+See LICENSE for the full text.
+
+================================================================================
+Third-party components
+================================================================================
+
+This project incorporates code from the following upstream projects. Each is
+acknowledged below with its origin, license, and (where applicable) a summary
+of modifications. Their licenses are reproduced inside the respective
+subdirectories where relevant.
+
+--------------------------------------------------------------------------------
+padne — PCB power-delivery-network FEM solver
+--------------------------------------------------------------------------------
+* Upstream: https://github.com/atx/padne
+* License:  GNU General Public License v3.0
+* Used by:  pdnsolver/ (modified fork, vendored)
+* Status:   Modified fork. See pdnsolver/CHANGES.md for the full list of
+            changes relative to upstream and pdnsolver/LICENSE.upstream for
+            the upstream GPL-3.0 text. Notable modifications include porting
+            the mesher from CGAL to the `triangle` PyPI package, replacing
+            PEP 695 generics with TypeVar/Generic for Python 3.11
+            compatibility, and adding orphan-vertex guards in the Laplace
+            solver.
+
+--------------------------------------------------------------------------------
+altium_monkey — Altium PCB project parser
+--------------------------------------------------------------------------------
+* Upstream: https://github.com/wavenumber-eng/altium_monkey
+* License:  GNU Affero General Public License v3.0
+* Used by:  altium_extract.py (imported as a Python dependency)
+* Status:   Unmodified. Linked in as a git submodule at altium_monkey/. To
+            initialise the submodule after cloning, run:
+                git submodule update --init --recursive
+
+================================================================================
+License compatibility
+================================================================================
+
+altium_monkey is licensed under the GNU Affero General Public License v3.0
+(AGPL-3.0). Because FYPA links to altium_monkey at runtime, the combined
+work must also be distributed under AGPL-3.0 or a compatible license. This
+project chooses AGPL-3.0.
+
+The vendored padne fork (pdnsolver/) is GPL-3.0; AGPL-3.0 is compatible with
+GPL-3.0 for the purposes of combining the two within a single work.

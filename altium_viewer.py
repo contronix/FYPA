@@ -1,0 +1,11888 @@
+"""Custom-OpenGL PDN solution viewer for FYPA.
+
+This is the user-facing visualisation layer. The heatmap canvas is a
+purpose-built :class:`gl_mesh_viewer.GLMeshViewer` (a ``QOpenGLWidget``
+subclass) that renders the FEM triangle mesh directly on the GPU via
+shaders — colours interpolate per-vertex through a 1-D LUT texture, and
+pan / zoom are single matrix-uniform updates. No rasterise step, no
+texture re-upload, always pixel-sharp at any zoom level.
+
+Layout
+------
+* Side panel (left): **Physical layers** eye-icon list (Top/Bottom/...),
+  **Rails** eye-icon list (active PDN nets only — tick one or more at once),
+  **Mode** dropdown (Voltage / Voltage Drop / Current Density / Power Density),
+  display checkboxes, summary stats, and a :class:`ScaleController`
+  (colour scheme, linear/log, Min/Max entry boxes).
+* Plot area (right): :class:`gl_mesh_viewer.GLMeshViewer` rendering the
+  mesh natively in OpenGL plus QPainter overlays for the title chip,
+  legend chip, and directive-pin markers, with the heatmap colour-scale
+  strip (:class:`_GradientBar` — gradient, draggable Min/Max handles,
+  value ticks) overlaid on the bottom-left corner. A probe label across
+  the bottom shows x / y / value / net under cursor.
+
+The viewer reads :class:`pdnsolver.solver.Solution` objects produced by
+``FYPA.py solve``. Each padne ``Layer`` in the solution is expected
+to be named ``"<physical>|<rail>"`` (the convention
+:func:`altium_geometry.build_per_net_geometry_layers` follows). Layers
+without a ``|`` still work — they appear with a ``(none)`` rail.
+"""
+from __future__ import annotations
+
+import contextlib
+import logging
+import math
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+import matplotlib
+import matplotlib.cm as _mpl_cm
+import numpy as np
+import shapely.geometry as _sg
+import shapely.prepared as _sp
+
+from gl_mesh_viewer import GLMeshViewer, MarkerGroup, _install_default_surface_format
+
+
+# Application icon — shown in the title bar AND Windows taskbar.
+#
+# Two source files live in ``assets/``: ``icon.svg`` (master, scalable)
+# and ``icon.ico`` (pre-rendered multi-resolution Windows-native, built
+# from the SVG by ``tools/build_icon_ico.py``). We prefer the .ico on
+# Windows because Qt's setWindowIcon → WM_SETICON path uses native
+# Windows icon resources to populate the taskbar; an SVG-derived
+# QPixmap doesn't always make that round-trip reliably.
+_ICON_DIR: Path = Path(__file__).parent / "assets"
+_ICON_PATH_ICO: Path = _ICON_DIR / "icon.ico"
+_ICON_PATH_SVG: Path = _ICON_DIR / "icon.svg"
+# Title-bar variant — text-only "FYPA" wordmark. Used as ICON_SMALL so the
+# title bar shows the wordmark while the taskbar (ICON_BIG) keeps the
+# full fang logo. Optional: if missing we fall back to icon.ico for both.
+_ICON_PATH_ICO_TITLE: Path = _ICON_DIR / "icon_titlebar.ico"
+# Cache the multi-resolution QIcon once we've built it.
+_ICON_CACHE: QIcon | None = None
+
+
+def _load_app_icon() -> QIcon | None:
+    """Return a multi-resolution :class:`QIcon` for use in
+    ``QApplication.setWindowIcon`` / ``QMainWindow.setWindowIcon``.
+
+    Prefers ``assets/icon_titlebar.ico`` (text-only "FYPA" wordmark) so
+    that QDialog / QMessageBox popups — which aren't routed through
+    :func:`_force_native_window_icon` — inherit the wordmark in their
+    title bar instead of the fang logo. Falls back to ``icon.ico`` if
+    the title-bar variant is missing, then to rendering ``icon.svg``
+    directly when running an unbuilt working tree.
+    """
+    global _ICON_CACHE
+    if _ICON_CACHE is not None:
+        return _ICON_CACHE
+    # Preferred: text-only wordmark — covers all dialogs and the main
+    # window's Qt-side icon. Main windows additionally call
+    # _force_native_window_icon to set ICON_BIG to the full fang logo.
+    for candidate in (_ICON_PATH_ICO_TITLE, _ICON_PATH_ICO):
+        if candidate.is_file():
+            icon = QIcon(str(candidate))
+            if not icon.isNull():
+                _ICON_CACHE = icon
+                return icon
+    # Fallback: render the SVG into a multi-resolution QIcon ourselves.
+    if not _ICON_PATH_SVG.is_file():
+        return None
+    try:
+        from PySide6.QtSvg import QSvgRenderer
+    except ImportError:
+        return None
+    renderer = QSvgRenderer(str(_ICON_PATH_SVG))
+    if not renderer.isValid():
+        return None
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64, 128, 256):
+        pm = QPixmap(size, size)
+        pm.fill(Qt.transparent)
+        painter = QPainter(pm)
+        renderer.render(painter)
+        painter.end()
+        icon.addPixmap(pm)
+    _ICON_CACHE = icon
+    return icon
+
+
+# FYPA branding assets — stacked above the H2 on the welcome window.
+# Both are pre-rendered PNGs because Qt's QSvgRenderer can't handle the
+# clipPaths in the master SVGs (the red/blue arrow triangles are
+# supposed to be clipped to inside the FYPA letters). The PNGs are
+# produced by tools/build_icon_ico.py via Inkscape.
+_FYPA_FANGS_PATH_PNG: Path = _ICON_DIR / "fypa_fangs_only.png"
+_FYPA_TEXT_PATH_PNG: Path = _ICON_DIR / "fypa_text_only_no_triangles.png"
+_FYPA_FANGS_CACHE: dict[int, QPixmap] = {}
+_FYPA_TEXT_CACHE: dict[int, QPixmap] = {}
+
+
+def _load_fypa_fangs_pixmap(height: int) -> QPixmap | None:
+    """Return ``assets/fypa_fangs_only.png`` scaled to ``height`` px,
+    aspect-preserved. Cached by height. ``None`` if the file is missing.
+    """
+    cached = _FYPA_FANGS_CACHE.get(height)
+    if cached is not None:
+        return cached
+    if not _FYPA_FANGS_PATH_PNG.is_file():
+        return None
+    pm = QPixmap(str(_FYPA_FANGS_PATH_PNG))
+    if pm.isNull():
+        return None
+    pm = pm.scaledToHeight(height, Qt.SmoothTransformation)
+    _FYPA_FANGS_CACHE[height] = pm
+    return pm
+
+
+def _load_fypa_text_pixmap(height: int) -> QPixmap | None:
+    """Return ``assets/fypa_text_only_no_triangles.png`` scaled to
+    ``height`` px, aspect-preserved. Cached by height. ``None`` if the
+    file is missing.
+
+    The PNG is the Inkscape-rendered, alpha-cropped form of
+    ``fypa_text only_no_triangles.svg`` — see ``tools/build_icon_ico.py``.
+    We don't render the SVG at runtime because Qt's QSvgRenderer
+    silently drops clipPaths.
+    """
+    cached = _FYPA_TEXT_CACHE.get(height)
+    if cached is not None:
+        return cached
+    if not _FYPA_TEXT_PATH_PNG.is_file():
+        return None
+    pm = QPixmap(str(_FYPA_TEXT_PATH_PNG))
+    if pm.isNull():
+        return None
+    pm = pm.scaledToHeight(height, Qt.SmoothTransformation)
+    _FYPA_TEXT_CACHE[height] = pm
+    return pm
+
+
+from PySide6.QtCore import (
+    QEvent, QObject, QPointF, QRectF, QSize, Qt, QThread, QTimer, QUrl, Signal,
+)
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QColor,
+    QCursor,
+    QDesktopServices,
+    QDoubleValidator,
+    QIcon,
+    QKeySequence,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QPolygonF,
+    QShortcut,
+)
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QProgressDialog,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSlider,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QTextBrowser,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+from matplotlib.tri import Triangulation
+
+
+# Install the default QSurfaceFormat (OpenGL 3.3 core, vsync on) BEFORE
+# any QOpenGLWidget is constructed. Idempotent — calling it from this
+# module-level scope ensures the format is set before the GLMeshViewer
+# in the Heatmap tab gets created.
+_install_default_surface_format()
+
+
+# --- Theme (dark / light) --------------------------------------------------
+#
+# The viewer defaults to dark so it looks the same on every machine,
+# regardless of the OS-level Qt palette. The Appearance group in the
+# Settings tab lets the user toggle to a light palette; the choice is
+# persisted via QSettings and re-applied on the next launch.
+#
+# Every styled widget pulls its colours from ``current_theme()`` via the
+# ``_T()`` shortcut, so swapping the active theme just needs the active
+# window to be rebuilt (handled by :meth:`PdnViewer._on_theme_changed`).
+
+_THEME_PRESETS: dict[str, dict[str, str]] = {
+    "dark": {
+        # Core surfaces
+        "bg":              "#2b2b2b",   # main panel background
+        "bg_alt":          "#333333",   # alternating rows, secondary surface
+        "bg_input":        "#1f1f1f",   # text inputs, code blocks
+        "bg_hover":        "#3a3a3a",   # button/section-header hover
+        "bg_hover_strong": "#4a4a4a",   # secondary hover
+        "bg_selection":    "#4a6080",   # selected rows / focused selection
+        "bg_header":       "#3a3a3a",   # table headers, group titles
+        # Text
+        "fg":              "#e6e6e6",   # primary text
+        "fg_strong":       "#ffffff",   # emphatic text / headers
+        "fg_muted":        "#b0b0b0",   # secondary text
+        "fg_dim":          "#909090",   # tertiary/disabled-looking text
+        "fg_hint":         "#888888",   # subtle hints / parentheticals
+        "fg_label":        "#cccccc",   # body labels / intro paragraphs
+        # Accents
+        "accent":          "#b8d4ff",   # links / status messages / h3
+        "accent_btn":      "#3a6080",   # primary button bg
+        "accent_btn_hov":  "#4a80a0",   # primary button hover
+        "code":            "#f0c674",   # inline <code> / code-like spans
+        "warn":            "#ffb84d",   # warning text
+        "err":             "#ff7070",   # error text
+        "ok":              "#7fdc7f",   # success flash
+        "warn_bg":         "#5a1a1a",   # warning cell background (table)
+        "warn_fg":         "#ff9696",   # warning cell foreground (table)
+        # Decoration
+        "border":          "#555555",   # widget borders / table grid
+        "gridline":        "#444444",   # subtle grid
+        "dielectric":      "#9090c0",   # stackup dielectric label
+        "dielectric_dim":  "#a0a0a0",
+        "separator":       "#707070",
+        "eye_open":        "#f0f0f0",
+        "eye_closed":      "#7a7a7a",
+    },
+    "light": {
+        # Core surfaces
+        "bg":              "#f5f5f5",
+        "bg_alt":          "#eeeeee",
+        "bg_input":        "#ffffff",
+        "bg_hover":        "#e0e0e0",
+        "bg_hover_strong": "#cfcfcf",
+        "bg_selection":    "#aac7ff",
+        "bg_header":       "#dcdcdc",
+        # Text
+        "fg":              "#1d1d1d",
+        "fg_strong":       "#000000",
+        "fg_muted":        "#4a4a4a",
+        "fg_dim":          "#6b6b6b",
+        "fg_hint":         "#7a7a7a",
+        "fg_label":        "#2d2d2d",
+        # Accents
+        "accent":          "#1a5fbf",
+        "accent_btn":      "#3a80c0",
+        "accent_btn_hov":  "#5aa0e0",
+        "code":            "#8a5a00",
+        "warn":            "#c47a00",
+        "err":             "#c0392b",
+        "ok":              "#2e8b57",
+        "warn_bg":         "#ffd6d6",
+        "warn_fg":         "#a31010",
+        # Decoration
+        "border":          "#b8b8b8",
+        "gridline":        "#cccccc",
+        "dielectric":      "#5a5aa0",
+        "dielectric_dim":  "#666688",
+        "separator":       "#9a9a9a",
+        "eye_open":        "#2d2d2d",
+        "eye_closed":      "#9a9a9a",
+    },
+}
+
+# QSettings keys. The org/app pair is also used by anything else in the
+# project that wants a persistent preference.
+_THEME_QS_ORG = "CopperTree"
+_THEME_QS_APP = "FYPA"
+_THEME_QS_KEY = "ui/theme"
+
+_current_theme_mode: str = "dark"
+
+
+def current_theme() -> dict[str, str]:
+    """Return the active theme's colour-token dict."""
+    return _THEME_PRESETS.get(_current_theme_mode, _THEME_PRESETS["dark"])
+
+
+def _T() -> dict[str, str]:
+    """Shortcut alias for :func:`current_theme` — handy in stylesheet f-strings."""
+    return current_theme()
+
+
+def current_theme_mode() -> str:
+    return _current_theme_mode
+
+
+def load_saved_theme_mode() -> str:
+    """Read the persisted theme choice (defaults to ``"dark"``)."""
+    try:
+        from PySide6.QtCore import QSettings
+        qs = QSettings(_THEME_QS_ORG, _THEME_QS_APP)
+        mode = qs.value(_THEME_QS_KEY, "dark")
+        if isinstance(mode, str) and mode in _THEME_PRESETS:
+            return mode
+    except Exception as e:
+        logging.getLogger(__name__).debug(
+            "Could not read saved theme preference (%s); using default.", e,
+        )
+    return "dark"
+
+
+def save_theme_mode(mode: str) -> None:
+    """Persist the chosen theme so the next launch picks it up."""
+    try:
+        from PySide6.QtCore import QSettings
+        qs = QSettings(_THEME_QS_ORG, _THEME_QS_APP)
+        qs.setValue(_THEME_QS_KEY, mode)
+    except Exception as e:
+        logging.getLogger(__name__).debug(
+            "Could not persist theme preference (%s); ignoring.", e,
+        )
+
+
+def _build_app_palette(mode: str):
+    """Build a QPalette matching the given theme. Used for native widgets
+    (menubar, scrollbars, file dialogs, dropdowns) that read from the
+    application palette rather than our QSS."""
+    from PySide6.QtGui import QPalette, QColor
+    t = _THEME_PRESETS[mode]
+    pal = QPalette()
+    pal.setColor(QPalette.Window,          QColor(t["bg"]))
+    pal.setColor(QPalette.WindowText,      QColor(t["fg"]))
+    pal.setColor(QPalette.Base,            QColor(t["bg_input"]))
+    pal.setColor(QPalette.AlternateBase,   QColor(t["bg_alt"]))
+    pal.setColor(QPalette.ToolTipBase,     QColor(t["bg"]))
+    pal.setColor(QPalette.ToolTipText,     QColor(t["fg"]))
+    pal.setColor(QPalette.Text,            QColor(t["fg"]))
+    pal.setColor(QPalette.Button,          QColor(t["bg_hover"]))
+    pal.setColor(QPalette.ButtonText,      QColor(t["fg"]))
+    pal.setColor(QPalette.BrightText,      QColor(t["err"]))
+    pal.setColor(QPalette.Highlight,       QColor(t["bg_selection"]))
+    pal.setColor(QPalette.HighlightedText, QColor(t["fg_strong"]))
+    pal.setColor(QPalette.Link,            QColor(t["accent"]))
+    pal.setColor(QPalette.LinkVisited,     QColor(t["accent"]))
+    # Disabled state — derived from the active colours so disabled
+    # buttons / menu items stay readable in both themes.
+    pal.setColor(QPalette.Disabled, QPalette.WindowText, QColor(t["fg_dim"]))
+    pal.setColor(QPalette.Disabled, QPalette.Text,       QColor(t["fg_dim"]))
+    pal.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(t["fg_dim"]))
+    return pal
+
+
+def _build_app_stylesheet(mode: str) -> str:
+    """Application-wide QSS, applied via ``app.setStyleSheet``. Targets
+    widgets that aren't covered by an inline stylesheet — menubar,
+    scrollbars, file dialogs, the central widget background — so they
+    follow the active theme."""
+    t = _THEME_PRESETS[mode]
+    return (
+        f"QMainWindow, QDialog, QWidget#qt_central_widget "
+        f"{{ background-color: {t['bg']}; color: {t['fg']}; }}"
+        f"QMenuBar {{ background-color: {t['bg']}; color: {t['fg']}; }}"
+        f"QMenuBar::item {{ background-color: transparent; padding: 4px 10px; }}"
+        f"QMenuBar::item:selected {{ background-color: {t['bg_hover']}; }}"
+        f"QMenu {{ background-color: {t['bg']}; color: {t['fg']};"
+        f"         border: 1px solid {t['border']}; }}"
+        f"QMenu::item:selected {{ background-color: {t['bg_selection']};"
+        f"                        color: {t['fg_strong']}; }}"
+        f"QMenu::separator {{ height: 1px; background: {t['border']};"
+        f"                    margin: 4px 6px; }}"
+        f"QTabWidget::pane {{ border: 1px solid {t['border']};"
+        f"                    background-color: {t['bg']}; }}"
+        f"QTabBar::tab {{ background-color: {t['bg_alt']}; color: {t['fg']};"
+        f"                padding: 6px 12px; border: 1px solid {t['border']};"
+        f"                border-bottom: none; }}"
+        f"QTabBar::tab:selected {{ background-color: {t['bg']};"
+        f"                         color: {t['fg_strong']}; }}"
+        f"QTabBar::tab:hover {{ background-color: {t['bg_hover']}; }}"
+        f"QComboBox {{ background-color: {t['bg_input']}; color: {t['fg']};"
+        f"             border: 1px solid {t['border']}; padding: 3px 6px; }}"
+        f"QComboBox QAbstractItemView {{ background-color: {t['bg_input']};"
+        f"                               color: {t['fg']};"
+        f"                               selection-background-color: {t['bg_selection']};"
+        f"                               selection-color: {t['fg_strong']}; }}"
+        f"QCheckBox {{ color: {t['fg']}; }}"
+        f"QGroupBox {{ color: {t['fg']}; }}"
+        f"QSlider::groove:horizontal {{ background: {t['bg_input']};"
+        f"                              height: 6px; border-radius: 3px; }}"
+        f"QSlider::handle:horizontal {{ background: {t['accent_btn']};"
+        f"                              width: 14px; margin: -5px 0;"
+        f"                              border-radius: 7px; }}"
+        f"QScrollBar:vertical {{ background: {t['bg']};"
+        f"                       width: 12px; margin: 0; }}"
+        f"QScrollBar::handle:vertical {{ background: {t['bg_hover']};"
+        f"                               min-height: 24px; border-radius: 4px; }}"
+        f"QScrollBar::handle:vertical:hover {{ background: {t['bg_hover_strong']}; }}"
+        f"QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{"
+        f"   height: 0; background: none; }}"
+        f"QScrollBar:horizontal {{ background: {t['bg']};"
+        f"                         height: 12px; margin: 0; }}"
+        f"QScrollBar::handle:horizontal {{ background: {t['bg_hover']};"
+        f"                                 min-width: 24px; border-radius: 4px; }}"
+        f"QScrollBar::handle:horizontal:hover {{ background: {t['bg_hover_strong']}; }}"
+        f"QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{"
+        f"   width: 0; background: none; }}"
+        f"QToolTip {{ background-color: {t['bg']}; color: {t['fg']};"
+        f"            border: 1px solid {t['border']}; padding: 3px 6px; }}"
+    )
+
+
+def apply_app_theme(app, mode: str | None = None) -> None:
+    """Apply ``mode`` (or the currently-active theme) to ``app``.
+
+    Sets the global QApplication style to Fusion (so the QPalette has
+    consistent effect across platforms), installs the matching palette
+    and our base stylesheet. Inline-styled widgets pick up the theme
+    when their owning window is rebuilt."""
+    global _current_theme_mode
+    if mode is not None and mode in _THEME_PRESETS:
+        _current_theme_mode = mode
+    try:
+        app.setStyle("Fusion")
+    except Exception as e:
+        logging.getLogger(__name__).debug(
+            "Could not set the Fusion style (%s); keeping the platform default.", e,
+        )
+    app.setPalette(_build_app_palette(_current_theme_mode))
+    app.setStyleSheet(_build_app_stylesheet(_current_theme_mode))
+
+# Hover-probe throttle. Mouse-move callbacks fire up to ~125 Hz on a
+# high-DPI mouse; we don't need to recompute the probe more often than
+# the eye can track. 33 ms ≈ 30 Hz feels live and removes a chunky
+# fraction of mouse-event CPU during slow pans / hover-over moves.
+HOVER_THROTTLE_S: float = 0.033
+# Faster throttle used ONLY while the "Show cursor tooltip" option is
+# on — the tooltip follows the cursor visibly, so the eye notices any
+# stutter the bottom probe-label hides. Lower = smoother but more CPU
+# spent on shapely.contains + _FastTriSampler query per move event.
+# Set to 0.0 to disable throttling entirely (re-probe on every event).
+CURSOR_TOOLTIP_THROTTLE_S: float = 0.008
+
+
+# --- Altium-style "eye" visibility icons -----------------------------------
+
+_EYE_PIXMAP_CACHE: dict[tuple[str, bool, int], QPixmap] = {}
+
+
+def _make_eye_pixmap(open_: bool, *, size: int = 16) -> QPixmap:
+    """Draw an Altium-style eye icon.
+
+    ``open_`` = True  → white eye (layer visible).
+    ``open_`` = False → muted grey eye with a diagonal slash (layer hidden).
+    """
+    px = QPixmap(size, size)
+    px.fill(Qt.transparent)
+    p = QPainter(px)
+    p.setRenderHint(QPainter.Antialiasing, True)
+
+    t = current_theme()
+    color = QColor(t["eye_open"] if open_ else t["eye_closed"])
+    pen = QPen(color)
+    pen.setWidthF(max(1.0, size * 0.09))
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+
+    pad = size * 0.10
+    cy = size / 2.0
+    bulge = size * 0.42
+    path = QPainterPath()
+    path.moveTo(pad, cy)
+    path.quadTo(size / 2.0, cy - bulge, size - pad, cy)
+    path.quadTo(size / 2.0, cy + bulge, pad, cy)
+    p.drawPath(path)
+
+    p.setPen(Qt.NoPen)
+    p.setBrush(color)
+    r = size * 0.17
+    p.drawEllipse(QPointF(size / 2.0, cy), r, r)
+
+    if not open_:
+        slash = QPen(color)
+        slash.setWidthF(max(1.2, size * 0.11))
+        slash.setCapStyle(Qt.RoundCap)
+        p.setPen(slash)
+        p.setBrush(Qt.NoBrush)
+        m = size * 0.12
+        p.drawLine(QPointF(m, size - m), QPointF(size - m, m))
+
+    p.end()
+    return px
+
+
+def _eye_pixmap(open_: bool, size: int = 16) -> QPixmap:
+    key = (current_theme_mode(), open_, size)
+    cached = _EYE_PIXMAP_CACHE.get(key)
+    if cached is None:
+        cached = _make_eye_pixmap(open_, size=size)
+        _EYE_PIXMAP_CACHE[key] = cached
+    return cached
+
+
+class EyeButton(QToolButton):
+    """Altium-style eye-icon toggle for layer visibility."""
+
+    toggled_visible = Signal(bool)
+
+    def __init__(self, parent=None, *, visible: bool = True,
+                 icon_size: int = 16) -> None:
+        super().__init__(parent)
+        self._visible = bool(visible)
+        self._icon_size = icon_size
+        self.setAutoRaise(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setIconSize(QSize(icon_size, icon_size))
+        self.setFixedSize(icon_size + 6, icon_size + 6)
+        self.setFocusPolicy(Qt.NoFocus)
+        self._apply_icon()
+        self.clicked.connect(self._on_clicked)
+
+    def isVisibleState(self) -> bool:
+        return self._visible
+
+    def setVisibleState(self, on: bool, *, emit: bool = True) -> None:
+        on = bool(on)
+        if on == self._visible:
+            return
+        self._visible = on
+        self._apply_icon()
+        if emit:
+            self.toggled_visible.emit(self._visible)
+
+    def _apply_icon(self) -> None:
+        self.setIcon(QIcon(_eye_pixmap(self._visible, self._icon_size)))
+        self.setToolTip("Hide layer" if self._visible else "Show layer")
+
+    def _on_clicked(self) -> None:
+        self.setVisibleState(not self._visible)
+
+
+class SidebarToggleButton(QToolButton):
+    """Slim vertical splitter handle that collapses / expands the heatmap
+    side panel. Paints a crisp anti-aliased triangle pointing in the
+    direction the panel will travel on the next click, instead of relying
+    on Unicode arrow glyphs (which render fuzzy at this size on Windows).
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._collapsed = False
+        self.setAutoRaise(True)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedWidth(14)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+
+    def setCollapsed(self, collapsed: bool) -> None:
+        collapsed = bool(collapsed)
+        if collapsed == self._collapsed:
+            return
+        self._collapsed = collapsed
+        self.update()
+
+    def isCollapsed(self) -> bool:
+        return self._collapsed
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        t = _T()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        rect = self.rect()
+        # Track background. underMouse() drives the hover tint; QToolButton's
+        # default styled-look fights the custom paint, so we draw it ourselves.
+        bg = QColor(t["bg_hover"] if self.underMouse() else t["bg_alt"])
+        p.fillRect(rect, bg)
+        p.setPen(QColor(t["border"]))
+        p.drawLine(rect.topLeft(), rect.bottomLeft())
+        p.drawLine(rect.topRight(), rect.bottomRight())
+        # Triangle: points RIGHT (▶) when collapsed (click expands the panel
+        # outward); points LEFT (◀) when expanded (click pulls it back in).
+        cx = rect.width() / 2.0
+        cy = rect.height() / 2.0
+        half_w = 3.0
+        half_h = 5.0
+        if self._collapsed:
+            tri = QPolygonF([
+                QPointF(cx - half_w, cy - half_h),
+                QPointF(cx - half_w, cy + half_h),
+                QPointF(cx + half_w, cy),
+            ])
+        else:
+            tri = QPolygonF([
+                QPointF(cx + half_w, cy - half_h),
+                QPointF(cx + half_w, cy + half_h),
+                QPointF(cx - half_w, cy),
+            ])
+        fill = QColor(t["fg"] if self.underMouse() else t["fg_muted"])
+        p.setPen(Qt.NoPen)
+        p.setBrush(fill)
+        p.drawPolygon(tri)
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self.update()
+        super().leaveEvent(event)
+
+
+# Modes the viewer offers. Each is (label, unit, derive_fn). The derive_fn
+# takes (tris, potentials, power_density, conductance, n_verts) and
+# returns a numpy array of values per vertex.
+#   tris            — (M, 3) int32, vertex indices into the mesh
+#   potentials      — (N,) float64, per-vertex voltage (V)
+#   power_density   — (M,) float64 or None, per-face power density (W/mm²)
+#   conductance     — sheet conductance (S) of the layer
+#   n_verts         — vertex count of the mesh (== potentials.size)
+def _voltage_per_vertex(tris, potentials, power_density, conductance, n_verts):
+    return potentials.copy()
+
+
+def _power_density_per_vertex(tris, potentials, power_density, conductance, n_verts):
+    if power_density is None:
+        return np.zeros(n_verts)
+    return _face_to_vertex_average(tris, power_density, n_verts)
+
+
+def _current_density_per_vertex(tris, potentials, power_density, conductance, n_verts):
+    # |J| = sqrt(power_density * sheet_conductance). power_density is W/mm^2;
+    # sheet_conductance is S (= A/V); product is A^2/mm^2; sqrt → A/mm.
+    p = _power_density_per_vertex(tris, potentials, power_density, conductance, n_verts)
+    return np.sqrt(np.maximum(p * conductance, 0.0))
+
+
+_MODES = [
+    ("Voltage",         "V",     _voltage_per_vertex),
+    ("Voltage Drop",    "V",     _voltage_per_vertex),  # values are shifted in _render
+    ("Current Density", "A/mm",  _current_density_per_vertex),
+    ("Power Density",   "W/mm^2", _power_density_per_vertex),
+    # Via Current: copper renders neutral grey (the derive_fn output is
+    # ignored — see :meth:`PdnViewer._render`), and the heatmap belongs
+    # to the via cylinders / markers. Scale range = (min, max) of every
+    # visible via's max-segment |I| on the selected rails.
+    ("Via Current",     "A",     _voltage_per_vertex),
+]
+
+# Mode label that triggers the "shift values so the worst SINK on the rail
+# reads 0 V" post-processing in _render. Kept as a constant so the same
+# string is used in both the mode list and the special-case check.
+_VOLTAGE_DROP_MODE: str = "Voltage Drop"
+
+# Mode label that disables the per-vertex copper heatmap and uses via
+# currents as the heatmapped quantity instead. Same string is used in
+# the mode list and every special-case branch.
+_VIA_CURRENT_MODE: str = "Via Current"
+
+# Modes whose values blow up at point constraints (the FEM has a
+# logarithmic gradient singularity at any pinned-voltage vertex such as a
+# SOURCE/SINK pin). The default colour-scale clamp uses a percentile rather
+# than the absolute max so the rest of the board isn't crushed to black.
+# The full data range is still exposed on the scale controller so the user
+# can drag/type up to the real max if they want to see the spike.
+_SPIKE_PRONE_MODES: frozenset[str] = frozenset({"Current Density", "Power Density"})
+
+# Heatmap modes whose data spans many decades, so a logarithmic colour
+# scale earns its keep: current density (J spikes hard at copper
+# constrictions), power density (~ J²·ρ — roughly the square of that
+# dynamic range), and via current (long-tailed: most vias near 0 A, a
+# handful near a regulator). The linear/log toggle is enabled only for
+# these. Voltage sits in a narrow band and Voltage Drop is signed, so a
+# log scale is useless or undefined for them.
+_LOG_ELIGIBLE_MODES: frozenset[str] = frozenset(
+    {"Current Density", "Power Density", _VIA_CURRENT_MODE}
+)
+
+# A log colour scale spans at most this many decades below the window
+# maximum. Values under the resulting floor — including the exact zeros
+# of no-current copper — clamp to the bottom of the LUT instead of
+# diverging to log(0) = -inf.
+_LOG_SCALE_DECADES: float = 6.0
+
+# Per-via segment current that earns a warning highlight in the Vias tab.
+# 1 A through a single 0.6 mm plated through-hole on 1 oz copper is roughly
+# where IPC-2152 derating starts to bite (~30°C rise depending on plating
+# thickness). Tune to taste.
+_VIA_CURRENT_WARN_A: float = 1.0
+
+# Percentile used to clip outliers in the default display range. P99 means
+# the worst 1% of vertices are above the auto-clamp top. Most FEM spikes
+# affect << 1% of vertices, so this gives a useful default scale on the
+# rest of the board.
+_DISPLAY_PERCENTILE_HIGH: float = 99.0
+
+# Percentile used to cap the *slider's full extent* (data_max) on spike-prone
+# modes. The raw vertex maximum can be 10–100× the physically meaningful range
+# because of the FEM logarithmic gradient singularity at pinned-voltage
+# vertices (SOURCE/SINK pins), which makes the slider's "Max" label
+# misleading. P99.9 still sits well above the P99 default-selection clamp so
+# users can drag up to inspect outliers, just not the singularity itself.
+_SLIDER_CAP_PERCENTILE: float = 99.9
+
+
+# Strong-ref list of every viewer window we hand off to the user. Without
+# this, freshly-created QMainWindows can be garbage-collected the moment
+# the spawning function returns — PySide6's ``QApplication.setProperty``
+# does NOT hold a reliable Python reference across signal boundaries, so
+# we anchor at module scope instead. Dead entries are pruned each append.
+_LIVE_VIEWERS: list[QMainWindow] = []
+
+
+def _register_viewer(win: QMainWindow) -> None:
+    """Append ``win`` to the module-level strong-ref list, pruning any
+    entries whose underlying QObject has already been destroyed."""
+    global _LIVE_VIEWERS
+    pruned: list[QMainWindow] = []
+    for w in _LIVE_VIEWERS:
+        try:
+            w.objectName()      # raises if the C++ object is gone
+        except RuntimeError:
+            continue
+        pruned.append(w)
+    pruned.append(win)
+    _LIVE_VIEWERS = pruned
+
+
+def _retire_viewer(win: QMainWindow) -> None:
+    """Close, unregister and destroy a viewer that's being replaced on a
+    reload, releasing its Solution / mesh data right away.
+
+    Without this every reload leaks: ``_register_viewer`` only prunes
+    viewers whose C++ object is *already* destroyed, and a plain
+    ``close()`` merely hides the window — so the previous PdnViewer stays
+    pinned in ``_LIVE_VIEWERS`` with its full (gigabyte-scale, on a large
+    board) ``Solution`` still in RAM. A long session then accumulates one
+    Solution per load until the next solve runs short of memory and PARDISO
+    pages to disk — which is what turns an ~8 s linear solve into ~50 s.
+    """
+    global _LIVE_VIEWERS
+    _LIVE_VIEWERS = [w for w in _LIVE_VIEWERS if w is not win]
+    try:
+        win.close()
+    except RuntimeError:
+        return  # C++ object already gone — nothing left to release.
+    # Drop the heavy payload explicitly so it's freed now, rather than
+    # whenever the window wrapper happens to be garbage-collected.
+    for attr in ("solution", "metadata"):
+        try:
+            setattr(win, attr, None)
+        except Exception:
+            pass
+    win.deleteLater()
+
+
+def _slider_data_max(vs_arr: np.ndarray, mode: str, raw_max: float) -> float:
+    """Effective ``data_max`` for the scale-controller slider.
+
+    On spike-prone modes (Current Density / Power Density), clip the raw
+    maximum to P99.9 so the FEM singularity at pinned-voltage vertices
+    doesn't blow up the slider's upper bound. On all other modes (and on
+    very small meshes) returns ``raw_max`` unchanged.
+    """
+    if mode not in _SPIKE_PRONE_MODES or len(vs_arr) < 100:
+        return raw_max
+    capped = float(np.percentile(vs_arr, _SLIDER_CAP_PERCENTILE))
+    return min(raw_max, capped) if math.isfinite(capped) else raw_max
+
+
+def _face_to_vertex_average(tris: np.ndarray, face_values: np.ndarray,
+                            n_verts: int) -> np.ndarray:
+    """Average face-defined values onto vertices (each vertex gets the mean
+    of the values of its incident faces). Vectorised via ``np.add.at`` —
+    same result as a Python loop, ~50× faster on large meshes."""
+    totals = np.zeros(n_verts, dtype=np.float64)
+    counts = np.zeros(n_verts, dtype=np.float64)
+    if tris.size == 0:
+        return totals
+    np.add.at(totals, tris[:, 0], face_values)
+    np.add.at(totals, tris[:, 1], face_values)
+    np.add.at(totals, tris[:, 2], face_values)
+    np.add.at(counts, tris[:, 0], 1.0)
+    np.add.at(counts, tris[:, 1], 1.0)
+    np.add.at(counts, tris[:, 2], 1.0)
+    counts[counts == 0] = 1.0
+    return totals / counts
+
+
+def _split_composite_name(name: str) -> tuple[str, str]:
+    if "|" in name:
+        phys, rail = name.split("|", 1)
+        return phys, rail
+    return name, ""
+
+
+def _build_cmap_lut(name: str = "viridis") -> np.ndarray:
+    """Sample a matplotlib colormap into a (256, 4) uint8 RGBA LUT for
+    upload to the GLMeshViewer's 1-D texture."""
+    cmap = _mpl_cm.get_cmap(name)
+    samples = cmap(np.linspace(0.0, 1.0, 256))
+    return (samples * 255.0).astype(np.uint8)
+
+
+# Flat grey the copper renders as in Via Current mode. Kept dark so the
+# orange / light-grey via cylinders (which own the heatmap in that mode)
+# stand out clearly against the context copper. Tweak here to taste.
+_VIA_CURRENT_COPPER_RGBA: tuple[int, int, int, int] = (110, 110, 110, 255)
+
+
+def _build_neutral_cmap_lut(
+    rgba: tuple[int, int, int, int] = _VIA_CURRENT_COPPER_RGBA,
+) -> np.ndarray:
+    """Flat-grey 256-entry RGBA LUT. Pushed to the GL viewer in
+    Via Current mode so the copper renders as a single neutral shade
+    regardless of the per-vertex values: the heatmap "belongs" to the
+    via cylinders in that mode, and the copper is just context."""
+    return np.tile(np.asarray(rgba, dtype=np.uint8), (256, 1))
+
+
+# --- Heatmap colour schemes -------------------------------------------------
+#
+# The heatmap looks up per-vertex colours through a 256-entry RGBA LUT
+# (see :func:`_build_cmap_lut`). The scheme is user-selectable from a
+# dropdown next to the colour-scale bar — :data:`_HEATMAP_COLORMAPS` is the
+# ordered ``(display name, matplotlib colormap name)`` menu; index 0 is the
+# default applied on first render.
+#
+# "Acton" and "Bam" are Scientific Colour Maps (Crameri — the same schemes
+# JuliaPlots ships). matplotlib doesn't bundle them, so
+# :func:`_register_custom_colormaps` builds them from anchor colours and
+# registers them under ``fypa_``-prefixed names that ``get_cmap`` resolves
+# like any built-in. Everything downstream (LUT build, gradient strip)
+# only ever sees a colormap name string, so custom and built-in schemes
+# travel the exact same path.
+
+# Anchor colours (evenly spaced, RGB 0..1) for the schemes matplotlib
+# doesn't ship. Sampled to follow the published Scientific Colour Map ramps.
+_CUSTOM_CMAP_ANCHORS: dict[str, list[tuple[float, float, float]]] = {
+    # Sequential: dark indigo -> mauve -> light pink.
+    "fypa_acton": [
+        (0.176, 0.125, 0.302),
+        (0.318, 0.235, 0.408),
+        (0.486, 0.318, 0.494),
+        (0.682, 0.404, 0.557),
+        (0.812, 0.541, 0.643),
+        (0.871, 0.671, 0.733),
+        (0.902, 0.792, 0.804),
+    ],
+    # Diverging: magenta <-> green through a near-white centre.
+    "fypa_bam": [
+        (0.396, 0.078, 0.353),
+        (0.620, 0.247, 0.541),
+        (0.812, 0.510, 0.706),
+        (0.937, 0.776, 0.886),
+        (0.969, 0.969, 0.969),
+        (0.737, 0.871, 0.722),
+        (0.435, 0.682, 0.435),
+        (0.184, 0.451, 0.243),
+    ],
+}
+
+
+def _register_custom_colormaps() -> None:
+    """Register the non-matplotlib colour schemes so :func:`get_cmap`
+    resolves them by name like any built-in. ``force=True`` makes a
+    repeat call (e.g. after a module reload) harmless."""
+    from matplotlib.colors import LinearSegmentedColormap
+    for name, anchors in _CUSTOM_CMAP_ANCHORS.items():
+        cmap = LinearSegmentedColormap.from_list(name, anchors, N=256)
+        matplotlib.colormaps.register(cmap, name=name, force=True)
+
+
+_register_custom_colormaps()
+
+
+# Ordered ``(display name, matplotlib colormap name)`` for the colour-scale
+# dropdown. Index 0 is the default. To add a scheme, append a row — the
+# combo, gradient strip and LUT build all read this tuple.
+_HEATMAP_COLORMAPS: tuple[tuple[str, str], ...] = (
+    ("Viridis (default)", "viridis"),
+    ("Blue → Red",   "RdBu_r"),
+    ("Heat",              "YlOrRd"),
+    ("Bam",               "fypa_bam"),
+    ("Acton",             "fypa_acton"),
+    ("Inferno",           "inferno"),
+    ("Turbo",             "turbo"),
+    ("Grayscale",         "gray"),
+)
+_DEFAULT_CMAP_NAME: str = _HEATMAP_COLORMAPS[0][1]
+
+
+def _generate_disk_cap(
+    x: float, y: float, z: float, radius: float,
+    color_rgb: tuple[float, float, float],
+    n_segments: int = 10,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Filled circular disk at ``(x, y, z)`` — triangle fan from centre to rim.
+
+    Returns ``(positions, colors)`` as (3*n_segments, 3) float32 arrays
+    ready for GL_TRIANGLES. Used to cap via cylinders at each copper-layer
+    junction so the endpoint colour is visible from any camera angle.
+    """
+    angles = np.linspace(0.0, 2.0 * np.pi, n_segments, endpoint=False)
+    cos_a = np.cos(angles, dtype=np.float64)
+    sin_a = np.sin(angles, dtype=np.float64)
+    cos_b = np.roll(cos_a, -1)
+    sin_b = np.roll(sin_a, -1)
+    rim_a = np.column_stack((x + radius * cos_a, y + radius * sin_a,
+                             np.full(n_segments, z)))
+    rim_b = np.column_stack((x + radius * cos_b, y + radius * sin_b,
+                             np.full(n_segments, z)))
+    out = np.empty((n_segments * 3, 3), dtype=np.float32)
+    out[0::3] = [x, y, z]
+    out[1::3] = rim_a
+    out[2::3] = rim_b
+    col = np.broadcast_to(np.asarray(color_rgb, dtype=np.float32),
+                          (out.shape[0], 3)).copy()
+    return out, col
+
+
+def _generate_via_cylinder(x: float, y: float, z_top: float, z_bottom: float,
+                            radius: float, color_rgb: tuple[float, float, float],
+                            n_segments: int = 10,
+                            ) -> tuple[np.ndarray, np.ndarray]:
+    """Generate the side-wall triangles of an open cylinder centred at
+    ``(x, y)`` extending from ``z_top`` to ``z_bottom``.
+
+    Returns ``(positions, colors)`` as (6*n_segments, 3) float32 arrays
+    suitable for :meth:`gl_mesh_viewer.GLMeshViewer.set_cylinders`. Each
+    side facet contributes two triangles (six vertices) drawn via
+    ``GL_TRIANGLES``. Caps are omitted — the user's view only ever sees
+    the side surface in PDN inspection.
+    """
+    angles = np.linspace(0.0, 2.0 * np.pi, n_segments, endpoint=False)
+    cos_a = np.cos(angles, dtype=np.float64)
+    sin_a = np.sin(angles, dtype=np.float64)
+    cos_b = np.roll(cos_a, -1)
+    sin_b = np.roll(sin_a, -1)
+    # Per-side-facet quad corners.
+    top1 = np.column_stack((x + radius * cos_a, y + radius * sin_a,
+                            np.full(n_segments, z_top)))
+    top2 = np.column_stack((x + radius * cos_b, y + radius * sin_b,
+                            np.full(n_segments, z_top)))
+    bot1 = np.column_stack((x + radius * cos_a, y + radius * sin_a,
+                            np.full(n_segments, z_bottom)))
+    bot2 = np.column_stack((x + radius * cos_b, y + radius * sin_b,
+                            np.full(n_segments, z_bottom)))
+    # Interleave as triangle pairs per facet:
+    #   T1 = top1, bot1, top2     T2 = top2, bot1, bot2
+    out = np.empty((n_segments * 6, 3), dtype=np.float32)
+    out[0::6] = top1
+    out[1::6] = bot1
+    out[2::6] = top2
+    out[3::6] = top2
+    out[4::6] = bot1
+    out[5::6] = bot2
+    col = np.broadcast_to(np.asarray(color_rgb, dtype=np.float32),
+                          (out.shape[0], 3)).copy()
+    return out, col
+
+
+def _generate_via_cylinder_gradient(
+    x: float, y: float, z_top: float, z_bottom: float,
+    radius: float,
+    color_top_rgb: tuple[float, float, float],
+    color_bottom_rgb: tuple[float, float, float],
+    n_segments: int = 10,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Same geometry as :func:`_generate_via_cylinder`, but each side facet's
+    top vertices use ``color_top_rgb`` and its bottom vertices use
+    ``color_bottom_rgb`` so the GPU interpolates the colour smoothly along
+    the cylinder's axis."""
+    angles = np.linspace(0.0, 2.0 * np.pi, n_segments, endpoint=False)
+    cos_a = np.cos(angles, dtype=np.float64)
+    sin_a = np.sin(angles, dtype=np.float64)
+    cos_b = np.roll(cos_a, -1)
+    sin_b = np.roll(sin_a, -1)
+    top1 = np.column_stack((x + radius * cos_a, y + radius * sin_a,
+                            np.full(n_segments, z_top)))
+    top2 = np.column_stack((x + radius * cos_b, y + radius * sin_b,
+                            np.full(n_segments, z_top)))
+    bot1 = np.column_stack((x + radius * cos_a, y + radius * sin_a,
+                            np.full(n_segments, z_bottom)))
+    bot2 = np.column_stack((x + radius * cos_b, y + radius * sin_b,
+                            np.full(n_segments, z_bottom)))
+    out = np.empty((n_segments * 6, 3), dtype=np.float32)
+    out[0::6] = top1
+    out[1::6] = bot1
+    out[2::6] = top2
+    out[3::6] = top2
+    out[4::6] = bot1
+    out[5::6] = bot2
+    ct = np.asarray(color_top_rgb, dtype=np.float32)
+    cb = np.asarray(color_bottom_rgb, dtype=np.float32)
+    col = np.empty((n_segments * 6, 3), dtype=np.float32)
+    col[0::6] = ct
+    col[1::6] = cb
+    col[2::6] = ct
+    col[3::6] = ct
+    col[4::6] = cb
+    col[5::6] = cb
+    return out, col
+
+
+def _sample_cmap_lut(lut: np.ndarray, value: float,
+                     vmin: float, vmax: float,
+                     ) -> tuple[float, float, float]:
+    """Pick the LUT row matching ``value`` clamped to ``[vmin, vmax]``.
+    ``lut`` is the (256, 4) uint8 RGBA array built by
+    :func:`_build_cmap_lut`. Returns an (R, G, B) triple in 0..1."""
+    if not math.isfinite(value):
+        return (0.5, 0.5, 0.5)
+    span = vmax - vmin
+    if span <= 0:
+        t = 0.0
+    else:
+        t = (value - vmin) / span
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    n = lut.shape[0]
+    idx = int(round(t * (n - 1)))
+    return (lut[idx, 0] / 255.0,
+            lut[idx, 1] / 255.0,
+            lut[idx, 2] / 255.0)
+
+
+def _extrude_to_prism(
+    xs: np.ndarray, ys: np.ndarray, vs: np.ndarray, tris: np.ndarray,
+    z_center: float, thickness: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Extrude a flat 2D triangle mesh into a thin closed prism.
+
+    The input is the per-layer copper mesh (xs, ys, vs at a single z =
+    ``z_center``). The output has:
+
+    * **Top face**: original triangles at ``z = z_center + thickness/2``
+    * **Bottom face**: original triangles at ``z = z_center - thickness/2``
+      with reversed winding (outward normal points down)
+    * **Side walls**: two triangles per *boundary* edge (edges incident
+      to exactly one input triangle); interior edges are hidden inside
+      the prism so we don't waste triangles on them.
+
+    Per-vertex value (used by the colormap shader) is duplicated top↔bottom
+    so the copper is uniformly coloured through its thickness — matches the
+    FEM's sheet-conductor assumption (no in-z variation).
+
+    Returns ``(xs, ys, zs, vs, tris)`` ready to feed into the GL viewer's
+    combined batch.
+    """
+    n = xs.size
+    if n == 0 or tris.size == 0:
+        empty = np.empty(0, dtype=np.float64)
+        return empty, empty, empty, empty, np.empty((0, 3), dtype=np.int32)
+
+    # Extrude DOWNWARD only: top face sits at z_center (the layer's
+    # plane) so it stays coplanar with the outline overlay and the via
+    # cylinders meet the copper flush. Bottom face is pushed down by
+    # ``thickness``.
+    z_top = z_center
+    z_bot = z_center - thickness
+
+    new_xs = np.concatenate([xs, xs])
+    new_ys = np.concatenate([ys, ys])
+    new_zs = np.empty(2 * n, dtype=np.float64)
+    new_zs[:n] = z_top
+    new_zs[n:] = z_bot
+    new_vs = np.concatenate([vs, vs])
+
+    top_tris = tris.astype(np.int64, copy=False)
+    bot_tris = tris[:, [0, 2, 1]].astype(np.int64) + n
+
+    # Boundary edges = those incident to exactly one triangle.
+    m = tris.shape[0]
+    edges = np.empty((3 * m, 2), dtype=np.int64)
+    edges[0::3] = np.sort(tris[:, [0, 1]], axis=1)
+    edges[1::3] = np.sort(tris[:, [1, 2]], axis=1)
+    edges[2::3] = np.sort(tris[:, [2, 0]], axis=1)
+    _, inverse, counts = np.unique(edges, axis=0,
+                                    return_inverse=True, return_counts=True)
+    boundary_mask = counts[inverse] == 1
+    bedges = edges[boundary_mask]
+
+    # Each boundary edge (a, b) → two triangles forming the side-wall
+    # quad: (a_top, b_top, b_bot) and (a_top, b_bot, a_bot).
+    a = bedges[:, 0]
+    b = bedges[:, 1]
+    wall_1 = np.column_stack([a, b, b + n])
+    wall_2 = np.column_stack([a, b + n, a + n])
+
+    all_tris = np.concatenate([top_tris, bot_tris, wall_1, wall_2],
+                              axis=0).astype(np.int32, copy=False)
+    return new_xs, new_ys, new_zs, new_vs, all_tris
+
+
+def _shape_outline_segments(shape) -> np.ndarray:
+    """Convert a shapely Polygon / MultiPolygon's outline (exterior +
+    interior rings) into an (N, 2) float32 array of GL_LINES vertices.
+
+    Consecutive vertex pairs form one segment, so N == 2 * num_segments.
+    Returns an empty array when the shape is empty / has no rings. Used
+    by the per-layer outline overlay in :class:`GLMeshViewer`.
+    """
+    if shape is None or shape.is_empty:
+        return np.empty((0, 2), dtype=np.float32)
+    if hasattr(shape, "geoms"):
+        polys = list(shape.geoms)
+    else:
+        polys = [shape]
+    rings: list[np.ndarray] = []
+    for poly in polys:
+        ext = poly.exterior
+        if ext is not None and not ext.is_empty:
+            rings.append(np.asarray(ext.coords, dtype=np.float32))
+        for hole in poly.interiors:
+            if hole is not None and not hole.is_empty:
+                rings.append(np.asarray(hole.coords, dtype=np.float32))
+    segs: list[np.ndarray] = []
+    for ring in rings:
+        # Each ring already includes the closing-vertex duplicate
+        # (ring[-1] == ring[0]); turning it into GL_LINES pairs gives
+        # ``len(ring) - 1`` segments, each two consecutive points.
+        if ring.shape[0] < 2:
+            continue
+        pairs = np.empty((2 * (ring.shape[0] - 1), 2), dtype=np.float32)
+        pairs[0::2] = ring[:-1]
+        pairs[1::2] = ring[1:]
+        segs.append(pairs)
+    if not segs:
+        return np.empty((0, 2), dtype=np.float32)
+    return np.concatenate(segs, axis=0)
+
+
+class _FastTriSampler:
+    """Point-samples a triangulated linear scalar field — a drop-in
+    replacement for :class:`matplotlib.tri.LinearTriInterpolator` that
+    skips its ``TrapezoidMapTriFinder``.
+
+    Matplotlib builds that trapezoid map eagerly inside the interpolator
+    constructor. On a large copper plane (a GND pour reaches 300k+
+    triangles) that takes 3–10 s and froze the GUI for several seconds
+    the first time the hover probe touched the plane — the per-layer
+    interpolator cache is why only the *first* hover stalled.
+
+    This sampler instead builds a ``cKDTree`` over triangle centroids
+    (pure C, ~50–80x faster to construct) and, at query time,
+    barycentric-interpolates the nearest triangle that contains the
+    point. The interpolation is mathematically identical — linear over
+    each triangle — so results match ``LinearTriInterpolator`` to
+    floating-point precision (verified <1e-16 V across every GND plane
+    in the example projects). Same pure-C-spatial-index swap the Vias /
+    Pins report tables already use (see :meth:`PdnViewer._compute_via_report`).
+    """
+
+    # Candidate triangles examined per query. For any quality mesh the
+    # containing triangle's centroid is among the nearest few; 32 is a
+    # wide safety margin — verified to give zero strict-inside misses
+    # across every GND plane in the bundled example designs.
+    _K: int = 32
+
+    def __init__(self, triangulation, values) -> None:
+        x = np.ascontiguousarray(triangulation.x, dtype=np.float64)
+        y = np.ascontiguousarray(triangulation.y, dtype=np.float64)
+        tris = np.ascontiguousarray(triangulation.triangles, dtype=np.intp)
+        z = np.ascontiguousarray(values, dtype=np.float64)
+        i0, i1, i2 = tris[:, 0], tris[:, 1], tris[:, 2]
+        # Per-triangle anchor vertex + the two edge vectors, so a query
+        # is just a point offset and a 2x2 solve for the barycentrics.
+        self._ax, self._ay = x[i0], y[i0]
+        self._v0x, self._v0y = x[i1] - self._ax, y[i1] - self._ay
+        self._v1x, self._v1y = x[i2] - self._ax, y[i2] - self._ay
+        det = self._v0x * self._v1y - self._v1x * self._v0y
+        # 1/det, zeroed on degenerate (zero-area) triangles so they can
+        # never win the argmax below.
+        self._inv_det = np.where(np.abs(det) > 1e-30, 1.0 / det, 0.0)
+        self._va, self._vb, self._vc = z[i0], z[i1], z[i2]
+        centroids = np.column_stack([
+            (x[i0] + x[i1] + x[i2]) / 3.0,
+            (y[i0] + y[i1] + y[i2]) / 3.0,
+        ])
+        from scipy.spatial import cKDTree
+        # balanced_tree / compact_nodes off → ~3x faster build; queries
+        # stay in the microsecond range, and we build once per layer.
+        self._tree = cKDTree(centroids, balanced_tree=False,
+                             compact_nodes=False)
+        self._k = int(min(self._K, max(1, tris.shape[0])))
+
+    def __call__(self, x: float, y: float):
+        """Sample the field at world coords (x, y). Returns a 0-d
+        ``numpy`` masked array — the same type ``LinearTriInterpolator``
+        returns — masked when the point is off the mesh."""
+        _d, idx = self._tree.query((x, y), k=self._k)
+        idx = np.atleast_1d(idx)
+        px = x - self._ax[idx]
+        py = y - self._ay[idx]
+        v0x, v0y = self._v0x[idx], self._v0y[idx]
+        v1x, v1y = self._v1x[idx], self._v1y[idx]
+        inv = self._inv_det[idx]
+        # Barycentric weights of (x, y) for each candidate triangle:
+        # p - a = u*(b - a) + w*(c - a); the third weight is 1 - u - w.
+        u = (px * v1y - v1x * py) * inv
+        w = (v0x * py - px * v0y) * inv
+        t = 1.0 - u - w
+        min_w = np.minimum(np.minimum(t, u), w)
+        min_w[inv == 0.0] = -np.inf          # never pick a degenerate tri
+        j = int(np.argmax(min_w))            # triangle the point is "most inside"
+        if min_w[j] < -0.5:
+            # Well outside every candidate triangle — a genuine off-mesh
+            # point (e.g. a meshing gap inside the copper outline). Match
+            # LinearTriInterpolator's masked off-mesh result.
+            return np.ma.masked_array(0.0, mask=True)
+        val = (t[j] * self._va[idx[j]]
+               + u[j] * self._vb[idx[j]]
+               + w[j] * self._vc[idx[j]])
+        return np.ma.masked_array(float(val), mask=False)
+
+
+class _GradientBar(QWidget):
+    """Horizontal colormap strip with two draggable handles for vmin/vmax,
+    designed to sit as an overlay on the heatmap viewer's bottom-left
+    corner.
+
+    Paints its own dark chip background, a title, the gradient strip with
+    draggable handles, and a row of value tick labels along the bottom.
+    Emits :attr:`rangeChanged(low, high)` whenever the user drags a
+    handle. The handles render as small triangle pointers above the
+    strip; clicking on the strip near a handle starts a drag. ``low`` is
+    always kept ≤ ``high`` with at least a tiny gap so the heatmap
+    doesn't collapse.
+
+    Colours are fixed rather than theme-driven — the chip sits on the
+    heatmap (not in the themed side panel), so it always uses a dark
+    background with light text, matching the GL viewer's legend chip.
+    """
+
+    rangeChanged = Signal(float, float)
+
+    # --- Fixed overlay colours (theme-independent — chip sits on the GL
+    # viewer, like the legend chip) ---
+    _CHIP_BG = QColor(30, 30, 30)
+    _CHIP_BORDER = QColor("#666666")
+    _STRIP_BORDER = QColor("#888888")
+    _MASK = QColor(0, 0, 0, 150)        # darkens the strip outside [low, high]
+    _TEXT = QColor("#e6e6e6")
+    _TICK = QColor("#aaaaaa")
+    _HANDLE_FILL = QColor("#f0f0f0")
+    _HANDLE_EDGE = QColor("#1a1a1a")
+
+    # --- Pixel geometry ---
+    _CHIP_W: int = 300
+    _CHIP_PAD: int = 8       # padding between chip edge and content
+    _MARGIN_X: int = 8       # extra inset so handle triangles aren't clipped
+    _TITLE_H: int = 15       # title text band
+    _MARGIN_TOP: int = 9     # handle-triangle space above the strip
+    _STRIP_HEIGHT: int = 15
+    _TICK_GAP: int = 3       # strip bottom → tick mark
+    _TICK_MARK: int = 4      # tick mark length
+    _TICK_LABEL_H: int = 13  # tick label text band
+    _HANDLE_HALF_W: int = 6
+    _N_TICKS: int = 5
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        # Data bounds (the absolute extents the slider spans) and user-
+        # selected clamp values. Kept separately so the user can clamp
+        # tighter than the data range without losing the auto-detected
+        # extents.
+        self._data_min: float = 0.0
+        self._data_max: float = 1.0
+        self._low: float = 0.0
+        self._high: float = 1.0
+        self._cmap_name: str = "viridis"
+        self._cmap_gradient: QLinearGradient | None = None
+        self._dragging: str | None = None  # 'low', 'high', or None
+        # Metric name + unit shown above the strip, e.g. "Voltage [V]".
+        self._title: str = ""
+        # Log-spaced value axis. When True the handle ↔ value mapping is
+        # logarithmic; the data range must be strictly positive for it to
+        # take effect (callers floor it — see PdnViewer._render).
+        self._log: bool = False
+        height = (self._CHIP_PAD + self._TITLE_H + self._MARGIN_TOP
+                  + self._STRIP_HEIGHT + self._TICK_GAP + self._TICK_MARK
+                  + self._TICK_LABEL_H + self._CHIP_PAD)
+        self.setFixedSize(self._CHIP_W, height)
+        self.setMouseTracking(True)
+        self._rebuild_gradient()
+
+    def setTitle(self, label: str, unit: str) -> None:
+        """Set the heading shown above the strip, e.g. ``Voltage [V]``."""
+        self._title = f"{label} [{unit}]" if unit else (label or "")
+        self.update()
+
+    def setColormap(self, cmap_name: str) -> None:
+        self._cmap_name = cmap_name
+        self._rebuild_gradient()
+        self.update()
+
+    def setLogScale(self, on: bool) -> None:
+        """Switch the strip between a linear and a log-spaced value axis.
+        Log needs a strictly positive data range; :meth:`_value_to_t`
+        falls back to linear if that doesn't hold."""
+        on = bool(on)
+        if on != self._log:
+            self._log = on
+            self.update()
+
+    def setDataRange(self, data_min: float, data_max: float) -> None:
+        """Set the absolute data extents (full slider range)."""
+        if not math.isfinite(data_min) or not math.isfinite(data_max):
+            return
+        if data_max <= data_min:
+            data_max = data_min + 1e-12
+        self._data_min = float(data_min)
+        self._data_max = float(data_max)
+        # Clamp the current selection to the new bounds.
+        self._low = max(self._data_min, min(self._low, self._data_max))
+        self._high = min(self._data_max, max(self._high, self._data_min))
+        if self._high <= self._low:
+            self._high = self._low + (self._data_max - self._data_min) * 1e-6
+        self.update()
+
+    def setSelectedRange(self, low: float, high: float,
+                         emit: bool = False) -> None:
+        """Programmatically set the clamp values. Used to reset on a fresh
+        render so the next mode starts with full-range coverage."""
+        if not (math.isfinite(low) and math.isfinite(high)):
+            return
+        if high <= low:
+            high = low + (self._data_max - self._data_min) * 1e-6
+        self._low = float(low)
+        self._high = float(high)
+        self.update()
+        if emit:
+            self.rangeChanged.emit(self._low, self._high)
+
+    def selectedRange(self) -> tuple[float, float]:
+        return self._low, self._high
+
+    def dataRange(self) -> tuple[float, float]:
+        return self._data_min, self._data_max
+
+    # --- Painting -----------------------------------------------------------
+
+    def _rebuild_gradient(self) -> None:
+        """Pre-compute a QLinearGradient with stops sampled from the active
+        matplotlib colormap. Cached so paintEvent doesn't re-sample on every
+        repaint (drags fire many repaints per second)."""
+        cmap = _mpl_cm.get_cmap(self._cmap_name)
+        grad = QLinearGradient(0, 0, 1, 0)
+        grad.setCoordinateMode(QLinearGradient.ObjectBoundingMode)
+        n_stops = 32
+        for i in range(n_stops):
+            t = i / (n_stops - 1)
+            r, g, b, a = cmap(t)
+            grad.setColorAt(t, QColor.fromRgbF(r, g, b, a))
+        self._cmap_gradient = grad
+
+    def _strip_rect(self) -> QRectF:
+        left = self._CHIP_PAD + self._MARGIN_X
+        top = self._CHIP_PAD + self._TITLE_H + self._MARGIN_TOP
+        return QRectF(
+            left,
+            top,
+            max(1.0, self.width() - 2.0 * left),
+            self._STRIP_HEIGHT,
+        )
+
+    def _log_ok(self) -> bool:
+        """True when the log axis can actually be used — it needs a
+        strictly positive, non-degenerate data range."""
+        return (self._log and self._data_min > 0.0
+                and self._data_max > self._data_min)
+
+    def _value_to_t(self, value: float) -> float:
+        """Normalised 0..1 position of ``value`` along the strip — log-
+        spaced when the log axis is active, linear otherwise."""
+        if self._log_ok():
+            lo = math.log10(self._data_min)
+            hi = math.log10(self._data_max)
+            v = math.log10(max(value, self._data_min))
+            t = (v - lo) / max(hi - lo, 1e-30)
+        else:
+            span = max(self._data_max - self._data_min, 1e-30)
+            t = (value - self._data_min) / span
+        return min(1.0, max(0.0, t))
+
+    def _value_to_x(self, value: float) -> float:
+        rect = self._strip_rect()
+        return rect.left() + self._value_to_t(value) * rect.width()
+
+    def _x_to_value(self, x: float) -> float:
+        rect = self._strip_rect()
+        if rect.width() <= 0:
+            return self._data_min
+        t = min(1.0, max(0.0, (x - rect.left()) / rect.width()))
+        if self._log_ok():
+            lo = math.log10(self._data_min)
+            hi = math.log10(self._data_max)
+            return 10.0 ** (lo + t * (hi - lo))
+        return self._data_min + t * (self._data_max - self._data_min)
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        # Chip background — an opaque dark rect + light border, matching
+        # the GL viewer's legend chip so the strip reads on top of the
+        # heatmap regardless of the colours underneath.
+        p.fillRect(self.rect(), self._CHIP_BG)
+        p.setPen(self._CHIP_BORDER)
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5))
+
+        # Title ("Voltage [V]" etc.).
+        if self._title:
+            f = p.font()
+            f.setPointSizeF(9.0)
+            f.setBold(True)
+            p.setFont(f)
+            p.setPen(self._TEXT)
+            p.drawText(
+                QRectF(self._CHIP_PAD, self._CHIP_PAD,
+                       self.width() - 2 * self._CHIP_PAD, self._TITLE_H),
+                Qt.AlignLeft | Qt.AlignVCenter, self._title,
+            )
+
+        # Gradient strip + border.
+        strip = self._strip_rect()
+        if self._cmap_gradient is not None:
+            p.fillRect(strip, self._cmap_gradient)
+        p.setPen(self._STRIP_BORDER)
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(strip)
+
+        # Darken the strip outside [low, high] so the active clamp window
+        # is visually obvious.
+        low_x = self._value_to_x(self._low)
+        high_x = self._value_to_x(self._high)
+        p.fillRect(QRectF(strip.left(), strip.top(),
+                          low_x - strip.left(), strip.height()), self._MASK)
+        p.fillRect(QRectF(high_x, strip.top(),
+                          strip.right() - high_x, strip.height()), self._MASK)
+
+        # Tick marks + value labels along the bottom edge.
+        self._draw_ticks(p, strip)
+
+        # Handle triangles (one pointing down at each clamp position).
+        self._draw_handle(p, low_x)
+        self._draw_handle(p, high_x)
+
+    def _draw_handle(self, p: QPainter, x: float) -> None:
+        top_y = self._strip_rect().top() - 1
+        tri = QPolygonF([
+            QPointF(x, top_y + 8),
+            QPointF(x - self._HANDLE_HALF_W, top_y - 2),
+            QPointF(x + self._HANDLE_HALF_W, top_y - 2),
+        ])
+        p.setPen(self._HANDLE_EDGE)
+        p.setBrush(self._HANDLE_FILL)
+        p.drawPolygon(tri)
+
+    def _draw_ticks(self, p: QPainter, strip: QRectF) -> None:
+        """Draw ``_N_TICKS`` evenly-spaced tick marks under the strip,
+        each labelled with the data value at that position."""
+        log = self._log_ok()
+        decimals = self._tick_decimals()
+        f = p.font()
+        f.setPointSizeF(8.0)
+        f.setBold(False)
+        p.setFont(f)
+        n = self._N_TICKS
+        mark_top = strip.bottom() + self._TICK_GAP
+        mark_bot = mark_top + self._TICK_MARK
+        label_top = mark_bot
+        for i in range(n):
+            t = i / (n - 1)
+            x = strip.left() + t * strip.width()
+            value = self._x_to_value(x)
+            p.setPen(self._TICK)
+            p.drawLine(QPointF(x, mark_top), QPointF(x, mark_bot))
+            text = (f"{value:.3g}" if log
+                    else self._fmt_tick(value, decimals))
+            # Keep the end labels inside the chip — left-align the first,
+            # right-align the last, centre the rest.
+            if i == 0:
+                box = QRectF(x, label_top, 90.0, self._TICK_LABEL_H)
+                align = Qt.AlignLeft | Qt.AlignVCenter
+            elif i == n - 1:
+                box = QRectF(x - 90.0, label_top, 90.0, self._TICK_LABEL_H)
+                align = Qt.AlignRight | Qt.AlignVCenter
+            else:
+                box = QRectF(x - 45.0, label_top, 90.0, self._TICK_LABEL_H)
+                align = Qt.AlignHCenter | Qt.AlignVCenter
+            p.setPen(self._TEXT)
+            p.drawText(box, align, text)
+
+    def _tick_decimals(self) -> int:
+        """Decimal places for the (linear) tick labels — enough to tell
+        adjacent ticks apart across the current data span."""
+        span = abs(self._data_max - self._data_min)
+        if span <= 0.0 or not math.isfinite(span):
+            return 2
+        step = span / max(self._N_TICKS - 1, 1)
+        if step <= 0.0:
+            return 2
+        return min(8, max(0, 1 - math.floor(math.log10(step))))
+
+    @staticmethod
+    def _fmt_tick(value: float, decimals: int) -> str:
+        if not math.isfinite(value):
+            return "—"
+        av = abs(value)
+        if av != 0.0 and (av < 1e-3 or av >= 1e5):
+            return f"{value:.2e}"
+        s = f"{value:.{decimals}f}"
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s or "0"
+
+    # --- Mouse input --------------------------------------------------------
+
+    def _hit_handle(self, x: float) -> str | None:
+        """Pick whichever handle is closest to ``x`` within the grip radius."""
+        low_x = self._value_to_x(self._low)
+        high_x = self._value_to_x(self._high)
+        grip = self._HANDLE_HALF_W + 4
+        d_low = abs(x - low_x)
+        d_high = abs(x - high_x)
+        if d_low <= grip and d_low <= d_high:
+            return "low"
+        if d_high <= grip:
+            return "high"
+        return None
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton:
+            return
+        pos = event.position()
+        strip = self._strip_rect()
+        # Only the strip and the handle band just above it are draggable —
+        # clicks on the title or the tick labels must not move a handle.
+        if not (strip.top() - 11 <= pos.y() <= strip.bottom() + 2):
+            return
+        self._dragging = self._hit_handle(pos.x())
+        if self._dragging is None:
+            # Click on bare strip → move the nearest handle to that point.
+            v = self._x_to_value(pos.x())
+            if abs(v - self._low) <= abs(v - self._high):
+                self._dragging = "low"
+            else:
+                self._dragging = "high"
+            self._update_from_drag(pos.x())
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._dragging is not None:
+            self._update_from_drag(event.position().x())
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._dragging = None
+
+    def _update_from_drag(self, x_pixel: float) -> None:
+        v = self._x_to_value(x_pixel)
+        # Don't let the handles cross — leave at least 1e-6 of the data span
+        # between them so the heatmap retains a tiny colour range.
+        gap = max((self._data_max - self._data_min) * 1e-6, 1e-30)
+        if self._dragging == "low":
+            self._low = min(v, self._high - gap)
+        elif self._dragging == "high":
+            self._high = max(v, self._low + gap)
+        self.update()
+        self.rangeChanged.emit(self._low, self._high)
+
+
+class ScaleController(QWidget):
+    """Compound widget: title + gradient bar + Min/Max textboxes + Reset.
+
+    Wraps :class:`_GradientBar` with editable text fields so users can
+    enter precise clamp values OR drag the handles. Mirrors the
+    "Scope Controller" panel commonly seen in CAD post-processors.
+    """
+
+    rangeChanged = Signal(float, float)
+    # Emitted (with the matplotlib colormap name) when the user picks a
+    # different colour scheme from the dropdown. Programmatic
+    # :meth:`setColormap` calls are signal-blocked and do NOT emit this.
+    colormapChanged = Signal(str)
+    # Emitted (True = logarithmic) when the user changes the Scale
+    # dropdown. Programmatic :meth:`setLogActive` does NOT emit it.
+    scaleTypeChanged = Signal(bool)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._unit: str = ""
+        self._label: str = "Value"
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self.title_label = QLabel("<b>Color scale</b>")
+        layout.addWidget(self.title_label)
+
+        # Colour-scheme picker — recolours the heatmap live. Sits directly
+        # under the title so it reads as part of the colour-scale panel.
+        cmap_row = QHBoxLayout()
+        cmap_row.setContentsMargins(0, 0, 0, 0)
+        cmap_row.setSpacing(6)
+        self.cmap_label = QLabel("Scheme")
+        self.cmap_label.setStyleSheet(
+            f"QLabel {{ color: {_T()['fg_muted']}; font-size: 8pt; }}"
+        )
+        self.cmap_combo = QComboBox()
+        for display_name, _mpl_name in _HEATMAP_COLORMAPS:
+            self.cmap_combo.addItem(display_name)
+        self.cmap_combo.setToolTip(
+            "Colour scheme for the heatmap. Changing it recolours the "
+            "viewport immediately — no re-solve needed."
+        )
+        self.cmap_combo.currentIndexChanged.connect(self._on_cmap_combo_changed)
+        cmap_row.addWidget(self.cmap_label, 0)
+        cmap_row.addWidget(self.cmap_combo, 1)
+        layout.addLayout(cmap_row)
+
+        # Linear / logarithmic value axis. Hidden by the viewer for
+        # modes where a log scale is meaningless (Voltage) or undefined
+        # (the signed Voltage Drop) — see PdnViewer._render.
+        scale_row = QHBoxLayout()
+        scale_row.setContentsMargins(0, 0, 0, 0)
+        scale_row.setSpacing(6)
+        self.scale_label = QLabel("Scale")
+        self.scale_label.setStyleSheet(
+            f"QLabel {{ color: {_T()['fg_muted']}; font-size: 8pt; }}"
+        )
+        self.scale_combo = QComboBox()
+        self.scale_combo.addItems(["Linear", "Logarithmic"])
+        self.scale_combo.setToolTip(
+            "Linear or logarithmic colour scale. A log scale spreads the "
+            "low end so the bulk of the board and the spikes are both "
+            "readable at once — available for Current Density, Power "
+            "Density and Via Current (those span many decades). Hidden "
+            "for Voltage / Voltage Drop."
+        )
+        self.scale_combo.currentIndexChanged.connect(self._on_scale_combo_changed)
+        scale_row.addWidget(self.scale_label, 0)
+        scale_row.addWidget(self.scale_combo, 1)
+        layout.addLayout(scale_row)
+
+        # The gradient strip itself is NOT placed in this side panel — it
+        # lives as an overlay on the heatmap viewer's bottom-left corner
+        # (PdnViewer._build_ui reparents it onto the GL viewer). It is
+        # created here, parentless, so this controller can keep driving
+        # its colormap / range / title and relay its drag events; the
+        # data-extent tick labels are drawn on the strip itself. This
+        # panel keeps only the Scheme / Scale pickers + Min/Max editors.
+        _t = _T()
+        self.bar = _GradientBar()
+        self.bar.rangeChanged.connect(self._on_bar_range_changed)
+
+        edits_row = QHBoxLayout()
+        edits_row.setContentsMargins(0, 0, 0, 0)
+        edits_row.setSpacing(6)
+
+        min_col = QVBoxLayout()
+        min_col.setSpacing(2)
+        min_lbl = QLabel("Min")
+        min_lbl.setStyleSheet(
+            f"QLabel {{ color: {_t['fg_muted']}; font-size: 8pt; }}"
+        )
+        self.min_edit = QLineEdit()
+        self.min_edit.setValidator(QDoubleValidator())
+        self.min_edit.editingFinished.connect(self._on_edits_committed)
+        min_col.addWidget(min_lbl)
+        min_col.addWidget(self.min_edit)
+        edits_row.addLayout(min_col, 1)
+
+        max_col = QVBoxLayout()
+        max_col.setSpacing(2)
+        max_lbl = QLabel("Max")
+        max_lbl.setStyleSheet(
+            f"QLabel {{ color: {_t['fg_muted']}; font-size: 8pt; }}"
+        )
+        self.max_edit = QLineEdit()
+        self.max_edit.setValidator(QDoubleValidator())
+        self.max_edit.editingFinished.connect(self._on_edits_committed)
+        max_col.addWidget(max_lbl)
+        max_col.addWidget(self.max_edit)
+        edits_row.addLayout(max_col, 1)
+
+        # Reset-to-data-range button — a small square button sitting to
+        # the right of the Max box. The Min/Max columns carry a label
+        # above the edit, so AlignBottom drops the button level with the
+        # input boxes (not the taller label+edit column). The "↺" glyph
+        # is the button's *text*, so it's painted in the themed text
+        # colour and tracks light/dark mode — a QStyle standard icon
+        # would not. Min/Max stay at equal stretch (1 each) so they keep
+        # the same width; the button column is fixed-width (stretch 0).
+        self.reset_button = QPushButton("↺")
+        self.reset_button.setToolTip(
+            "Reset to data range — restore Min / Max to the auto-detected "
+            "data range for the current layer, rail, and mode."
+        )
+        _reset_font = self.reset_button.font()
+        if _reset_font.pointSize() > 0:
+            _reset_font.setPointSize(_reset_font.pointSize() + 2)
+            self.reset_button.setFont(_reset_font)
+        self.reset_button.clicked.connect(self._on_reset_clicked)
+        edits_row.addWidget(self.reset_button, 0, Qt.AlignBottom)
+
+        layout.addLayout(edits_row)
+
+        # Theme-driven styling for the inputs so they don't fight the rest
+        # of the UI. Colours come from the active theme dict so both dark
+        # and light modes look right.
+        self.setStyleSheet(
+            f"QLineEdit {{ background-color: {_t['bg_input']}; color: {_t['fg']};"
+            f"            border: 1px solid {_t['border']}; padding: 2px 4px; }}"
+            f"QPushButton {{ background-color: {_t['bg_hover']}; color: {_t['fg']};"
+            f"              border: 1px solid {_t['border']}; padding: 3px; }}"
+            f"QPushButton:hover {{ background-color: {_t['bg_hover_strong']}; }}"
+        )
+
+        # Square the reset button to the Min/Max input height. Done after
+        # the stylesheet is set so the line edit's size hint already
+        # includes the themed padding + border.
+        self.min_edit.ensurePolished()
+        _edit_h = self.min_edit.sizeHint().height()
+        self.reset_button.setFixedSize(_edit_h, _edit_h)
+
+    def apply_theme(self) -> None:
+        """Re-style the controller and its children to match the active
+        theme. Called by :meth:`PdnViewer._refresh_inline_theme` after the
+        user picks a new theme in the Settings tab."""
+        t = current_theme()
+        # The "Min" / "Max" / "Scheme" / "Scale" header labels weren't
+        # captured as instance attributes; find them by their plain text
+        # so we can re-style. (The gradient strip itself is a fixed-colour
+        # overlay on the GL viewer — it has no theme to follow.)
+        for lbl in self.findChildren(QLabel):
+            if lbl is self.title_label:
+                continue
+            if lbl.text().strip() in ("Min", "Max", "Scheme", "Scale"):
+                lbl.setStyleSheet(
+                    f"QLabel {{ color: {t['fg_muted']}; font-size: 8pt; }}"
+                )
+        self.setStyleSheet(
+            f"QLineEdit {{ background-color: {t['bg_input']}; color: {t['fg']};"
+            f"            border: 1px solid {t['border']}; padding: 2px 4px; }}"
+            f"QPushButton {{ background-color: {t['bg_hover']}; color: {t['fg']};"
+            f"              border: 1px solid {t['border']}; padding: 3px; }}"
+            f"QPushButton:hover {{ background-color: {t['bg_hover_strong']}; }}"
+        )
+
+    def setColormap(self, cmap_name: str) -> None:
+        """Set the active colour scheme (matplotlib colormap name). Syncs
+        both the gradient strip and the dropdown selection WITHOUT emitting
+        :attr:`colormapChanged` — used for programmatic sync from the
+        viewer (the dropdown itself is the only thing that emits)."""
+        self.bar.setColormap(cmap_name)
+        for i, (_display, mpl_name) in enumerate(_HEATMAP_COLORMAPS):
+            if mpl_name == cmap_name and self.cmap_combo.currentIndex() != i:
+                self.cmap_combo.blockSignals(True)
+                self.cmap_combo.setCurrentIndex(i)
+                self.cmap_combo.blockSignals(False)
+                break
+
+    def _on_cmap_combo_changed(self, index: int) -> None:
+        """User picked a scheme from the dropdown — repaint the gradient
+        strip and let the viewer recolour the heatmap."""
+        if 0 <= index < len(_HEATMAP_COLORMAPS):
+            mpl_name = _HEATMAP_COLORMAPS[index][1]
+            self.bar.setColormap(mpl_name)
+            self.colormapChanged.emit(mpl_name)
+
+    def setLogActive(self, on: bool) -> None:
+        """Set whether the gradient strip uses a log-spaced value axis.
+        This is the *effective* state (the viewer forces linear for
+        ineligible modes); the dropdown selection is left untouched so
+        the user's preference survives a trip through such a mode."""
+        self.bar.setLogScale(on)
+
+    def setLogVisible(self, visible: bool) -> None:
+        """Show or hide the Scale (Linear / Logarithmic) dropdown for the
+        current mode. Hidden — not merely greyed — for modes where a log
+        axis is meaningless (Voltage) or undefined (the signed Voltage
+        Drop), so the panel only ever shows controls that do something."""
+        self.scale_combo.setVisible(visible)
+        self.scale_label.setVisible(visible)
+
+    def _on_scale_combo_changed(self, index: int) -> None:
+        """User switched the Linear / Logarithmic dropdown."""
+        self.scaleTypeChanged.emit(index == 1)
+
+    def setLabelUnit(self, label: str, unit: str) -> None:
+        # The metric name + unit are shown as the title on the overlaid
+        # strip; the side-panel header stays the static "Color scale".
+        self._label = label
+        self._unit = unit
+        self.bar.setTitle(label, unit)
+
+    def setRange(self, data_min: float, data_max: float,
+                 sel_min: float | None = None,
+                 sel_max: float | None = None,
+                 reset_selection: bool = True) -> None:
+        """Set the data extents (full slider range) and optionally the
+        initial Min/Max selection.
+
+        ``sel_min`` / ``sel_max`` default to the data extents — pass a
+        narrower window when the auto-detected data range contains
+        outliers (e.g. FEM spikes at pinned-voltage vertices) so the
+        default heatmap isn't crushed to one corner of the colour scale.
+        The slider can still be dragged out to ``data_max`` to inspect
+        the outlier.
+        """
+        self.bar.setDataRange(data_min, data_max)
+        if reset_selection:
+            initial_min = data_min if sel_min is None else sel_min
+            initial_max = data_max if sel_max is None else sel_max
+            self.bar.setSelectedRange(initial_min, initial_max, emit=False)
+        # Always refresh the text boxes so they reflect the (possibly
+        # re-clamped) selection.
+        low, high = self.bar.selectedRange()
+        self._set_edit_values(low, high)
+
+    def selectedRange(self) -> tuple[float, float]:
+        return self.bar.selectedRange()
+
+    # --- Internal slots -----------------------------------------------------
+
+    def _on_bar_range_changed(self, low: float, high: float) -> None:
+        self._set_edit_values(low, high)
+        self.rangeChanged.emit(low, high)
+
+    def _on_edits_committed(self) -> None:
+        try:
+            low = float(self.min_edit.text())
+            high = float(self.max_edit.text())
+        except ValueError:
+            return
+        if high <= low:
+            return
+        self.bar.setSelectedRange(low, high, emit=False)
+        self.rangeChanged.emit(low, high)
+
+    def _on_reset_clicked(self) -> None:
+        d_min, d_max = self.bar.dataRange()
+        self.bar.setSelectedRange(d_min, d_max, emit=False)
+        self._set_edit_values(d_min, d_max)
+        self.rangeChanged.emit(d_min, d_max)
+
+    def _set_edit_values(self, low: float, high: float) -> None:
+        # ``blockSignals`` is the simple way to suppress editingFinished
+        # while we update the text — otherwise typing in one box would
+        # trigger a re-render mid-edit when focus moves.
+        self.min_edit.blockSignals(True)
+        self.max_edit.blockSignals(True)
+        self.min_edit.setText(self._fmt(low))
+        self.max_edit.setText(self._fmt(high))
+        self.min_edit.blockSignals(False)
+        self.max_edit.blockSignals(False)
+
+    @staticmethod
+    def _fmt(value: float) -> str:
+        if not math.isfinite(value):
+            return "—"
+        if value == 0:
+            return "0"
+        if abs(value) < 1e-3 or abs(value) >= 1e5:
+            return f"{value:.3e}"
+        return f"{value:.4g}"
+
+
+class _SolveProgressUpdater(QObject):
+    """Wires a :class:`_SolveWorker`'s ``stage_changed`` / ``substage_changed``
+    signals to a :class:`QProgressDialog`, with a live elapsed-time
+    counter for the current stage so the user can see that long opaque
+    steps (e.g. the ~20 s "Meshing + solving") are still making progress.
+
+    The dialog's label text is rendered as up to two lines:
+
+      | Meshing + solving (21 (layer, net) slabs, 67 networks)…  (12s)
+      | Currently: Constructing the Laplace operators
+
+    A second, independent counter — the total wall-clock time since the
+    load started — ticks in the dialog's bottom-left corner ("Elapsed:
+    Ns"). Unlike the per-stage counter it never resets between stages.
+
+    Both counters tick once a second via a QTimer parented to ``self``
+    (so it dies when the updater is deleted). Call :meth:`stop` from the
+    worker's cleanup path to stop ticking before the dialog closes.
+    """
+
+    def __init__(self, dlg: QProgressDialog, worker: _SolveWorker,
+                 parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._dlg = dlg
+        self._stage_text: str = ""
+        self._substage_text: str = ""
+        self._stage_start: float = 0.0
+        # Wall-clock start of the whole load, for the bottom-left total
+        # counter. Set now (the dialog is already shown) so it counts
+        # from the moment the dialog appears, not from the first stage.
+        self._total_start: float = time.monotonic()
+        self._elapsed_label: QLabel = self._make_elapsed_label(dlg)
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._render)
+        # Tick immediately — the total counter must run even before the
+        # first stage_changed arrives (e.g. during the solve-cache probe).
+        self._timer.start()
+        worker.stage_changed.connect(self._on_stage)
+        worker.substage_changed.connect(self._on_substage)
+        self._render()
+
+    @staticmethod
+    def _make_elapsed_label(dlg: QProgressDialog) -> QLabel:
+        """Build the total-elapsed label pinned to the dialog's
+        bottom-left, level with the Cancel button.
+
+        The dialog is fixed-size by the time this runs, and the Cancel
+        button's vertical position depends only on the dialog height
+        (unchanged by the width-only stretch in the caller) — so a
+        one-shot move() holds for the dialog's whole lifetime.
+        """
+        label = QLabel(dlg)
+        label.setObjectName("_elapsed_timer_label")
+        # Size for the widest text we'll ever show: the label isn't
+        # layout-managed, so a later setText() won't grow it and a
+        # too-narrow label would clip the seconds count.
+        label.setText("Elapsed: 0000s")
+        label.adjustSize()
+        label.setText("Elapsed: 0s")
+        cancel_btn = dlg.findChild(QPushButton)
+        if cancel_btn is not None and cancel_btn.height() > 0:
+            y = cancel_btn.y() + (cancel_btn.height() - label.height()) // 2
+        else:
+            y = dlg.height() - label.height() - 9
+        label.move(11, y)
+        label.show()
+        label.raise_()
+        return label
+
+    def _on_stage(self, text: str) -> None:
+        self._stage_text = text
+        self._substage_text = ""
+        self._stage_start = time.monotonic()
+        self._render()
+
+    def _on_substage(self, text: str) -> None:
+        self._substage_text = text
+        self._render()
+
+    def _render(self) -> None:
+        if self._dlg is None:
+            return
+        # Total wall-clock counter (bottom-left) — updated every tick,
+        # independent of which stage is currently running.
+        total = int(time.monotonic() - self._total_start)
+        self._elapsed_label.setText(f"Elapsed: {total}s")
+        if not self._stage_text:
+            return
+        elapsed = int(time.monotonic() - self._stage_start)
+        first = f"{self._stage_text}  ({elapsed}s)" if elapsed > 0 \
+            else self._stage_text
+        if self._substage_text:
+            self._dlg.setLabelText(f"{first}\nCurrently: {self._substage_text}")
+        else:
+            self._dlg.setLabelText(first)
+
+    def stop(self) -> None:
+        """Stop the elapsed-time timer. Safe to call multiple times."""
+        if self._timer.isActive():
+            self._timer.stop()
+
+
+class _StageTimer:
+    """Accumulates wall-clock durations of named load-pipeline stages and
+    logs a ranked breakdown when the load finishes.
+
+    The whole-load counterpart of pdnsolver.solver's per-stage timing: it
+    lets a clean load self-report where its time went (extract, geometry,
+    solve, packaging, cache) so the slow stages are obvious without scraping
+    timestamps out of the log by hand.
+    """
+
+    def __init__(self, log_: logging.Logger) -> None:
+        self._log = log_
+        self._stages: list[tuple[str, float]] = []
+        self._t0 = time.monotonic()
+
+    @contextlib.contextmanager
+    def stage(self, label: str):
+        """Time a ``with``-wrapped pipeline stage and record its duration."""
+        t = time.monotonic()
+        try:
+            yield
+        finally:
+            dt = time.monotonic() - t
+            self._stages.append((label, dt))
+            self._log.info("Stage '%s' done in %.2fs", label, dt)
+
+    def log_breakdown(self) -> None:
+        """Log every recorded stage, slowest first, with its share of the
+        total wall-clock time since this timer was created. An
+        ``(other / untimed)`` row catches whatever ran outside a stage."""
+        total = time.monotonic() - self._t0
+        self._log.info("=== Load timing breakdown (slowest stage first) ===")
+        accounted = 0.0
+        for label, dt in sorted(self._stages, key=lambda kv: kv[1], reverse=True):
+            accounted += dt
+            pct = 100.0 * dt / total if total > 0 else 0.0
+            self._log.info("  %8.2fs  %5.1f%%  %s", dt, pct, label)
+        other = total - accounted
+        self._log.info("  %8.2fs  %5.1f%%  (other / untimed)", other,
+                       100.0 * other / total if total > 0 else 0.0)
+        self._log.info("  %8.2fs  100.0%%  TOTAL", total)
+
+
+class _SolveWorker(QThread):
+    """Background worker that re-runs the FEM solve off the GUI thread.
+
+    The solve takes 10–60 s on typical boards; running it on the main
+    thread freezes the UI (Windows shows "Not Responding") and the
+    Settings-tab status label can't update mid-solve. Punting it to a
+    QThread lets the progress dialog spin and stage messages stream in
+    via :attr:`stage_changed`.
+
+    Note: the worker does NOT call ``settings.apply_to_modules()`` itself;
+    the caller does that on the main thread before ``start()`` so the
+    module-level monkey-patch ordering is unambiguous.
+    """
+
+    stage_changed = Signal(str)           # "Building geometry…" etc.
+    substage_changed = Signal(str)        # finer-grained detail line shown
+                                          # under the main stage label (e.g.
+                                          # pdnsolver's per-step log records
+                                          # during meshing + solving)
+    finished_ok = Signal(object, object)  # (LeanSolution, metadata dict)
+    failed = Signal(str)                  # error message for the UI
+
+    def __init__(self, prjpcb_path: Path, settings,
+                  sink_overrides: dict[tuple[str, str, int | None], float] | None = None,
+                  stackup_overrides: dict[int, float] | None = None,
+                  pcbdoc_selector: str | Path | None = None,
+                  use_design_cache: bool = True,
+                  try_solve_cache_first: bool = False,
+                  parent=None) -> None:
+        super().__init__(parent)
+        self._prjpcb_path = prjpcb_path
+        self._settings = settings
+        # ``{(designator, schdoc, channel_index): current_amperes}`` —
+        # substituted into the parsed AnnotationResult before build_problem
+        # so the FEM sees the new currents. ``channel_index`` is None for
+        # the legacy unindexed SINK channel and an int for indexed channels
+        # (PDN1_I / PDN2_I / …).
+        self._sink_overrides = dict(sink_overrides or {})
+        # ``{layer_id: copper_thickness_mm}`` — substituted into the
+        # ExtractedProject's stackup so both per-layer conductance and
+        # via-barrel hop lengths reflect the new thicknesses.
+        self._stackup_overrides = dict(stackup_overrides or {})
+        # Selects one of several .PcbDoc files in a multi-PCB project.
+        # None = altium_monkey default (first PcbDoc in project order).
+        self._pcbdoc_selector = pcbdoc_selector
+        # False = "Load from Project (Clean)" / "Reload Design Info" path:
+        # always run extract+geometry+annotations from disk. True = try the
+        # FYPA design-info cache first and fall back to a fresh load on miss.
+        self._use_design_cache = bool(use_design_cache)
+        # True = try the FYPA SOLVE cache first; on hit, emit finished_ok
+        # immediately with the cached (solution, metadata) and skip
+        # extract/mesh/solve entirely. The pickle.load can take 5–10 s for
+        # large boards, so doing it on this worker thread (rather than the
+        # main thread before starting the worker) keeps the progress
+        # dialog responsive instead of freezing the UI.
+        self._try_solve_cache_first = bool(try_solve_cache_first)
+
+    def run(self) -> None:  # type: ignore[override]
+        # Bias the OS scheduler toward the GUI thread. The packaging phase
+        # (build_solve_metadata + to_lean_solution + cache pickle) is pure
+        # Python and holds the GIL continuously; without this the main
+        # thread starves, the QProgressDialog barber-pole pauses, and
+        # Windows flags the window "Not Responding" on large boards.
+        self.setPriority(QThread.LowPriority)
+        try:
+            from altium_loader import (
+                build_problem,
+                build_solve_metadata,
+                load_project,
+            )
+            from lean_solution import to_lean_solution
+            from pdnsolver import mesh as _pdn_mesh
+            from pdnsolver import solver as _pdn_solver
+
+            # Resolve the PcbDoc up-front so the cache key is stable.
+            pcbdoc_resolved: Path | None = None
+            try:
+                from FYPA import _resolve_pcbdoc
+                pcbdoc_resolved = _resolve_pcbdoc(
+                    self._prjpcb_path,
+                    str(self._pcbdoc_selector) if self._pcbdoc_selector else None,
+                )
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    "Could not resolve PcbDoc for cache key (%s: %s); "
+                    "solve cache will NOT be written this run.",
+                    type(e).__name__, e,
+                )
+                pcbdoc_resolved = None
+
+            # Solve-cache fast path: pickle.load can take 5–10 s on large
+            # boards and blocks until the file is fully read, so doing it
+            # here (off the GUI thread) keeps the progress dialog responsive.
+            # On hit, finish immediately and skip extract/mesh/solve.
+            # Skipped when overrides are active — the cached solve was
+            # computed against the on-disk project and would be wrong.
+            if (self._try_solve_cache_first
+                    and pcbdoc_resolved is not None
+                    and not self._stackup_overrides
+                    and not self._sink_overrides):
+                self.stage_changed.emit(
+                    f"Checking solve cache for {self._prjpcb_path.name}…"
+                )
+                try:
+                    cached = _try_solve_cache(self._prjpcb_path, pcbdoc_resolved)
+                except Exception as e:
+                    logging.getLogger(__name__).warning(
+                        "Solve-cache check failed (%s: %s); will re-solve.",
+                        type(e).__name__, e,
+                    )
+                    cached = None
+                if cached is not None:
+                    logging.getLogger(__name__).info(
+                        "Solve cache hit for %s — skipping extract + solve.",
+                        self._prjpcb_path.name,
+                    )
+                    self.stage_changed.emit(
+                        "Solve cache hit — opening viewer…"
+                    )
+                    self.finished_ok.emit(cached[0], cached[1])
+                    return
+
+            # Whole-load stage timer — logs a breakdown just before the
+            # viewer opens so a clean load self-reports where its time went.
+            _timer = _StageTimer(logging.getLogger(__name__))
+
+            loaded = None
+            if self._use_design_cache and pcbdoc_resolved is not None:
+                self.stage_changed.emit("Checking design-info cache…")
+                try:
+                    from FYPA import (
+                        _design_info_fingerprint,
+                        _try_load_cached_design_info,
+                    )
+                    # Unpickling the cached LoadedProject ("reusing the
+                    # design extract") runs many seconds on a big board.
+                    # Time it so the load breakdown reports the cost — it
+                    # parallels the "Save design-info cache" stage.
+                    with _timer.stage("Load design-info cache"):
+                        design_fp = _design_info_fingerprint(
+                            self._prjpcb_path, pcbdoc_resolved,
+                        )
+                        loaded = _try_load_cached_design_info(
+                            self._prjpcb_path, design_fp,
+                            pcbdoc_path=pcbdoc_resolved,
+                        )
+                except Exception as e:
+                    logging.getLogger(__name__).warning(
+                        "Design-info cache check failed (%s); re-extracting.",
+                        e,
+                    )
+                    loaded = None
+
+            if loaded is None:
+                self.stage_changed.emit("Loading project from disk…")
+                with _timer.stage("Extract + load project"):
+                    loaded = load_project(self._prjpcb_path,
+                                          pcbdoc_selector=self._pcbdoc_selector)
+                # Persist the freshly-loaded design info so the next run
+                # (e.g. a Re-run that only changes physics) can skip the
+                # extract step. Failures are non-fatal.
+                #
+                # Skipped on a clean load (``use_design_cache`` False): a
+                # clean load won't read a design-info cache anyway, so
+                # writing one — ~5 s of pickling the ExtractedProject on a
+                # big board — is pure dead weight on the critical path. The
+                # first subsequent *non-clean* load repopulates it.
+                if self._use_design_cache and pcbdoc_resolved is not None:
+                    try:
+                        from FYPA import (
+                            _design_info_fingerprint,
+                            _save_cached_design_info,
+                        )
+                        # Pickling the whole LoadedProject runs several
+                        # seconds on a big board. Give it its own progress
+                        # label + timing-log stage so the wait isn't
+                        # mistaken for a hung "Loading project from disk".
+                        self.stage_changed.emit("Saving design-info cache…")
+                        with _timer.stage("Save design-info cache"):
+                            design_fp = _design_info_fingerprint(
+                                self._prjpcb_path, pcbdoc_resolved,
+                            )
+                            _save_cached_design_info(
+                                self._prjpcb_path, design_fp, loaded,
+                                pcbdoc_path=pcbdoc_resolved,
+                            )
+                    except Exception as e:
+                        logging.getLogger(__name__).warning(
+                            "Couldn't write design-info cache (%s); ignoring.",
+                            e,
+                        )
+            else:
+                self.stage_changed.emit("Design-info cache hit — reusing extract.")
+
+            if not loaded.is_solveable:
+                _log = logging.getLogger(__name__)
+                _log_file = Path(__file__).parent / "log" / "fypa.log"
+                try:
+                    # diagnostic_summary() touches loaded.geometry, which
+                    # lazily runs the heavy per-layer polygon union. Give
+                    # it an honest progress label + a timed stage so the
+                    # wait shows in the dialog and log instead of looking
+                    # like a hang on the "cache hit" message.
+                    self.stage_changed.emit("Building diagnostic summary…")
+                    with _timer.stage("Build diagnostic summary"):
+                        _summary = loaded.diagnostic_summary()
+                    _log.error("Project is not solveable:\n%s", _summary)
+                except Exception as _exc:
+                    _log.error("Project is not solveable (diagnostic failed: %s)", _exc)
+                self.failed.emit(
+                    f"Project is not solveable.\n\n"
+                    f"See the log file for details:\n{_log_file}"
+                )
+                return
+
+            if self._stackup_overrides:
+                self.stage_changed.emit(
+                    f"Applying {len(self._stackup_overrides)} stackup "
+                    "thickness override(s)…"
+                )
+                loaded = self._apply_stackup_overrides(loaded)
+
+            if self._sink_overrides:
+                self.stage_changed.emit(
+                    f"Applying {len(self._sink_overrides)} sink-current "
+                    "override(s)…"
+                )
+                self._apply_sink_overrides(loaded)
+
+            self.stage_changed.emit("Assembling FEM problem…")
+            with _timer.stage("Build FEM problem"):
+                problem, via_segment_records, stub_pieces_by_pair, per_net_layers = (
+                    build_problem(loaded)
+                )
+
+            # variable_size_maximum_factor 1.0 == uniform mesh; > 1 enables
+            # adaptive variable-density meshing (coarse plane interiors).
+            mesher_config = _pdn_mesh.Mesher.Config(
+                minimum_angle=self._settings.mesh_min_angle_deg,
+                maximum_size=self._settings.mesh_max_size_mm,
+                variable_size_maximum_factor=(
+                    3.0 if getattr(self._settings, "adaptive_mesh", False)
+                    else 1.0
+                ),
+            )
+
+            self.stage_changed.emit(
+                f"Meshing + solving ({len(problem.layers)} (layer, net) "
+                f"slabs, {len(problem.networks)} networks)…"
+            )
+            # Capture Python warnings.warn() (e.g. padne's SolverWarning
+            # about ground node current) into the log file. Without this,
+            # warnings only go to stderr and are invisible from the GUI.
+            logging.captureWarnings(True)
+            # Forward pdnsolver's per-step INFO log records to the GUI as
+            # substage updates so the user can see what the solver is
+            # currently doing during the ~20 s opaque "Meshing + solving"
+            # stage ("Meshing the connected components", "Constructing the
+            # Laplace operators", "Solving the system of equations", …).
+            sub_emit = self.substage_changed.emit
+
+            class _SubstageForwarder(logging.Handler):
+                def emit(self_h, record: logging.LogRecord) -> None:
+                    try:
+                        sub_emit(record.getMessage())
+                    except Exception:
+                        pass
+
+            _substage_handler = _SubstageForwarder(level=logging.INFO)
+            _solver_log = logging.getLogger("pdnsolver.solver")
+            _mesh_log = logging.getLogger("pdnsolver.mesh")
+            _solver_log.addHandler(_substage_handler)
+            _mesh_log.addHandler(_substage_handler)
+            with _timer.stage("Mesh + solve"):
+                try:
+                    padne_solution = _pdn_solver.solve(
+                        problem, mesher_config=mesher_config,
+                    )
+                finally:
+                    _solver_log.removeHandler(_substage_handler)
+                    _mesh_log.removeHandler(_substage_handler)
+            si = padne_solution.solver_info
+            _log_post = logging.getLogger(__name__)
+            _log_post.info(
+                "Solver stats: ground_node_current=%.4g A, residual_norm=%.4g",
+                si.ground_node_current, si.residual_norm,
+            )
+            if abs(si.ground_node_current) > 1e-3:
+                _log_post.warning(
+                    "Ground node current is %.4g A — far from zero. The FEM "
+                    "is injecting this current at the reference vertex to "
+                    "balance the system. Absolute voltages are unreliable.",
+                    si.ground_node_current,
+                )
+
+            self.stage_changed.emit("Packaging solution: building metadata…")
+            with _timer.stage("Build solve metadata"):
+                metadata = build_solve_metadata(
+                    loaded, problem,
+                    mesher_config=mesher_config,
+                    solver_info=padne_solution.solver_info,
+                    via_segment_records=via_segment_records,
+                    settings=self._settings,
+                    stub_pieces_by_pair=stub_pieces_by_pair,
+                    per_net_layers=per_net_layers,
+                )
+            self.stage_changed.emit("Packaging solution: converting result…")
+            with _timer.stage("Convert to lean solution"):
+                new_solution = to_lean_solution(padne_solution)
+
+            # Persist the solve to the FYPA solve cache so the next
+            # "Load from Project" can skip both extract and solve.
+            # Skip when stackup_overrides / sink_overrides are in play —
+            # the resulting solve diverges from the on-disk project, so
+            # caching it would poison the next plain load. Failures are
+            # non-fatal: the viewer still opens.
+            _cache_log = logging.getLogger(__name__)
+            if pcbdoc_resolved is None:
+                _cache_log.warning(
+                    "Solve cache NOT written: pcbdoc_resolved is None "
+                    "(see earlier warning from _resolve_pcbdoc).",
+                )
+            elif self._stackup_overrides or self._sink_overrides:
+                _cache_log.info(
+                    "Solve cache NOT written: stackup/sink overrides "
+                    "are active; cached solve would diverge from project.",
+                )
+            else:
+                try:
+                    from FYPA import (
+                        _project_fingerprint,
+                        _save_cached_solution,
+                        _solve_cache_path,
+                    )
+                    self.stage_changed.emit("Packaging solution: saving cache…")
+                    solve_fp = _project_fingerprint(
+                        self._prjpcb_path, pcbdoc_resolved,
+                    )
+                    cache_path = _solve_cache_path(
+                        self._prjpcb_path, pcbdoc_resolved,
+                    )
+                    with _timer.stage("Write solve cache"):
+                        wrote = _save_cached_solution(
+                            self._prjpcb_path, solve_fp,
+                            new_solution, metadata,
+                            pcbdoc_path=pcbdoc_resolved,
+                        )
+                    if wrote:
+                        _cache_log.info(
+                            "Solve cache written to %s "
+                            "(%d files in fingerprint).",
+                            cache_path,
+                            len(solve_fp.get("files") or {}),
+                        )
+                except Exception as e:
+                    _cache_log.warning(
+                        "Couldn't write solve cache (%s: %s); ignoring.",
+                        type(e).__name__, e,
+                    )
+
+            # Final stage before handing off — the new PdnViewer construction
+            # in the GUI thread's _on_solve_finished slot is heavy on big
+            # boards (tabs, GL widgets, setup HTML for thousands of
+            # components) and blocks the dialog from repainting until it
+            # finishes. Update the label so the user sees what's actually
+            # happening instead of a stale "saving cache" message.
+            self.stage_changed.emit("Opening viewer…")
+            _timer.log_breakdown()
+            self.finished_ok.emit(new_solution, metadata)
+        except Exception as e:
+            import traceback
+            self.failed.emit(
+                f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
+            )
+
+    def _apply_stackup_overrides(self, loaded):
+        """Return a new :class:`LoadedProject` whose extracted stackup
+        has the user-supplied copper thicknesses substituted in.
+
+        ExtractedProject + RawStackupLayer are both frozen dataclasses,
+        so we rebuild the stackup tuple via :func:`dataclasses.replace`.
+        ``loaded.geometry`` is recomputed too so the displayed per-layer
+        conductance reflects the new thickness — the FEM itself reads
+        ``loaded.extracted.stackup`` directly via
+        :func:`altium_loader.build_per_net_geometry_layers`, so the
+        solve correctness only depends on the new ExtractedProject.
+        Skipped overrides (layer not in stackup) are silently ignored.
+        """
+        from dataclasses import replace as _dc_replace
+        from altium_geometry import build_layer_geometries
+        from altium_loader import LoadedProject
+
+        new_stackup = []
+        for s in loaded.extracted.stackup:
+            if s.layer_id in self._stackup_overrides:
+                new_thk = float(self._stackup_overrides[s.layer_id])
+                s = _dc_replace(s, copper_thickness_mm=new_thk)
+            new_stackup.append(s)
+
+        new_extracted = _dc_replace(
+            loaded.extracted, stackup=tuple(new_stackup),
+        )
+        # Rebuild the legacy single-union geometry — cheap relative to
+        # the solve, and keeps the diagnostic_summary honest about the
+        # new sheet conductance. LoadedProject is no longer a frozen
+        # dataclass (geometry was made lazy to skip ~0.8 s on every
+        # solve), so we construct a fresh one explicitly instead of
+        # going through dataclasses.replace.
+        new_geometry = build_layer_geometries(new_extracted)
+        return LoadedProject(
+            extracted=new_extracted,
+            annotations=loaded.annotations,
+            geometry=new_geometry,
+        )
+
+    def _apply_sink_overrides(self, loaded) -> None:
+        """Mutate ``loaded.annotations.directives`` in-place so every
+        SinkSpec whose ``(designator, schdoc, channel_index)`` matches an
+        override gets replaced with a copy carrying the new ``current``.
+        Unmatched overrides are silently ignored — typically because the
+        user deleted a SINK directive (or removed an indexed channel) in
+        Altium between solves."""
+        from dataclasses import replace as _dc_replace
+        from altium_annotations import SinkSpec
+        directives = loaded.annotations.directives
+        for i, d in enumerate(directives):
+            if not isinstance(d, SinkSpec):
+                continue
+            key = (d.designator, d.schdoc_name, d.channel_index)
+            if key in self._sink_overrides:
+                directives[i] = _dc_replace(
+                    d, current=float(self._sink_overrides[key]),
+                )
+
+
+def _try_solve_cache(prjpcb_path: Path,
+                     pcbdoc_path: Path | None) -> tuple[object, dict] | None:
+    """Return ``(solution, metadata)`` from the FYPA solve cache if the
+    fingerprint matches, else ``None``. Wraps the FYPA helpers so menu
+    handlers don't have to know about fingerprints; cache misses + import
+    failures are silently treated as ``None``."""
+    try:
+        from FYPA import (
+            _project_fingerprint,
+            _try_load_cached_solution,
+        )
+        fp = _project_fingerprint(prjpcb_path, pcbdoc_path)
+        cached = _try_load_cached_solution(prjpcb_path, fp,
+                                            pcbdoc_path=pcbdoc_path)
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "Solve-cache check failed (%s); will re-solve.", e,
+        )
+        return None
+    if cached is None or cached[0] is None:
+        return None
+    return cached
+
+
+def _choose_pcbdoc(parent: QWidget | None, prjpcb_path: Path,
+                   default: Path | None = None) -> tuple[bool, Path | None]:
+    """Resolve which .PcbDoc to use for ``prjpcb_path``.
+
+    Returns ``(proceed, selected_path)``:
+
+    * ``(True, path)``  — caller should solve against ``path``.
+    * ``(True, None)``  — failed to enumerate, but caller may still
+      attempt with altium_monkey's default. Used as a soft fallback.
+    * ``(False, None)`` — user cancelled the chooser; caller should
+      abort silently.
+
+    A single-PCB project returns the only path without prompting.
+    Multi-PCB projects open a modal :class:`QInputDialog.getItem` so the
+    user can pick. ``default``, when supplied and present in the list, is
+    pre-selected (handy for re-runs of a previously-chosen board).
+    """
+    try:
+        from altium_extract import list_pcbdoc_paths
+        paths = list_pcbdoc_paths(prjpcb_path)
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "Couldn't enumerate PcbDocs in %s (%s); falling back to default.",
+            prjpcb_path, e,
+        )
+        return True, None
+    if not paths:
+        QMessageBox.critical(
+            parent, "No PcbDoc in project",
+            f"{prjpcb_path.name} does not reference any .PcbDoc — FYPA "
+            "needs a PCB document for power analysis.",
+        )
+        return False, None
+    if len(paths) == 1:
+        return True, paths[0]
+    names = [p.name for p in paths]
+    default_idx = 0
+    if default is not None:
+        default_resolved = default.resolve()
+        for i, p in enumerate(paths):
+            if p.resolve() == default_resolved:
+                default_idx = i
+                break
+    chosen, ok = QInputDialog.getItem(
+        parent, "Select PcbDoc",
+        f"{prjpcb_path.name} contains multiple PCB documents.\n"
+        "Choose which one to solve:",
+        names, default_idx, False,
+    )
+    if not ok or not chosen:
+        return False, None
+    return True, paths[names.index(chosen)]
+
+
+def _abort_solve_worker(owner) -> None:
+    """Tear down an in-flight ``_SolveWorker`` owned by ``owner``.
+
+    Detaches the worker's result signals (so a late finish can't pop open
+    a viewer we no longer want), requests cooperative interruption, then
+    falls back to ``QThread.terminate()`` for when the worker is mid-solve
+    in a long-running scipy/Triangle C call we can't interrupt politely.
+    Forcible termination may leak some Triangle / scipy arena memory until
+    process exit, but the interpreter itself stays usable — the user can
+    open another project without restarting.
+
+    Also closes the progress dialog and clears ``owner``'s solve refs so
+    the late ``QThread.finished`` → ``_cleanup_solve_worker`` chain is a
+    no-op. Safe to call when nothing is in flight."""
+    worker = getattr(owner, "_solve_worker", None)
+    if worker is not None:
+        # Detach BOTH the result signals (finished_ok/failed/stage_changed)
+        # and QThread.finished. The latter normally fires
+        # ``_cleanup_solve_worker``, but we do its work inline below — and
+        # leaving it connected would race with a fresh solve started right
+        # after cancel: the OLD worker's late ``finished`` would wipe
+        # ``owner._solve_worker``, which by then points at the NEW worker.
+        for sig_name in ("finished_ok", "failed", "stage_changed",
+                         "substage_changed", "finished"):
+            sig = getattr(worker, sig_name, None)
+            if sig is not None:
+                try:
+                    sig.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+        # If the solver is mid-meshing, tear down the worker-process pool
+        # so the children stop after their current Triangle call instead
+        # of running to completion as orphans. Safe no-op when no pool is
+        # active. Must happen BEFORE terminate(), so the queue close
+        # propagates before the thread holding the pool dies.
+        try:
+            from pdnsolver.solver import cancel_active_mesh_pool
+            cancel_active_mesh_pool()
+        except Exception as _exc:
+            logging.getLogger(__name__).warning(
+                "cancel_active_mesh_pool raised %s; carrying on.", _exc,
+            )
+        worker.requestInterruption()
+        worker.terminate()
+        # 2 s is plenty for the OS to reap the thread; we don't want to
+        # block the GUI indefinitely if something pathological happens.
+        worker.wait(2000)
+    updater = getattr(owner, "_solve_progress_updater", None)
+    if updater is not None:
+        updater.stop()
+        updater.deleteLater()
+        owner._solve_progress_updater = None
+    dlg = getattr(owner, "_solve_progress_dlg", None)
+    if dlg is not None:
+        dlg.close()
+        owner._solve_progress_dlg = None
+    if worker is not None:
+        worker.deleteLater()
+        owner._solve_worker = None
+
+
+# --- Help menu: shared handlers --------------------------------------------
+#
+# The launcher and the main viewer both expose a Help menu (Open Log /
+# About) next to their File menu. _build_help_menu builds it; the two
+# module-level handlers below back its actions so the behaviour is
+# identical from either window.
+
+# Project home page, shown in the About dialog. PLACEHOLDER — once the real
+# repository URL is confirmed, set it here and restore the clickable <a> link
+# in _show_about_dialog (drop the plain-text rendering for the placeholder).
+_GITHUB_URL: str = "{ GITHUB LINK TBD }"
+
+
+def _open_log_file(parent: QWidget) -> None:
+    """Help > Open Log — open FYPA's log file with the OS default handler.
+
+    The path comes from :data:`FYPA._LOG_FILE`, which is anchored next to
+    FYPA.exe in a PyInstaller build and in the source tree's ``log/`` folder
+    in a dev checkout — so this works identically either way."""
+    try:
+        from FYPA import _LOG_FILE
+        log_path = Path(_LOG_FILE)
+    except Exception as e:  # pragma: no cover - defensive
+        QMessageBox.warning(parent, "Open Log",
+                            f"Couldn't locate the log file ({e}).")
+        return
+    if not log_path.is_file():
+        QMessageBox.information(
+            parent, "Open Log",
+            "No log file has been written yet.\n\n"
+            f"Expected location:\n{log_path}",
+        )
+        return
+    if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_path))):
+        QMessageBox.warning(
+            parent, "Open Log",
+            "Couldn't open the log file in the default application.\n\n"
+            f"It is located at:\n{log_path}",
+        )
+
+
+def _show_about_dialog(parent: QWidget) -> None:
+    """Help > About — a small themed dialog showing the version and a
+    clickable link to the project's GitHub page."""
+    try:
+        from FYPA import __version__ as fypa_version
+    except Exception:
+        fypa_version = "unknown"
+    t = _T()
+    # QDialog background + text colour come from the app-wide stylesheet;
+    # the Close button follows the Fusion palette like every other dialog.
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("About FYPA")
+    icon = _load_app_icon()
+    if icon is not None:
+        dlg.setWindowIcon(icon)
+
+    layout = QVBoxLayout(dlg)
+    layout.setContentsMargins(36, 28, 36, 24)
+    layout.setSpacing(8)
+
+    fangs = _load_fypa_fangs_pixmap(96)
+    if fangs is not None:
+        logo = QLabel()
+        logo.setPixmap(fangs)
+        logo.setAlignment(Qt.AlignCenter)
+        layout.addWidget(logo)
+
+    body = QLabel(
+        "<div style='text-align:center;'>"
+        f"<h2 style='color:{t['fg']}; margin:6px 0 0 0;'>FYPA</h2>"
+        f"<p style='color:{t['accent']}; margin:2px 0;'>Altium PDN Analyser</p>"
+        f"<p style='color:{t['fg_muted']}; margin:2px 0;'>Version {fypa_version}</p>"
+        f"<p style='color:{t['fg_dim']}; margin:12px 0 2px 0;'>{_GITHUB_URL}</p>"
+        "</div>"
+    )
+    body.setTextFormat(Qt.RichText)
+    body.setAlignment(Qt.AlignCenter)
+    layout.addWidget(body)
+
+    layout.addSpacing(6)
+    buttons = QHBoxLayout()
+    buttons.addStretch(1)
+    close_btn = QPushButton("Close")
+    close_btn.setDefault(True)
+    close_btn.clicked.connect(dlg.accept)
+    buttons.addWidget(close_btn)
+    buttons.addStretch(1)
+    layout.addLayout(buttons)
+
+    # Widen the dialog to roughly double its natural (content-driven) width
+    # so the layout has more breathing room around the logo and text.
+    hint = dlg.sizeHint()
+    dlg.resize(hint.width() * 2, hint.height())
+    dlg.exec()
+
+
+def _build_help_menu(window) -> None:
+    """Add a Help menu (Open Log / About) to *window*'s menu bar.
+
+    Shared by :class:`LauncherWindow` and :class:`PdnViewer` so both show
+    the same Help entries immediately after their File menu."""
+    help_menu = window.menuBar().addMenu("&Help")
+
+    open_log = QAction("Open &Log", window)
+    open_log.setStatusTip(
+        "Open the FYPA log file in the system's default application."
+    )
+    open_log.triggered.connect(lambda: _open_log_file(window))
+    help_menu.addAction(open_log)
+
+    about = QAction("&About", window)
+    about.setStatusTip("Version information and a link to the project page.")
+    about.triggered.connect(lambda: _show_about_dialog(window))
+    help_menu.addAction(about)
+
+
+class LauncherWindow(QMainWindow):
+    """Minimal launcher window shown when FYPA is invoked with no project.
+
+    Has just a File menu (Open Project / Open Solution / Exit) and a centred
+    welcome label. Picking a project runs the same solve worker the main
+    viewer uses; on success, a real :class:`PdnViewer` opens and this
+    launcher closes itself.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("FYPA")
+        icon = _load_app_icon()
+        if icon is not None:
+            self.setWindowIcon(icon)
+        self.resize(640, 360)
+
+        centre = QWidget(self)
+        layout = QVBoxLayout(centre)
+        layout.setContentsMargins(40, 40, 40, 40)
+        t = _T()
+        # Use clickable <a> links (with linkActivated) so the user can
+        # launch each File-menu action from this welcome screen too.
+        link_style = (
+            f"color:{t['accent']}; text-decoration:underline; font-weight:600;"
+        )
+        label = QLabel(
+            "<div style='text-align:center;'>"
+            f"<h2 style='color:{t['fg']}; margin-top:2px; margin-bottom:0;'>Altium PDN Analyser</h2>"
+            f"<p style='color:{t['accent']};'>No project loaded.</p>"
+            f"<p style='color:{t['fg_dim']};'>"
+            f"<a href='open-project' style='{link_style}'>Load from Project&hellip;</a>"
+            " (Ctrl+O) to pick a <code>.PrjPcb</code>,<br>"
+            f"<a href='open-project-clean' style='{link_style}'>Load from Project (Clean)&hellip;</a>"
+            " (Ctrl+Shift+L) to force a fresh extract + solve,<br>"
+            "or "
+            f"<a href='open-solution' style='{link_style}'>Load Solution&hellip;</a>"
+            " (Ctrl+Shift+O) to load a saved <code>.pkl</code>."
+            "</p>"
+            f"<p style='color:{t['fg_dim']}; font-size:smaller; font-style:italic;'>"
+            "FYPA is a design-aid tool. Treat its results as guidance "
+            "and validate against measurement."
+            "</p>"
+            "</div>"
+        )
+        label.setTextFormat(Qt.RichText)
+        label.setAlignment(Qt.AlignCenter)
+        # Handle the link clicks ourselves and dispatch to the existing
+        # menu handlers — don't bounce out to a system browser.
+        label.setOpenExternalLinks(False)
+        label.setTextInteractionFlags(
+            Qt.LinksAccessibleByMouse | Qt.LinksAccessibleByKeyboard
+        )
+        label.linkActivated.connect(self._on_welcome_link)
+        layout.setSpacing(0)
+        layout.addStretch(1)
+        fangs_pm = _load_fypa_fangs_pixmap(256)
+        if fangs_pm is not None:
+            fangs_label = QLabel()
+            fangs_label.setPixmap(fangs_pm)
+            fangs_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(fangs_label)
+        text_pm = _load_fypa_text_pixmap(50)
+        if text_pm is not None:
+            text_label = QLabel()
+            text_label.setPixmap(text_pm)
+            text_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(text_label)
+        layout.addWidget(label)
+        layout.addStretch(1)
+        centre.setStyleSheet(f"background-color: {t['bg']};")
+        self.setCentralWidget(centre)
+
+        self._build_menubar()
+
+        # Held across the async solve so Qt + Python keep them alive.
+        self._solve_worker: _SolveWorker | None = None
+        self._solve_progress_dlg: QProgressDialog | None = None
+        self._solve_progress_updater: _SolveProgressUpdater | None = None
+
+    def _on_welcome_link(self, href: str) -> None:
+        """Dispatch a click on one of the welcome-label hyperlinks to the
+        matching File-menu handler."""
+        if href == "open-project":
+            self._on_menu_open_project(clean=False)
+        elif href == "open-project-clean":
+            self._on_menu_open_project(clean=True)
+        elif href == "open-solution":
+            self._on_menu_open_solution()
+
+    def _build_menubar(self) -> None:
+        mb = self.menuBar()
+        file_menu = mb.addMenu("&File")
+
+        open_proj = QAction("&Load from Project…", self)
+        open_proj.setShortcut(QKeySequence.Open)  # Ctrl+O
+        open_proj.setStatusTip(
+            "Pick a .PrjPcb; reuse the cached solution if the project is "
+            "unchanged, otherwise extract + solve."
+        )
+        open_proj.triggered.connect(self._on_menu_open_project)
+        file_menu.addAction(open_proj)
+
+        open_proj_clean = QAction("Load from Project (&Clean)…", self)
+        open_proj_clean.setShortcut("Ctrl+Shift+L")
+        open_proj_clean.setStatusTip(
+            "Pick a .PrjPcb; ignore any cached design info or solution and "
+            "re-extract + re-solve from scratch."
+        )
+        open_proj_clean.triggered.connect(
+            lambda: self._on_menu_open_project(clean=True)
+        )
+        file_menu.addAction(open_proj_clean)
+
+        file_menu.addSeparator()
+
+        open_sol = QAction("&Load Solution…", self)
+        open_sol.setShortcut("Ctrl+Shift+O")
+        open_sol.setStatusTip(
+            "Open a previously-saved solution pickle (no re-solve)."
+        )
+        open_sol.triggered.connect(self._on_menu_open_solution)
+        file_menu.addAction(open_sol)
+
+        file_menu.addSeparator()
+        quit_act = QAction("E&xit", self)
+        quit_act.setShortcut(QKeySequence.Quit)
+        quit_act.triggered.connect(self.close)
+        file_menu.addAction(quit_act)
+
+        _build_help_menu(self)
+
+    def _on_menu_open_project(self, *, clean: bool = False) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Open Altium project", "",
+            "Altium project (*.PrjPcb);;All files (*)",
+        )
+        if not path_str:
+            return
+        prjpcb_path = Path(path_str)
+        proceed, pcbdoc_path = _choose_pcbdoc(self, prjpcb_path)
+        if not proceed:
+            return
+        from altium_loader import SolveSettings
+        settings = SolveSettings()
+        settings.apply_to_modules()
+
+        # The solve-cache check (potentially 5–10 s of pickle.load on
+        # large boards) is delegated to the worker so the dialog below
+        # stays responsive instead of freezing the UI.
+        initial_text = (
+            f"Checking solve cache for {prjpcb_path.name}…\n"
+            "On a cache miss this falls through to a full extract + solve "
+            "(10–60 s depending on board size)."
+            if not clean else
+            f"Loading {prjpcb_path.name} and solving…\n"
+            "This can take 10–60 s depending on board size and mesh density."
+        )
+        dlg = QProgressDialog(initial_text, "Cancel", 0, 0, self)
+        dlg.setWindowTitle(
+            "Loading project (clean)" if clean else "Loading project"
+        )
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        dlg.canceled.connect(self._on_solve_cancelled)
+        dlg.show()
+        QApplication.processEvents()
+        # 44% wider than Qt's auto-sized width so the longer per-stage
+        # status messages ("Packaging solution: building metadata…",
+        # "Opening viewer…", etc.) aren't truncated.
+        _sz = dlg.size()
+        dlg.setFixedSize(int(_sz.width() * 1.44), _sz.height())
+
+        worker = _SolveWorker(
+            prjpcb_path, settings,
+            pcbdoc_selector=str(pcbdoc_path) if pcbdoc_path else None,
+            use_design_cache=not clean,
+            try_solve_cache_first=not clean,
+            parent=self,
+        )
+        self._solve_worker = worker
+        self._solve_progress_dlg = dlg
+        # Wires stage_changed / substage_changed to the dialog, with a
+        # live elapsed-time counter for the current stage.
+        self._solve_progress_updater = _SolveProgressUpdater(dlg, worker, self)
+        worker.finished_ok.connect(
+            lambda sol, meta: self._on_solve_finished(sol, meta, settings)
+        )
+        worker.failed.connect(self._on_solve_failed)
+        worker.finished.connect(self._cleanup_solve_worker)
+        worker.start()
+
+    def _on_solve_cancelled(self) -> None:
+        """User clicked Cancel on the solve progress dialog. Forcibly kill
+        the worker — the launcher is already the "home" state, so just stay
+        here once the dialog is gone."""
+        _abort_solve_worker(self)
+
+    def _cleanup_solve_worker(self) -> None:
+        if self._solve_progress_updater is not None:
+            self._solve_progress_updater.stop()
+            self._solve_progress_updater.deleteLater()
+            self._solve_progress_updater = None
+        if self._solve_progress_dlg is not None:
+            # QProgressDialog.close() routes through reject() → cancel(),
+            # which emits canceled — and our canceled handler tears down
+            # the in-flight solve. Drop the connection first so closing a
+            # dialog whose worker finished naturally doesn't get treated
+            # as a user cancel.
+            try:
+                self._solve_progress_dlg.canceled.disconnect(self._on_solve_cancelled)
+            except (RuntimeError, TypeError):
+                pass
+            self._solve_progress_dlg.close()
+            self._solve_progress_dlg = None
+        if self._solve_worker is not None:
+            self._solve_worker.deleteLater()
+            self._solve_worker = None
+
+    def _on_solve_failed(self, message: str) -> None:
+        logging.getLogger(__name__).error("Solve failed: %s", message)
+        QMessageBox.critical(self, "Solve failed", message)
+
+    def _on_solve_finished(self, new_solution, metadata: dict,
+                           new_settings) -> None:
+        self._open_viewer_and_close(new_solution, metadata,
+                                    initial_settings=new_settings)
+
+    def _on_menu_open_solution(self) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Open solution pickle", "",
+            "Solution pickle (*.pkl);;All files (*)",
+        )
+        if not path_str:
+            return
+        try:
+            from FYPA import _load_solution_pickle
+            solution, metadata = _load_solution_pickle(Path(path_str))
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Couldn't open solution",
+                f"Failed to load {path_str}:\n\n{type(e).__name__}: {e}",
+            )
+            return
+        self._open_viewer_and_close(solution, metadata)
+
+    def _open_viewer_and_close(self, solution, metadata: dict | None,
+                               *, initial_settings=None) -> None:
+        try:
+            kwargs = {"metadata": metadata}
+            if initial_settings is not None:
+                kwargs["initial_settings"] = initial_settings
+            _t = time.monotonic()
+            new_win = PdnViewer(solution, **kwargs)
+            logging.getLogger(__name__).info(
+                "PdnViewer __init__ took %.2fs", time.monotonic() - _t,
+            )
+        except Exception as e:
+            logging.getLogger(__name__).exception("Failed to open viewer")
+            QMessageBox.critical(
+                self, "Couldn't open viewer",
+                f"Solution loaded but the viewer failed to open:\n\n"
+                f"{type(e).__name__}: {e}",
+            )
+            return
+        _register_viewer(new_win)
+        app = QApplication.instance()
+        # The new viewer's GL widget show() is processed asynchronously,
+        # so there's a one-tick window where visible_windows == 0 if we
+        # hide/close the launcher synchronously — that trips
+        # quitOnLastWindowClosed and the whole process exits. Disable
+        # the auto-quit, hide the launcher, then restore the flag on the
+        # next event-loop tick (by which time new_win is fully shown).
+        prev_quit = app.quitOnLastWindowClosed()
+        app.setQuitOnLastWindowClosed(False)
+        new_win.show()
+        _force_native_window_icon(new_win)
+        _set_window_aumid(new_win)
+        self.hide()
+        QTimer.singleShot(
+            0, lambda: app.setQuitOnLastWindowClosed(prev_quit)
+        )
+
+
+class PdnViewer(QMainWindow):
+    """Main window — composes the side panel and the matplotlib plot area.
+
+    ``metadata`` (if supplied) is the dict bundled into the solve pickle
+    by :func:`altium_loader.build_solve_metadata` — used to populate the
+    Setup tab with stackup / physics constants / directive details /
+    solver stats. If ``None`` (e.g. loading a legacy pickle), the Setup
+    tab shows a note explaining why metadata isn't available.
+    """
+
+    def __init__(self, solution, metadata: dict | None = None,
+                  initial_settings: object | None = None,
+                  via_current_warn_a: float | None = None,
+                  display_percentile_high: float | None = None):
+        super().__init__()
+        # Stashed on self so _build_ui (called below) can log per-tab
+        # timings against the same start point.
+        self._init_t0 = time.monotonic()
+        self._init_log = logging.getLogger(__name__)
+        self._init_log.info("PdnViewer init: START")
+        self.solution = solution
+        self.metadata = metadata
+        # Solve-time + display-time settings exposed in the Settings tab.
+        # ``initial_settings`` is a :class:`altium_loader.SolveSettings` —
+        # passed by the Re-run handler so the new viewer pre-populates the
+        # fields with whatever the user just submitted. Falls back to the
+        # values recorded in the pickle (which match the FEM that produced
+        # this solution) so opening a fresh pickle always shows the truth.
+        from altium_loader import SolveSettings as _SolveSettings
+        if initial_settings is None:
+            initial_settings = _SolveSettings.from_metadata(metadata)
+        self._solve_settings = initial_settings
+        # Display-only knobs (no re-solve needed to apply, but settable
+        # from the same Settings tab so users have one place for tuning).
+        self._via_current_warn_a: float = (
+            float(via_current_warn_a) if via_current_warn_a is not None
+            else _VIA_CURRENT_WARN_A
+        )
+        self._display_percentile_high: float = (
+            float(display_percentile_high) if display_percentile_high is not None
+            else _DISPLAY_PERCENTILE_HIGH
+        )
+        project_name = getattr(solution.problem, "project_name", None) or "unknown"
+        self.setWindowTitle(f"FYPA -- {project_name}")
+        icon = _load_app_icon()
+        if icon is not None:
+            self.setWindowIcon(icon)
+        # Open maximised so the plot has the most canvas to work with. With
+        # aspect='equal', the plot's height grows proportionally with its
+        # width — so a bigger window = a bigger board view, no stretching.
+        self.resize(1400, 900)
+        # Defer the maximise until after show() — calling showMaximized()
+        # during __init__ doesn't always stick on Windows.
+        self._pending_maximize: bool = True
+
+        # Index every padne Layer by (physical, net). The net here is what we
+        # used to call "rail" in the naming convention — but now we group
+        # bridged nets into rails, so the underlying per-net layer index
+        # still keys on the literal net name.
+        self._index_by_pair: dict[tuple[str, str], int] = {}
+        physicals: set[str] = set()
+        for i, layer in enumerate(solution.problem.layers):
+            phys, net = _split_composite_name(layer.name)
+            self._index_by_pair[(phys, net)] = i
+            physicals.add(phys)
+
+        # Build rail groups from RESISTOR bridges + SOURCE/SINK/REGULATOR
+        # terminals (the metadata bundle). The Rail dropdown shows the
+        # PRIMARY net per group ("+3V3", not "3V3_SW"); the renderer combines
+        # every per-net layer in the group into one heatmap so the user sees
+        # both +3V3 and 3V3_SW copper when they pick "+3V3".
+        self._rail_names: list[str]
+        self._rail_to_members: dict[str, list[str]]
+        self._rail_names, self._rail_to_members = self._compute_rail_groups(metadata)
+
+        # Sort layers into physical stackup order (Top → inner → Bottom).
+        # The stackup metadata is the authority: its rows are already in
+        # physical order (top first), independent of layer name or id —
+        # which matters for boards like Corvette whose layers are named
+        # "L1".."L16" rather than "Top Layer"/"Bottom Layer". The name
+        # heuristic below is only a fallback for layers absent from the
+        # metadata (or when no metadata was bundled): inner-layer names
+        # start with "L" + a number, parsed so L10 sorts after L9.
+        _stackup_pos = {
+            row["name"]: i
+            for i, row in enumerate(
+                metadata.get("stackup", []) if metadata else []
+            )
+        }
+        _ln_re = re.compile(r"^L(\d+)", re.IGNORECASE)
+
+        def _layer_sort_key(name: str) -> tuple[int, int, str]:
+            pos = _stackup_pos.get(name)
+            if pos is not None:
+                return (0, pos, name)
+            lower = name.lower()
+            if "top" in lower:
+                return (1, 0, name)
+            if "bottom" in lower:
+                return (3, 0, name)
+            m = _ln_re.match(name.strip())
+            ln = int(m.group(1)) if m else (1 << 30)
+            return (2, ln, name)
+        self._physicals = sorted(physicals, key=_layer_sort_key)
+        # Rank in the physical stackup (0 = topmost). Used to decide draw
+        # order when multiple layers are visible — we want the topmost
+        # checked layer to render last so it sits visually on top.
+        self._phys_stackup_rank: dict[str, int] = {}
+        for rank, name in enumerate(self._physicals):
+            self._phys_stackup_rank[name] = rank
+
+        # Map physical-layer display name → Altium layer id. We need this so
+        # the directive-pin overlay can filter pins to the layer currently
+        # being viewed (pins carry a layer_id, the dropdown carries a name).
+        self._phys_name_to_layer_id: dict[str, int] = {}
+        for row in (metadata.get("stackup", []) if metadata else []):
+            self._phys_name_to_layer_id[row["name"]] = row["layer_id"]
+
+        # World-z (mm) at the centre of each physical copper layer, derived
+        # from the cumulative copper + dielectric thicknesses in the stackup
+        # metadata. z=0 is the topmost layer's centreline; lower layers are
+        # negative. Using real distances (instead of a uniform rank spacing)
+        # makes 3D via cylinders honour the actual stackup — adjacent inner
+        # planes look thin, top-to-bottom vias look long.
+        self._phys_z_mm: dict[str, float] = {}
+        z_accum = 0.0
+        rows = (metadata.get("stackup", []) if metadata else []) or []
+        for i, row in enumerate(rows):
+            name = row.get("name")
+            t_cu = float(row.get("copper_thickness_mm") or 0.0)
+            if name is not None:
+                self._phys_z_mm[name] = -(z_accum + 0.5 * t_cu)
+            if i + 1 < len(rows):
+                z_accum += t_cu + float(row.get("dielectric_thickness_mm") or 0.0)
+        # ``self._rails`` kept as an alias of the rail-group names so the
+        # rest of the UI code (rail combo population, mode helpers) doesn't
+        # need to know the rails came from group reduction.
+        self._rails = self._rail_names
+
+        # Designators of directives currently expanded in the Setup tab.
+        # Empty by default → all directives collapsed; user click toggles.
+        self._expanded_directives: set[str] = set()
+
+        # Cached state for the hover probe. Updated on every _render(),
+        # reused by _on_gl_mouse_hovered.
+        self._probe_unit: str = ""
+        self._probe_label: str = ""
+        self._last_probe_at: float = 0.0
+        # Per-(physical_layer, net) probe descriptors, top-first. Each
+        # dict has: 'physical', 'net', 'layer_id', 'triangulation',
+        # 'interpolator', 'values', 'prepared_shape'. Built by
+        # :meth:`_build_rail_arrays`.
+        self._layer_probes: list[dict] = []
+        # Per-(layer_index, derive_fn) cache of the assembled mesh arrays
+        # + Triangulation + _FastTriSampler + prepared shapely shape.
+        # Solution is immutable for the session, so entries live forever
+        # — this makes layer-toggle (re-render) re-use the already-built
+        # voltage sampler instead of rebuilding it.
+        self._layer_cache: dict[tuple[int, int], dict] = {}
+        # Per-layer cache of current-density vectors (J = -sigma * grad V).
+        # Mode-independent — keyed by layer_index only — because the
+        # current arrows are derived from the raw potentials regardless
+        # of which scalar mode the heatmap is showing.
+        self._layer_vec_cache: dict[int, dict] = {}
+        # Data bounds, colour-scale clamp, and the current colormap name.
+        # All consumed by either the GLMeshViewer (rendering) or the
+        # CPU-side hover probe (mode / Voltage Drop reference).
+        self._data_bounds: tuple[float, float, float, float] | None = None
+        self._vmin: float = 0.0
+        self._vmax: float = 1.0
+        self._cmap_name: str = _DEFAULT_CMAP_NAME
+        # Which LUT is currently uploaded to the GL viewer's copper-mesh
+        # cmap texture: "data" = the viridis ramp keyed on per-vertex
+        # values; "neutral" = a flat grey LUT used in Via Current mode
+        # so the copper drops out as context behind the heatmapped vias.
+        # ``self._cmap_name`` is unchanged — it still tracks the data
+        # ramp, which the via cylinders / scale controller use directly.
+        self._gl_cmap_kind: str = "data"
+        # Linear vs logarithmic colour scale. ``_log_scale`` is the user's
+        # dropdown choice (persists across modes); ``_log_active`` is the
+        # effective state for the current render — True only when the
+        # mode is log-eligible and the data range is positive. The GL
+        # values/levels and the baked via LUTs are pushed through
+        # :meth:`_gl_scale`, which is log10 (floored at ``_log_floor``)
+        # exactly when ``_log_active`` is True.
+        self._log_scale: bool = False
+        self._log_active: bool = False
+        self._log_floor: float = 1e-12
+        # (net, x_mm, y_mm) -> max-|segment-current| for every via on
+        # the rail set rendered last. Populated in Via Current mode by
+        # :meth:`_render`; empty for every other mode. Used by both the
+        # 3D via cylinder coloring path and the 2D marker overlay.
+        self._via_current_lookup: dict[tuple[str, float, float], float] = {}
+        # Hit-test index for SOURCE/SINK marker hover. Rebuilt by
+        # :meth:`_update_markers_and_legend` from the same pin walk that
+        # populates the marker overlay, so it matches exactly what's drawn.
+        self._marker_hover_index_cache: dict | None = None
+        # (visible_layers, rail, mode) signature of the previous render's
+        # scale-controller push. Used so a render that doesn't change the
+        # heatmap selection (e.g. a 2D/3D toggle) leaves the user's clamp
+        # alone — only a real layer/rail/mode change resets it.
+        self._last_scale_selection: tuple[tuple[str, ...], str, str] | None = None
+
+        # CAD-style fixed-scale viewport state. When the widget is
+        # resized we preserve mm-per-pixel and grow / shrink the visible
+        # area, rather than letting the view auto-fit the board.
+        self._mm_per_pixel: float = 0.0
+        # ``_need_initial_fit`` is True until the very first time the
+        # view is successfully fit to the data. Stays False afterwards
+        # so subsequent renders (layer toggle, rail change, mode change)
+        # do NOT reset the user's pan / zoom — they just swap the mesh
+        # in place and leave the viewport alone.
+        self._need_initial_fit: bool = True
+        # Re-entrancy guard for the GL viewer's synchronous viewChanged
+        # signal — see :meth:`_fit_board_to_canvas` for why this exists.
+        self._suppress_view_changed: bool = False
+
+        # The OpenGL canvas — assigned in _build_ui.
+        self._gl_viewer: GLMeshViewer | None = None
+        # Legend HTML (top-right) — pushed to the GLMeshViewer's QPainter
+        # overlay layer.
+        self._legend_html: str = ""
+        # Currently highlighted via location (world mm). When non-None,
+        # a yellow ring is drawn on the GL viewer at this point — always
+        # shown, even if "Show pin markers" is off. Cleared by another
+        # jump or by :meth:`_clear_via_highlight`.
+        self._highlight_via_xy: tuple[float, float] | None = None
+
+        # Per-(physical, net) nearest-vertex voltage lookups, built lazily
+        # the first time a rail's stubs / series bars / heatmap-vias need a
+        # voltage sample. Cached for the lifetime of the viewer (the
+        # solution doesn't change), so flipping rails / vias on and off
+        # never rebuilds them. Each entry is a ``(cKDTree, potentials)``
+        # pair or ``None`` — see :meth:`_via_voltage_kdtree`.
+        self._via_voltage_kdtree_cache: dict[
+            tuple[str, str], tuple | None
+        ] = {}
+        # Updated each _render() so :meth:`_push_via_cylinders` can apply
+        # the same Voltage-Drop offset that the layer heatmap uses.
+        self._last_drop_reference: float | None = None
+
+        # Single-entry cache of the stub triangle geometry — see
+        # :meth:`_push_stubs`. Stub positions depend only on the visible
+        # layer/rail set and the 2D/3D z, never on the colour scheme or
+        # scale, so a recolour reuses this and only re-bakes the colours.
+        # ``(geom_key, positions, spans)`` or ``None``.
+        self._stub_geom_cache: tuple | None = None
+
+        # Voltage-difference measurement tool. Set when the user presses
+        # Shift while hovering copper that has a voltage value in either
+        # Voltage or Voltage Drop mode. ``_measure_anchor_xy`` is the
+        # world-mm point at shift-press time and ``_measure_anchor_voltage``
+        # is the probed voltage there; the live readout subtracts the
+        # current cursor's voltage from this anchor.
+        self._measure_anchor_xy: tuple[float, float] | None = None
+        self._measure_anchor_voltage: float | None = None
+
+        self._build_ui()
+        self._install_hotkeys()
+        # Application-wide event filter for the Shift-drag voltage-
+        # difference tool. Installing it on QApplication (rather than
+        # the GL viewer or this window) means Shift key events are
+        # picked up regardless of which child widget currently has
+        # keyboard focus — without this, the user has to click the
+        # viewport first before the tool responds.
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+        self._render()
+
+    # --- Rail-group computation ---------------------------------------------
+
+    def _compute_rail_groups(
+        self, metadata: dict | None,
+    ) -> tuple[list[str], dict[str, list[str]]]:
+        """Group nets into rails based on RESISTOR bridges.
+
+        Walks the metadata's directive list:
+
+        * **RESISTOR** directives bridge their two terminal nets → union them.
+        * **SOURCE / SINK / REGULATOR** directives mark their terminal's
+          *named* net (the ``PDN_*_NET`` value) as a "primary candidate" —
+          any group containing a primary is a rail worth showing in the
+          dropdown; groups that don't (signal nets, unused bridges) are
+          dropped.
+
+        The group's **display name** is a primary in it — i.e. a net a
+        directive explicitly named, never a net that was only pulled into
+        the group by a SERIES bridge. So a sink whose ``PDN_N_NET = GND``
+        resolved (via the bridge) onto ``+DM_SW1`` still gives a rail named
+        ``GND``, not ``+DM_SW1``. Returns
+        ``(rail_names_sorted, {primary_name: [all member nets]})``.
+        """
+        if metadata is None:
+            return [], {}
+
+        parent: dict[str, str] = {}
+
+        def find(x: str) -> str:
+            while parent.setdefault(x, x) != x:
+                parent[x] = parent[parent[x]]  # path compression
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        primary_candidates: set[str] = set()
+
+        for d in metadata.get("directives", []):
+            role = d.get("role", "")
+            terms = d.get("terminals") or {}
+            nets_per_term: list[set[str]] = []
+            for _tname, t in terms.items():
+                nets = {p.get("net") for p in t.get("pins", []) if p.get("net")}
+                req = t.get("requested_net")
+                for n in nets:
+                    find(n)  # ensure presence in union-find
+                if nets:
+                    nets_per_term.append(nets)
+                # The directive names this terminal's net (PDN_*_NET). When
+                # its pins resolved onto a SERIES-bridged net instead, tie the
+                # named net into the group so the rail keeps the user's name.
+                if req:
+                    find(req)
+                    for n in nets:
+                        union(req, n)
+                # The rail's display name is what the directive ASKED for —
+                # the named net — not the bridged net its pins landed on.
+                # Fall back to the pin nets only for a *_PINS-override
+                # terminal, which has no named net.
+                if role in ("SOURCE", "SINK", "REGULATOR"):
+                    primary_candidates.update({req} if req else nets)
+            if role == "RESISTOR" and len(nets_per_term) == 2:
+                # Bridge every net in one terminal with every net in the other.
+                for a in nets_per_term[0]:
+                    for b in nets_per_term[1]:
+                        union(a, b)
+
+        # Materialise groups and pick a primary for each.
+        groups: dict[str, set[str]] = {}
+        for net in list(parent.keys()):
+            groups.setdefault(find(net), set()).add(net)
+
+        rail_to_members: dict[str, list[str]] = {}
+        for root, members in groups.items():
+            primaries = members & primary_candidates
+            if not primaries:
+                continue
+            # Pick the "most rail-looking" primary name: prefer leading '+',
+            # then ground-ish names, then alphabetical.
+            def _primary_rank(n: str) -> tuple[int, str]:
+                if n.startswith("+"):
+                    return (0, n)
+                if n.lower() in {"0v", "gnd", "ground", "vss"}:
+                    return (1, n)
+                return (2, n)
+            primary = sorted(primaries, key=_primary_rank)[0]
+            rail_to_members[primary] = sorted(members)
+
+        def _rail_sort_key(rail: str) -> tuple[int, str]:
+            if rail.lower() in {"0v", "gnd", "ground", "vss"}:
+                return (2, rail)
+            if rail.startswith("+"):
+                return (0, rail)
+            return (1, rail)
+        rail_names = sorted(rail_to_members.keys(), key=_rail_sort_key)
+        return rail_names, rail_to_members
+
+    def showEvent(self, event) -> None:
+        """Apply the deferred ``showMaximized`` once Qt has actually shown the
+        window. Doing this in ``__init__`` is unreliable on Windows — the
+        platform window doesn't exist yet so the maximise request gets lost.
+        """
+        super().showEvent(event)
+        if getattr(self, "_pending_maximize", False):
+            self._pending_maximize = False
+            self.showMaximized()
+        # Once the viewer is visible, compute the Vias warning count so the
+        # tab title shows "Vias ⚠ N" without the user having to click in.
+        # Deferred via singleShot(0) so the first paint happens before this
+        # ~0.3 s compute runs (it's still on the GUI thread, so it briefly
+        # stutters mouse handling, but the window is already visible by
+        # then). Guarded so it runs only once per viewer instance.
+        if not getattr(self, "_vias_warn_init_scheduled", False):
+            self._vias_warn_init_scheduled = True
+            QTimer.singleShot(0, self._init_vias_warn_count)
+
+    # --- UI construction -----------------------------------------------------
+
+    def _build_ui(self) -> None:
+        # Top-level: a menubar over a tab widget. Tab 0 is the heatmap view
+        # (everything that used to be the whole window); Tab 1 is the Setup
+        # tab populated from the metadata dict so users can verify what the
+        # FEM was given.
+        self._build_menubar()
+        self.tabs = QTabWidget(self)
+        self.setCentralWidget(self.tabs)
+
+        heatmap_tab = QWidget(self.tabs)
+        self._heatmap_tab_index = self.tabs.addTab(heatmap_tab, "Heatmap")
+
+        central = heatmap_tab
+        outer = QHBoxLayout(central)
+        outer.setContentsMargins(8, 8, 8, 8)
+
+        # Side panel.
+        side = QVBoxLayout()
+        side.setSpacing(6)
+
+        side.addWidget(QLabel("<b>Physical layers</b>"))
+        # Altium-style layer list. Each row has a clickable eye icon (open
+        # = visible, slashed grey = hidden), a colour swatch, and the layer
+        # name. The first row is an "All Layers" toggle that mirrors
+        # Altium's behaviour: clicking its eye shows or hides every layer.
+        self.layer_list = QListWidget()
+        self.layer_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.layer_list.setFocusPolicy(Qt.NoFocus)
+        _t = _T()
+        self.layer_list.setStyleSheet(
+            f"QListWidget {{ background-color: {_t['bg']}; color: {_t['fg']};"
+            f"              border: 1px solid {_t['border']}; padding: 2px;"
+            f"              alternate-background-color: {_t['bg_alt']}; }}"
+            f"QListWidget::item:hover {{ background-color: {_t['bg_hover']}; }}"
+        )
+        self.layer_list.setAlternatingRowColors(True)
+
+        self._layer_eye_buttons: list[tuple[str, EyeButton]] = []
+
+        self._all_layers_eye = EyeButton(visible=True)
+        all_row = self._build_layer_row_widget(
+            self._all_layers_eye, swatch_color=None,
+            label_text="All Layers", bold=True,
+        )
+        all_item = QListWidgetItem()
+        all_item.setFlags(Qt.ItemIsEnabled)
+        self.layer_list.addItem(all_item)
+        all_item.setSizeHint(all_row.sizeHint())
+        self.layer_list.setItemWidget(all_item, all_row)
+        self._all_layers_eye.toggled_visible.connect(self._on_all_layers_toggled)
+
+        for phys in self._physicals:
+            eye = EyeButton(visible=True)
+            eye.toggled_visible.connect(self._on_layer_eye_toggled)
+            row = self._build_layer_row_widget(
+                eye, swatch_color=self._layer_color_for(phys),
+                label_text=phys, bold=False,
+            )
+            item = QListWidgetItem()
+            item.setFlags(Qt.ItemIsEnabled)
+            self.layer_list.addItem(item)
+            item.setSizeHint(row.sizeHint())
+            self.layer_list.setItemWidget(item, row)
+            self._layer_eye_buttons.append((phys, eye))
+
+        self._sync_all_layers_eye()
+
+        # Size the list to show every physical layer (plus the "All Layers"
+        # header). When the full side panel ends up too tall for the window,
+        # the outer side QScrollArea below scrolls the whole panel.
+        approx_row_h = self.layer_list.sizeHintForRow(0) or 22
+        self.layer_list.setFixedHeight(
+            (len(self._physicals) + 1) * approx_row_h + 6
+        )
+        side.addWidget(self.layer_list)
+
+        side.addSpacing(8)
+        side.addWidget(QLabel("<b>Rails</b>"))
+        # Altium-style rail list — mirrors the physical-layer control above
+        # so users can show any combination of rails at once. The first row
+        # is an "All Rails" toggle that mirrors the same UX as "All Layers".
+        # Rails are the PRIMARY names of bridge groups (e.g. "+3V3"), not
+        # raw net names: ticking "+3V3" displays both +3V3 and any net
+        # bridged to it (e.g. 3V3_SW via L2's RESISTOR directive).
+        self.rail_list = QListWidget()
+        self.rail_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.rail_list.setFocusPolicy(Qt.NoFocus)
+        self.rail_list.setStyleSheet(
+            f"QListWidget {{ background-color: {_t['bg']}; color: {_t['fg']};"
+            f"              border: 1px solid {_t['border']}; padding: 2px;"
+            f"              alternate-background-color: {_t['bg_alt']}; }}"
+            f"QListWidget::item:hover {{ background-color: {_t['bg_hover']}; }}"
+        )
+        self.rail_list.setAlternatingRowColors(True)
+        self.rail_list.setToolTip(
+            "PDN rails — tick one or more to show their copper. Each rail "
+            "groups together nets bridged by a RESISTOR directive (e.g. "
+            "selecting '+3V3' shows both +3V3 and 3V3_SW copper if L2 "
+            "bridges them). 'All Rails' toggles every rail at once."
+        )
+
+        self._rail_eye_buttons: list[tuple[str, EyeButton]] = []
+
+        self._all_rails_eye = EyeButton(visible=False)
+        all_rails_row = self._build_layer_row_widget(
+            self._all_rails_eye, swatch_color=None,
+            label_text="All Rails", bold=True,
+        )
+        all_rails_item = QListWidgetItem()
+        all_rails_item.setFlags(Qt.ItemIsEnabled)
+        self.rail_list.addItem(all_rails_item)
+        all_rails_item.setSizeHint(all_rails_row.sizeHint())
+        self.rail_list.setItemWidget(all_rails_item, all_rails_row)
+        self._all_rails_eye.toggled_visible.connect(self._on_all_rails_toggled)
+
+        for rail in self._rails:
+            eye = EyeButton(visible=False)
+            eye.toggled_visible.connect(self._on_rail_eye_toggled)
+            row = self._build_layer_row_widget(
+                eye, swatch_color=None,
+                label_text=rail, bold=False,
+            )
+            item = QListWidgetItem()
+            item.setFlags(Qt.ItemIsEnabled)
+            self.rail_list.addItem(item)
+            item.setSizeHint(row.sizeHint())
+            self.rail_list.setItemWidget(item, row)
+            self._rail_eye_buttons.append((rail, eye))
+
+        # Default: first rail visible, others hidden — matches the previous
+        # combo's behaviour of starting at index 0.
+        if self._rail_eye_buttons:
+            self._rail_eye_buttons[0][1].setVisibleState(True, emit=False)
+        self._sync_all_rails_eye()
+
+        approx_rail_h = self.rail_list.sizeHintForRow(0) or 22
+        self.rail_list.setFixedHeight(
+            (len(self._rails) + 1) * approx_rail_h + 6
+        )
+        side.addWidget(self.rail_list)
+
+        side.addSpacing(8)
+        side.addWidget(QLabel("<b>Mode</b>"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems([m[0] for m in _MODES])
+        side.addWidget(self.mode_combo)
+
+        side.addSpacing(8)
+        # Colour-scale controller: colour scheme + linear/log pickers and
+        # Min/Max text-box entry. Editing the range clamps the heatmap
+        # colours interactively without re-rasterising the mesh. Sits
+        # directly under the Mode combo so the scale tracks the metric.
+        # Its gradient strip is not shown here — it is reparented onto the
+        # GL viewer as a bottom-left overlay (see below).
+        self.scale_controller = ScaleController()
+        self.scale_controller.rangeChanged.connect(self._on_scale_range_changed)
+        self.scale_controller.colormapChanged.connect(self._on_colormap_changed)
+        self.scale_controller.scaleTypeChanged.connect(self._on_scale_type_changed)
+        side.addWidget(self.scale_controller, 0)
+
+        side.addSpacing(8)
+        self.rail_only_box = QCheckBox("Show only rail net (R)")
+        self.rail_only_box.setToolTip(
+            "When on, only the copper of each selected rail's own primary "
+            "net is shown — any nets joined to it via SERIES bridges (e.g. "
+            "3V3_SW bridged to +3V3 by L2) are hidden. Markers, the probe, "
+            "and the net-name lookup all follow the same filter."
+        )
+        side.addWidget(self.rail_only_box)
+
+        self.show_markers_box = QCheckBox("Show pin markers (I)")
+        self.show_markers_box.setChecked(True)
+        self.show_markers_box.setToolTip(
+            "When on, the directive pin markers (SOURCE / SINK / SERIES / "
+            "REGULATOR / VIA) and their legend are drawn on top of the "
+            "heatmap. Turn off for an unobstructed view of the copper."
+        )
+        side.addWidget(self.show_markers_box)
+
+        self.show_outlines_box = QCheckBox("Show layer outlines (O)")
+        self.show_outlines_box.setChecked(False)
+        self.show_outlines_box.setToolTip(
+            "When on, every visible layer's copper boundary is traced "
+            "with a thin line in that layer's swatch colour. Useful for "
+            "spotting which copper belongs to which layer when stacking "
+            "multiple layers in the view."
+        )
+        side.addWidget(self.show_outlines_box)
+
+        self.show_board_outline_box = QCheckBox("Show board outline")
+        self.show_board_outline_box.setChecked(False)
+        self.show_board_outline_box.setToolTip(
+            "When on, the PCB's mechanical board outline is overlaid as "
+            "a bold contrasting ribbon on top of the heatmap. Sourced "
+            "from the mechanical layer tagged Layer Type = Board."
+        )
+        side.addWidget(self.show_board_outline_box)
+
+        self.show_mesh_box = QCheckBox("Show copper mesh")
+        self.show_mesh_box.setChecked(False)
+        self.show_mesh_box.setToolTip(
+            "When on, the FEM triangulation is overlaid on the heatmap "
+            "as a fine dark wireframe — useful for judging local mesh "
+            "density and spotting elongated triangles. No solve impact; "
+            "purely a visualisation toggle."
+        )
+        side.addWidget(self.show_mesh_box)
+
+        self.show_pads_box = QCheckBox("Show pads (P)")
+        self.show_pads_box.setChecked(False)
+        self.show_pads_box.setToolTip(
+            "When on, every SMT and through-hole pad on a visible copper "
+            "layer is traced with a black outline at the pad's location. "
+            "SMT pads appear on their assigned layer only; through-hole "
+            "pads appear on every enabled copper layer. Press P to toggle."
+        )
+        side.addWidget(self.show_pads_box)
+
+        self.show_all_copper_box = QCheckBox("Show all copper (C)")
+        self.show_all_copper_box.setChecked(False)
+        self.show_all_copper_box.setToolTip(
+            "When on, every copper polygon on a visible layer that does "
+            "NOT belong to any currently selected rail is traced with a "
+            "thin outline in that layer's swatch colour. Useful for seeing "
+            "where other rails and signal nets sit relative to the rails "
+            "being analysed. Press C to toggle."
+        )
+        side.addWidget(self.show_all_copper_box)
+
+        self.colour_stubs_box = QCheckBox("Grey no current copper")
+        self.colour_stubs_box.setChecked(False)
+        self.colour_stubs_box.setToolTip(
+            "Copper pieces that the FEM excluded (no current path through "
+            "them — typically via-cap stubs and decoupling islands) are "
+            "coloured by their approximate voltage by default, sampled from "
+            "the same-net solved layer. Check this to instead draw them as "
+            "a flat dim grey, making them obviously distinct from the solved "
+            "copper. The voltage is constant across each piece since no "
+            "current flows."
+        )
+        side.addWidget(self.colour_stubs_box)
+
+        self.cursor_tooltip_box = QCheckBox("Show cursor tooltip (T)")
+        self.cursor_tooltip_box.setChecked(False)
+        self.cursor_tooltip_box.setToolTip(
+            "When on, a small tooltip follows the cursor showing the "
+            "value of the current mode (Voltage / Voltage Drop / Current "
+            "Density / Power Density) at that point, plus the net and "
+            "layer. Same information as the bar at the bottom of the plot."
+        )
+        side.addWidget(self.cursor_tooltip_box)
+
+        self.view_3d_box = QCheckBox("3D view (3)")
+        self.view_3d_box.setChecked(False)
+        self.view_3d_box.setToolTip(
+            "Switch the canvas to a 3D perspective view of the stacked "
+            "copper layers. Right-drag pans, Shift+right-drag rotates, "
+            "and the wheel dollies the camera. Vias are drawn as orange "
+            "cylinders connecting the layers they span."
+        )
+        side.addWidget(self.view_3d_box)
+
+        self.heatmap_vias_box = QCheckBox("Heatmap vias/PTH (V)")
+        self.heatmap_vias_box.setChecked(False)
+        self.heatmap_vias_box.setToolTip(
+            "Colour via and plated-through-hole cylinders by the active "
+            "heatmap mode (voltage / drop / current / power) instead of "
+            "solid orange (vias) / light grey (PTHs). Voltage / Voltage "
+            "Drop interpolate along the barrel; Current Density and Power "
+            "Density are constant per inter-layer segment. 3D mode only. "
+            "Press V to toggle."
+        )
+        side.addWidget(self.heatmap_vias_box)
+
+        self.show_arrows_box = QCheckBox("Show current arrows (A)")
+        self.show_arrows_box.setChecked(False)
+        self.show_arrows_box.setToolTip(
+            "Overlay white arrows showing the direction (and relative "
+            "magnitude) of current flow at a regular grid of sample points. "
+            "The arrow shaft length scales with sqrt(|J|) so weak and strong "
+            "currents are both visible. Press A to toggle. Works in both "
+            "2D and 3D — in 3D each arrow sits on its layer's copper top."
+        )
+        side.addWidget(self.show_arrows_box)
+
+        self.arrow_spacing_label = QLabel("Arrow density: 30")
+        self.arrow_spacing_label.setStyleSheet(
+            f"QLabel {{ color: {_T()['fg_muted']}; font-size: 8pt; }}"
+        )
+        side.addWidget(self.arrow_spacing_label)
+        self.arrow_spacing_slider = QSlider(Qt.Horizontal)
+        self.arrow_spacing_slider.setRange(5, 300)
+        self.arrow_spacing_slider.setValue(30)
+        self.arrow_spacing_slider.setToolTip(
+            "Approximate number of arrows along the shorter side of each "
+            "layer. Arrows are placed at fixed world-space positions, so "
+            "zooming pans through them instead of resampling — keeps the "
+            "count bounded on very large designs."
+        )
+        self.arrow_spacing_slider.valueChanged.connect(
+            self._on_arrow_density_changed,
+        )
+        side.addWidget(self.arrow_spacing_slider)
+
+        # Layer-spacing slider — drives both the per-layer z separation
+        # and the via cylinder length in 3D mode (they share the same
+        # vertical-exaggeration uniform, so dragging is instant — no
+        # mesh rebuild). No-op in 2D mode.
+        side.addSpacing(8)
+        self.layer_spacing_label = QLabel("Layer spacing: 10×")
+        self.layer_spacing_label.setStyleSheet(
+            f"QLabel {{ color: {_T()['fg_muted']}; font-size: 8pt; }}"
+        )
+        side.addWidget(self.layer_spacing_label)
+        self.layer_spacing_slider = QSlider(Qt.Horizontal)
+        self.layer_spacing_slider.setRange(1, 100)
+        self.layer_spacing_slider.setValue(10)
+        self.layer_spacing_slider.setToolTip(
+            "3D mode only. Higher = more visual separation between "
+            "layers and longer via cylinders; 1× ≈ physical thickness."
+        )
+        self.layer_spacing_slider.valueChanged.connect(
+            self._on_layer_spacing_changed,
+        )
+        side.addWidget(self.layer_spacing_slider)
+
+        side.addSpacing(12)
+        self.summary_label = QLabel("")
+        self.summary_label.setWordWrap(True)
+        side.addWidget(self.summary_label)
+
+        side.addStretch(1)
+
+        # Wrap side layout in a fixed-width container, then put that inside a
+        # QScrollArea so the panel scrolls vertically when its contents exceed
+        # the window height (e.g. on boards with many copper layers).
+        side_widget = QWidget()
+        side_widget.setLayout(side)
+        side_widget.setFixedWidth(260)
+
+        side_scroll = QScrollArea()
+        side_scroll.setWidget(side_widget)
+        # Resizable=True is essential: with =False, the inner widget uses its
+        # width-agnostic sizeHint() for height, which under-estimates the
+        # height of word-wrapped labels (e.g. summary_label) at the actual
+        # 260px width, and the controls below it overlap. =True makes the
+        # layout reflow at the real width.
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setFrameShape(QFrame.NoFrame)
+        side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # Always-on vertical scrollbar so the inner viewport width is
+        # constant regardless of whether scrolling is needed; without this,
+        # adding/removing the scrollbar would shift content widths around.
+        side_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        # Reserve room for the vertical scrollbar so its appearance doesn't
+        # crop the 260px-wide content. 18px covers the default Fusion/Win
+        # scrollbar extent with a hair of margin.
+        side_scroll.setFixedWidth(260 + 18)
+        side_scroll.setStyleSheet(
+            f"QScrollArea {{ background-color: {_T()['bg']}; }}"
+        )
+        outer.addWidget(side_scroll)
+        self._sidebar_scroll = side_scroll
+
+        # Slim vertical splitter handle that toggles the sidebar's visibility
+        # so the user can give the viewport extra real estate. Custom-painted
+        # triangle stays crisp at 14px; Unicode arrow glyphs were fuzzy.
+        # Hotkey "B" mirrors the click.
+        self._sidebar_toggle_btn = SidebarToggleButton()
+        self._sidebar_toggle_btn.setToolTip(
+            "Collapse / expand the side panel (B)"
+        )
+        self._sidebar_toggle_btn.clicked.connect(self._toggle_sidebar)
+        outer.addWidget(self._sidebar_toggle_btn)
+
+        # Plot area — custom QOpenGLWidget rendering the FEM mesh directly
+        # via shaders (per-vertex colour interpolation, MVP transform on
+        # GPU). Pan and zoom become single matrix uniforms; no rasterise,
+        # no texture upload, always pixel-sharp.
+        plot_layout = QVBoxLayout()
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+        plot_layout.setSpacing(0)
+
+        self._gl_viewer = GLMeshViewer()
+        # Push the colormap LUT once — every render reuses it via uniform.
+        self._gl_viewer.set_colormap(_build_cmap_lut(self._cmap_name))
+        # Resize / pan / zoom all flow through this signal — we use it to
+        # keep our cached mm-per-pixel in sync (so window resizes preserve
+        # the user's zoom level CAD-style) and to schedule a re-fit on
+        # the first render once Qt has settled the widget size.
+        self._gl_viewer.viewChanged.connect(self._on_gl_view_changed)
+        self._gl_viewer.mouseHoveredAt.connect(self._on_gl_mouse_hovered)
+        self._gl_viewer.clicked.connect(self._on_gl_clicked)
+
+        plot_layout.addWidget(self._gl_viewer, 1)
+
+        # Heatmap colour-scale strip — overlaid on the GL viewer's
+        # bottom-left corner rather than living in the side panel. It's a
+        # live child widget (not a paintGL overlay) so the Min/Max drag
+        # handles stay interactive. The ScaleController still owns it and
+        # drives its colormap / range / title; only the parent + on-screen
+        # position change here. _position_scale_overlay (called on every
+        # GL-viewer resize via eventFilter) keeps it pinned bottom-left.
+        self._scale_overlay = self.scale_controller.bar
+        self._scale_overlay.setParent(self._gl_viewer)
+        self._scale_overlay.show()
+        self._position_scale_overlay()
+
+        # Probe label: updated on every mouse move over the plot. Colours
+        # pinned so the text stays readable under any system / Qt theme
+        # (otherwise white-on-light-grey from the inherited dark theme).
+        self.probe_label_widget = QLabel("Hover the plot to probe values")
+        _t = _T()
+        self.probe_label_widget.setStyleSheet(
+            f"QLabel {{ font-family: Consolas, monospace; padding: 6px 10px;"
+            f" color: {_t['fg']}; background-color: {_t['bg']};"
+            f" border-top: 1px solid {_t['border']}; }}"
+        )
+        plot_layout.addWidget(self.probe_label_widget)
+
+        plot_widget = QWidget()
+        plot_widget.setLayout(plot_layout)
+        outer.addWidget(plot_widget, 1)
+
+        self._init_log.info(
+            "PdnViewer init: pre-tabs done (%.2fs)",
+            time.monotonic() - self._init_t0,
+        )
+        # Setup tab — populated from the metadata bundle that ships with the
+        # solve pickle. Built once at construction time; doesn't react to
+        # heatmap selection changes.
+        _t = time.monotonic()
+        self.tabs.addTab(self._build_setup_tab(), "Setup")
+        self._init_log.info("PdnViewer init: Setup tab (%.2fs)", time.monotonic() - _t)
+
+        # Pins tab — sortable, filterable table of every directive pin's
+        # voltage / drop / current density / power density. The empty
+        # table structure is built up-front (cheap); the actual row
+        # population (one QTableWidgetItem per pin × N columns + a voltage
+        # interpolator per (layer, net)) is deferred to the first time the
+        # user navigates to this tab — see :meth:`_on_tabs_current_changed`.
+        # Without this, opening a viewer on a board with thousands of pins
+        # blocks the GUI thread for several seconds.
+        _t = time.monotonic()
+        self._pins_table_populated = False
+        self._pins_tab_index = self.tabs.addTab(self._build_pins_tab(), "Nodes")
+        self._init_log.info("PdnViewer init: Nodes tab (%.2fs)", time.monotonic() - _t)
+
+        # Vias tab — sortable, filterable table of every via's worst-segment
+        # current + power dissipation. Same lazy-populate treatment as the
+        # Nodes tab; on a 7 000-via board the populate step alone took
+        # 35 seconds of blocked GUI thread. The empty structure plus a
+        # placeholder row are built up-front so the tab isn't visually
+        # empty if the user immediately clicks it.
+        _t = time.monotonic()
+        self._vias_table_populated = False
+        self._vias_tab_index = self.tabs.addTab(self._build_vias_tab(), "Vias")
+        self._init_log.info("PdnViewer init: Vias tab (%.2fs)", time.monotonic() - _t)
+
+        # Settings tab — tunable physics + meshing + display knobs and a
+        # Re-run button. Changes apply on the next solve (Re-run opens a
+        # fresh viewer with the new solution).
+        _t = time.monotonic()
+        self.tabs.addTab(self._build_settings_tab(), "Settings")
+        self._init_log.info("PdnViewer init: Settings tab (%.2fs)", time.monotonic() - _t)
+
+        # Help tab — static reference for hotkeys + mouse controls. Built
+        # once at construction; never updates.
+        _t = time.monotonic()
+        self.tabs.addTab(self._build_help_tab(), "Help")
+        self._init_log.info("PdnViewer init: Help tab (%.2fs)", time.monotonic() - _t)
+        self._init_log.info(
+            "PdnViewer init: all tabs done (total %.2fs)",
+            time.monotonic() - self._init_t0,
+        )
+
+        # Lazy-populate the Nodes/Vias tables on first activation. Done
+        # this way (rather than on construction) so opening a viewer on a
+        # large board is instant — the user lands on the Heatmap tab and
+        # only pays for the row builds if they actually navigate to the
+        # table tabs.
+        self.tabs.currentChanged.connect(self._on_tabs_current_changed)
+
+        # Wire up signals.
+        # layer_list.itemChanged is wired in _build_ui via
+        # _on_layer_visibility_changed so we can pause-and-resume during
+        # programmatic checks without spamming renders.
+        self.mode_combo.currentTextChanged.connect(self._render)
+        self.rail_only_box.toggled.connect(self._render)
+        self.show_markers_box.toggled.connect(self._render)
+        self.show_outlines_box.toggled.connect(self._render)
+        self.show_board_outline_box.toggled.connect(self._refresh_board_outline)
+        self.show_mesh_box.toggled.connect(
+            lambda checked: self._gl_viewer.set_show_mesh_edges(checked)
+        )
+        self.show_pads_box.toggled.connect(self._render)
+        self.show_all_copper_box.toggled.connect(self._render)
+        self.colour_stubs_box.toggled.connect(self._render)
+        self.cursor_tooltip_box.toggled.connect(self._on_cursor_tooltip_toggled)
+        self.view_3d_box.toggled.connect(self._on_view_3d_toggled)
+        self.heatmap_vias_box.toggled.connect(self._render)
+        self.show_arrows_box.toggled.connect(self._on_arrows_toggled)
+        # Pan, wheel zoom, and resize handlers are wired to the GL viewer
+        # via signals connected when the viewer was created.
+
+    # --- Layer-list helpers -------------------------------------------------
+
+    # Fixed colour palette for the layer-list swatches. Matches Altium's
+    # default "Signal And Plane Layers" palette so the swatches in this
+    # viewer line up with what the user sees in Altium's Layers dialog.
+    # Top/Bottom get dedicated colours; inner layers index into a cycle
+    # by their position in the stackup (1st inner = cycle[0], etc.).
+    _LAYER_SWATCH_COLOURS: dict[str, str] = {
+        "top":    "#ff0000",
+        "bottom": "#0000ff",
+    }
+    _INNER_LAYER_CYCLE: tuple[str, ...] = (
+        "#bc8e00",  # 1st inner (L2)
+        "#70dbfa",  # 2nd inner (L3)
+        "#00cc66",  # 3rd inner (L4)
+        "#9966ff",  # 4th inner (L5)
+        "#00ffff",  # 5th inner (L6)
+        "#800080",  # 6th inner (L7)
+        "#ff00ff",  # 7th inner (L8)
+        "#808000",  # 8th inner (L9)
+        "#ffff00",  # 9th inner (L10)
+        "#808080",  # 10th inner (L11)
+        "#ffffff",  # 11th inner (L12)
+        "#800080",  # 12th inner (L13)
+        "#008080",  # 13th inner (L14)
+        "#c0c0c0",  # 14th inner (L15)
+    )
+
+    def _layer_color_for(self, phys: str) -> str:
+        # Colour is keyed purely on the layer's position in the stackup
+        # ordering — not its name or id. Board layer names vary ("Top Layer"
+        # vs "L1"), so a name check mis-colours designs like Corvette whose
+        # layers are "L1".."L16". Ordering is reliable: the first layer in
+        # the stackup is always red, the last always blue.
+        rank = self._phys_stackup_rank.get(phys, 0)
+        if rank == 0:
+            return self._LAYER_SWATCH_COLOURS["top"]
+        if rank == len(self._physicals) - 1:
+            return self._LAYER_SWATCH_COLOURS["bottom"]
+        # Inner layer — pick deterministically by stackup position so the
+        # same layer keeps the same colour across re-renders. The 1st inner
+        # layer has rank 1; subtract 1 to map it to cycle[0] (the cyan that
+        # Altium uses for Mid Layer 1).
+        idx = max(0, rank - 1)
+        return self._INNER_LAYER_CYCLE[idx % len(self._INNER_LAYER_CYCLE)]
+
+    def _build_layer_row_widget(self, eye: EyeButton, *,
+                                  swatch_color: str | None,
+                                  label_text: str, bold: bool) -> QWidget:
+        """Build a single row for the layer list: eye + swatch + name."""
+        w = QWidget()
+        layout = QHBoxLayout(w)
+        layout.setContentsMargins(2, 1, 6, 1)
+        layout.setSpacing(6)
+        layout.addWidget(eye)
+        if swatch_color is not None:
+            swatch = QLabel()
+            pix = QPixmap(14, 14)
+            pix.fill(QColor(swatch_color))
+            swatch.setPixmap(pix)
+            swatch.setFixedSize(14, 14)
+            layout.addWidget(swatch)
+        else:
+            # Keep the name label aligned with rows that have a swatch.
+            spacer = QLabel()
+            spacer.setFixedSize(14, 14)
+            layout.addWidget(spacer)
+        name = QLabel(label_text)
+        _fg = _T()["fg"]
+        name.setStyleSheet(
+            f"QLabel {{ color: {_fg}; font-weight: bold; }}"
+            if bold else f"QLabel {{ color: {_fg}; }}"
+        )
+        layout.addWidget(name)
+        layout.addStretch(1)
+        return w
+
+    def _on_layer_eye_toggled(self, _on: bool) -> None:
+        """An individual layer's eye was clicked."""
+        self._sync_all_layers_eye()
+        self._on_layer_visibility_changed()
+
+    def _on_all_layers_toggled(self, on: bool) -> None:
+        """The "All Layers" eye was clicked — show or hide every layer."""
+        for _name, eye in self._layer_eye_buttons:
+            eye.setVisibleState(on, emit=False)
+        self._on_layer_visibility_changed()
+
+    def _sync_all_layers_eye(self) -> None:
+        """Reflect "any layer visible" in the All Layers eye state."""
+        any_visible = any(eye.isVisibleState()
+                          for _n, eye in self._layer_eye_buttons)
+        self._all_layers_eye.setVisibleState(any_visible, emit=False)
+
+    def _set_layer_visible(self, name: str, on: bool, *, emit: bool = True) -> None:
+        """Programmatically toggle a named layer's visibility."""
+        for nm, eye in self._layer_eye_buttons:
+            if nm == name:
+                eye.setVisibleState(on, emit=emit)
+                break
+        self._sync_all_layers_eye()
+
+    def _on_layer_visibility_changed(self, _item: object = None) -> None:
+        """Layer eye toggled in the layer list → re-render."""
+        self._render()
+
+    def _visible_layers(self) -> list[str]:
+        """Names of the physical layers currently visible (eye open),
+        in stackup order (top first)."""
+        return [name for name, eye in self._layer_eye_buttons
+                if eye.isVisibleState()]
+
+    def _on_rail_eye_toggled(self, _on: bool) -> None:
+        """An individual rail's eye was clicked."""
+        self._sync_all_rails_eye()
+        self._render()
+
+    def _on_all_rails_toggled(self, on: bool) -> None:
+        """The "All Rails" eye was clicked — show or hide every rail."""
+        for _name, eye in self._rail_eye_buttons:
+            eye.setVisibleState(on, emit=False)
+        self._render()
+
+    def _sync_all_rails_eye(self) -> None:
+        """Reflect "any rail visible" in the All Rails eye state."""
+        any_visible = any(eye.isVisibleState()
+                          for _n, eye in self._rail_eye_buttons)
+        self._all_rails_eye.setVisibleState(any_visible, emit=False)
+
+    def _visible_rails(self) -> list[str]:
+        """Names of the rails currently visible (eye open), in the
+        sort order they were registered (matches the rail list UI)."""
+        return [name for name, eye in self._rail_eye_buttons
+                if eye.isVisibleState()]
+
+    # --- Rendering -----------------------------------------------------------
+
+    def _current_selection(self) -> tuple[list[str], list[str], str]:
+        """Current heatmap selection: ``(visible_layers, visible_rails, mode)``."""
+        layers = self._visible_layers()
+        rails = self._visible_rails()
+        mode = self.mode_combo.currentText()
+        return layers, rails, mode
+
+    def _mode_derive_fn(self, mode: str):
+        for label, unit, fn in _MODES:
+            if label == mode:
+                return label, unit, fn
+        raise KeyError(mode)
+
+    def _effective_rail_members(self, rail_names) -> list[str]:
+        """The list of net names whose copper should appear when the given
+        rails are selected, honouring the "Show only rail net" checkbox.
+
+        Off → union of full rail groups (e.g. ``[+3V3, 3V3_SW]`` for +3V3).
+        On  → just each selected rail's primary name (bridged nets hidden).
+
+        Accepts either a single rail name (legacy single-rail call sites)
+        or a list of rail names (multi-rail control). An empty list / empty
+        string returns ``[]`` — caller code treats that as "no rail filter
+        currently selected", which in practice means the heatmap mesh has
+        no nets to draw.
+        """
+        if isinstance(rail_names, str):
+            rail_names = [rail_names] if rail_names else []
+        if not rail_names:
+            return []
+        rail_only = self.rail_only_box.isChecked()
+        members: list[str] = []
+        seen: set[str] = set()
+        for rail_name in rail_names:
+            full = self._rail_to_members.get(rail_name, [rail_name])
+            if rail_only and rail_name in full:
+                picks: list[str] = [rail_name]
+            else:
+                picks = list(full)
+            for m in picks:
+                if m not in seen:
+                    seen.add(m)
+                    members.append(m)
+        return members
+
+    def _build_rail_arrays(
+        self, phys_list: list[str], rail_names: list[str], derive_fn,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+               np.ndarray, list[dict]]:
+        """Combine every per-(layer, net) padne Layer for the listed physical
+        layers + the selected rail groups' nets into one big mesh batch for
+        the GPU, and ALSO build per-(physical_layer, net) CPU-side
+        interpolators for the hover probe and Voltage Drop reference.
+
+        Drawing order is BOTTOM-to-TOP of the stackup, so the topmost
+        checked layer is rendered last and sits visually on top of any
+        lower layers it overlaps with.
+
+        Returns ``(xs, ys, zs, vs, triangles, layer_probes)``. ``zs`` is
+        per-vertex z (pre-exaggeration mm; the GLMeshViewer applies its
+        own vertical scaling in 3D mode). In 2D mode the GL viewer ignores
+        z, but we still build the array so the data path stays uniform.
+        ``layer_probes`` is a list of dicts (one per visible (phys, net))
+        with keys ``physical``, ``net``, ``layer_id``, ``triangulation``,
+        ``interpolator``, ``values`` (numpy float64), ``prepared_shape``.
+        The list is in TOP-FIRST order so the probe can walk it and
+        report the topmost layer whose copper sits under the cursor.
+        """
+        members = self._effective_rail_members(rail_names)
+        # BOTTOM-first for GPU draw order (topmost rendered last → on top).
+        phys_draw_order = sorted(
+            phys_list,
+            key=lambda p: self._phys_stackup_rank.get(p, 1 << 30),
+            reverse=True,
+        )
+        xs_parts: list[np.ndarray] = []
+        ys_parts: list[np.ndarray] = []
+        zs_parts: list[np.ndarray] = []
+        vs_parts: list[np.ndarray] = []
+        tris_parts: list[np.ndarray] = []
+        # layer_probes is ordered TOP-FIRST so the hover probe naturally
+        # reports the visually-topmost layer when copper overlaps.
+        layer_probes: list[dict] = []
+        # In 3D mode extrude each layer's flat mesh into a thin prism so
+        # the copper has visible thickness from oblique angles. 2D mode
+        # keeps the flat mesh as-is (no perf hit on the common path).
+        extrude_3d = (self.view_3d_box.isChecked()
+                      and self._COPPER_THICKNESS_MM > 0.0)
+        offset = 0
+        for phys in phys_draw_order:
+            phys_z = self._layer_z_for(phys)
+            for net in members:
+                layer_index = self._index_by_pair.get((phys, net))
+                if layer_index is None:
+                    continue
+                entry = self._layer_arrays(layer_index, derive_fn)
+                n_in = entry["xs"].size
+                if n_in == 0 or entry["tris"].size == 0:
+                    continue
+                if extrude_3d:
+                    lxs, lys, lzs, lvs, ltris = _extrude_to_prism(
+                        entry["xs"], entry["ys"], entry["vs"], entry["tris"],
+                        z_center=phys_z,
+                        thickness=self._COPPER_THICKNESS_MM,
+                    )
+                else:
+                    lxs = entry["xs"]
+                    lys = entry["ys"]
+                    lzs = np.full(n_in, phys_z, dtype=np.float64)
+                    lvs = entry["vs"]
+                    ltris = entry["tris"]
+                n = lxs.size
+                xs_parts.append(lxs)
+                ys_parts.append(lys)
+                zs_parts.append(lzs)
+                vs_parts.append(lvs)
+                # Vectorised offset add — re-base local indices into the
+                # combined GPU batch.
+                tris_parts.append(ltris + offset)
+                offset += n
+                layer_probes.append({
+                    "physical": phys,
+                    "net": net,
+                    "layer_id": self._phys_name_to_layer_id.get(phys),
+                    "layer_index": layer_index,
+                    "triangulation": entry["triangulation"],
+                    "interpolator": entry["interpolator"],
+                    # Cache key stored for lazy interpolator writeback — when
+                    # the hover probe builds the interpolator on first cursor
+                    # move, it writes back to the cache entry so subsequent
+                    # renders of the same (layer, mode) reuse it.
+                    "_cache_key": (layer_index, id(derive_fn)),
+                    "values": entry["vs"],
+                    "prepared_shape": entry["prepared_shape"],
+                    "outline_segments": entry["outline_segments"],
+                    "z": phys_z,
+                })
+        # Reverse to put topmost layer first in the probe walk order.
+        layer_probes.reverse()
+
+        if xs_parts:
+            xs = np.concatenate(xs_parts)
+            ys = np.concatenate(ys_parts)
+            zs = np.concatenate(zs_parts)
+            vs = np.concatenate(vs_parts)
+            tris = np.concatenate(tris_parts, axis=0)
+        else:
+            xs = np.empty(0, dtype=np.float64)
+            ys = np.empty(0, dtype=np.float64)
+            zs = np.empty(0, dtype=np.float64)
+            vs = np.empty(0, dtype=np.float64)
+            tris = np.empty((0, 3), dtype=np.int32)
+        return xs, ys, zs, vs, tris, layer_probes
+
+    def _layer_arrays(self, layer_index: int, derive_fn) -> dict:
+        """Assemble (and cache) per-layer arrays + Triangulation +
+        _FastTriSampler + prepared shapely shape for one
+        (layer_index, derive_fn) pair.
+
+        First call walks the LayerSolution meshes once and builds
+        everything; subsequent calls are dict lookups. Solution data is
+        immutable so the cache lives for the session.
+
+        Keying on ``id(derive_fn)`` (rather than the mode label) means
+        modes that share a derive function — e.g. 'Voltage' and
+        'Voltage Drop', which both use ``_voltage_per_vertex`` (Voltage
+        Drop's shift is applied later, downstream in ``_render``) —
+        share a single cache entry.
+        """
+        key = (layer_index, id(derive_fn))
+        cached = self._layer_cache.get(key)
+        if cached is not None:
+            return cached
+
+        ls = self.solution.layer_solutions[layer_index]
+        layer = self.solution.problem.layers[layer_index]
+        # Lean format: per-mesh-component numpy arrays — no half-edge
+        # iteration, no per-vertex Python attribute access.
+        xys_meshes = ls.vertex_xys
+        tris_meshes = ls.triangles
+        pots_meshes = ls.potentials
+        pds_meshes = ls.power_densities
+
+        mxs_parts: list[np.ndarray] = []
+        mys_parts: list[np.ndarray] = []
+        mvs_parts: list[np.ndarray] = []
+        mtris_parts: list[np.ndarray] = []
+        offset = 0
+        for xys, tris_local, pot, pd in zip(
+            xys_meshes, tris_meshes, pots_meshes, pds_meshes,
+        ):
+            n = xys.shape[0]
+            if n < 3 or tris_local.size == 0:
+                continue
+            values = derive_fn(tris_local, pot, pd, layer.conductance, n)
+            mxs_parts.append(xys[:, 0])
+            mys_parts.append(xys[:, 1])
+            mvs_parts.append(np.asarray(values, dtype=np.float64))
+            # Re-base local indices into the per-layer combined batch.
+            mtris_parts.append(tris_local + offset)
+            offset += n
+
+        if mxs_parts:
+            xs = np.concatenate(mxs_parts)
+            ys = np.concatenate(mys_parts)
+            vs = np.concatenate(mvs_parts)
+        else:
+            xs = np.empty(0, dtype=np.float64)
+            ys = np.empty(0, dtype=np.float64)
+            vs = np.empty(0, dtype=np.float64)
+        if mtris_parts:
+            tris = np.concatenate(mtris_parts, axis=0)
+        else:
+            tris = np.empty((0, 3), dtype=np.int32)
+
+        if xs.size >= 3 and tris.size > 0:
+            triangulation = Triangulation(xs, ys, tris)
+            # The voltage sampler (_FastTriSampler) is built lazily on
+            # first cursor hover via _ensure_interpolator() — there's no
+            # point building it for a layer the user never probes. The
+            # cache entry is updated at hover time so re-renders of the
+            # same (layer, mode) always reuse a previously-built sampler.
+            interpolator = None
+        else:
+            triangulation = None
+            interpolator = None
+
+        shape = layer.shape
+        prepared_shape = (_sp.prep(shape)
+                          if shape is not None and not shape.is_empty else None)
+        outline_segments = _shape_outline_segments(shape)
+
+        # Vertex indices that actually appear in a triangle. The padne
+        # solver's orphan-vertex guards pin "no-triangle" vertices to
+        # V=0 to keep the linear system non-singular; they're invisible
+        # in the heatmap (no triangle = no painted pixel) but they
+        # otherwise dominate vs.min()/max() and skew the scale-controller
+        # range — especially after the Voltage Drop subtract shifts them
+        # by the source voltage. Callers compute stats via vs[used_indices].
+        if tris.size > 0:
+            used_indices = np.unique(tris.ravel().astype(np.int64))
+        else:
+            used_indices = np.empty(0, dtype=np.int64)
+
+        entry = {
+            "xs": xs,
+            "ys": ys,
+            "vs": vs,
+            "tris": tris,
+            "triangulation": triangulation,
+            "interpolator": interpolator,
+            "prepared_shape": prepared_shape,
+            # Outline segments: (N, 2) float32 with vertices in GL_LINES
+            # pairs (consecutive entries are one segment). Pre-built here
+            # so toggling the outline overlay is just a buffer upload.
+            "outline_segments": outline_segments,
+            "used_indices": used_indices,
+        }
+        self._layer_cache[key] = entry
+        return entry
+
+    def _layer_vectors(self, layer_index: int) -> dict | None:
+        """Build (and cache) the per-triangle current-density vector
+        ``J = -sigma * grad V`` for one padne layer.
+
+        The result is independent of the current heatmap mode (it always
+        works off the raw potentials), so the cache key is just the
+        layer index. ``None`` is returned when the layer has no usable
+        triangles.
+
+        Returned dict has:
+
+        * ``xs, ys`` — ``(N,)`` float64 vertex coordinates (mm) packed
+          across all mesh components of the layer (same packing scheme
+          as :meth:`_layer_arrays`).
+        * ``tris`` — ``(M, 3)`` int32 triangle indices.
+        * ``cx, cy`` — ``(M,)`` triangle centroid coordinates (mm).
+        * ``Jx, Jy`` — ``(M,)`` per-triangle current-density components
+          (A/mm). Zero on degenerate (zero-area) triangles.
+        * ``trifinder`` — matplotlib ``TriFinder`` for point-in-triangle
+          lookups during arrow grid sampling.
+        * ``bounds`` — ``(x_min, x_max, y_min, y_max)`` of the layer.
+        """
+        cached = self._layer_vec_cache.get(layer_index)
+        if cached is not None:
+            return cached
+
+        ls = self.solution.layer_solutions[layer_index]
+        layer = self.solution.problem.layers[layer_index]
+        sigma = float(layer.conductance)
+
+        xs_parts: list[np.ndarray] = []
+        ys_parts: list[np.ndarray] = []
+        pot_parts: list[np.ndarray] = []
+        tris_parts: list[np.ndarray] = []
+        offset = 0
+        for xys, tris_local, pot in zip(ls.vertex_xys, ls.triangles, ls.potentials):
+            n = xys.shape[0]
+            if n < 3 or tris_local.size == 0:
+                continue
+            xs_parts.append(xys[:, 0])
+            ys_parts.append(xys[:, 1])
+            pot_parts.append(np.asarray(pot, dtype=np.float64))
+            tris_parts.append(tris_local.astype(np.int32, copy=False) + offset)
+            offset += n
+        if not xs_parts:
+            return None
+
+        xs = np.concatenate(xs_parts)
+        ys = np.concatenate(ys_parts)
+        pots = np.concatenate(pot_parts)
+        tris = np.concatenate(tris_parts, axis=0)
+
+        # Per-triangle linear gradient of potential. Solve
+        #   [[x1-x0, y1-y0], [x2-x0, y2-y0]] @ [dV/dx, dV/dy]^T
+        #   = [V1-V0, V2-V0]^T
+        # vectorised across all triangles.
+        tx = xs[tris]
+        ty = ys[tris]
+        tv = pots[tris]
+        ax_ = tx[:, 1] - tx[:, 0]
+        ay_ = ty[:, 1] - ty[:, 0]
+        bx_ = tx[:, 2] - tx[:, 0]
+        by_ = ty[:, 2] - ty[:, 0]
+        det = ax_ * by_ - bx_ * ay_
+        # Avoid division by zero on degenerate (collinear) triangles.
+        bad = np.abs(det) < 1e-30
+        safe_det = np.where(bad, 1.0, det)
+        dV1 = tv[:, 1] - tv[:, 0]
+        dV2 = tv[:, 2] - tv[:, 0]
+        dVdx = (by_ * dV1 - ay_ * dV2) / safe_det
+        dVdy = (ax_ * dV2 - bx_ * dV1) / safe_det
+        Jx = -sigma * dVdx
+        Jy = -sigma * dVdy
+        if bad.any():
+            Jx[bad] = 0.0
+            Jy[bad] = 0.0
+
+        cx = tx.mean(axis=1)
+        cy = ty.mean(axis=1)
+
+        triangulation = Triangulation(xs, ys, tris)
+        trifinder = triangulation.get_trifinder()
+
+        entry = {
+            "xs": xs, "ys": ys, "tris": tris,
+            "cx": cx, "cy": cy,
+            "Jx": Jx, "Jy": Jy,
+            "trifinder": trifinder,
+            "bounds": (float(xs.min()), float(xs.max()),
+                       float(ys.min()), float(ys.max())),
+        }
+        self._layer_vec_cache[layer_index] = entry
+        return entry
+
+    # --- Current-arrow overlay --------------------------------------------
+
+    # Pre-exaggeration mm offset applied to arrow z in 3D mode so the
+    # arrow sits above the copper top face instead of z-fighting with
+    # it. Scaled by the GL viewer's vertical-exaggeration uniform, so a
+    # 0.0025 mm lift becomes 0.125 mm at the default 50× — enough to
+    # clear z-fight without the arrow visibly floating above the copper.
+    # Manual-adjust knob: bump this up if you still see z-fighting,
+    # drop it if the arrows look detached from the layer.
+    _ARROW_Z_LIFT_MM: float = 0.0015
+
+    # Hard cap on grid cells per layer. Even with a pathological density
+    # request and a very elongated layer, this keeps the meshgrid
+    # allocation bounded (≤ ~3 MB of float64) instead of letting it blow
+    # out to hundreds of GiB like the old screen-px sampling did on
+    # large designs at deep zoom.
+    _ARROW_MAX_GRID_CELLS: int = 200_000
+
+    def _build_arrow_segments(self, layer_probes: list[dict],
+                              density: float) -> np.ndarray:
+        """Sample current vectors on a regular grid anchored to each
+        layer's *world-space* bounds and return the GL_LINES vertex
+        buffer needed to draw an arrow at each sample. In 2D the result
+        is ``(K, 2)`` (z=0 broadcast in the GL viewer); in 3D it's
+        ``(K, 3)`` with each arrow lifted to its layer's stackup z so it
+        sits on top of the copper. Consecutive vertex pairs are one
+        segment; each arrow contributes three segments (shaft + two
+        head wings = 6 vertices).
+
+        ``density`` is the approximate number of arrows along the
+        shorter side of the *combined* visible-layer bounds. Spacing is
+        shared across every layer in this pass so a small island layer
+        and a full-board plane get the same arrow size — and is derived
+        from world bounds (not the viewport), so zoom / pan / 3D dolly
+        don't change the sample positions or trigger a rebuild.
+        """
+        if (not layer_probes or density <= 0
+                or self._gl_viewer is None):
+            return np.empty((0, 2), dtype=np.float32)
+        in_3d = self._gl_viewer.view_mode() == "3d"
+
+        head_angle_rad = math.radians(25.0)
+        cos_a = math.cos(head_angle_rad)
+        sin_a = math.sin(head_angle_rad)
+        head_frac = 0.30           # head length / shaft length
+        max_len_frac = 0.85        # longest shaft / spacing_mm
+        min_len_frac = 0.20        # shortest shaft (for non-zero |J|)
+        cols = 3 if in_3d else 2
+
+        # Pre-pass: resolve per-layer vector caches once and take the
+        # union of their bounds. The arrow spacing is derived from this
+        # union (not each layer's own bounds), so every layer in the
+        # current selection gets the same arrow size — otherwise a tiny
+        # island layer would render thousands of tiny arrows next to a
+        # plane layer's coarse grid.
+        resolved: list[tuple[dict, dict]] = []
+        ux_min = math.inf; ux_max = -math.inf
+        uy_min = math.inf; uy_max = -math.inf
+        for lp in layer_probes:
+            layer_index = lp.get("layer_index")
+            if layer_index is None:
+                continue
+            vec = self._layer_vectors(layer_index)
+            if vec is None:
+                continue
+            lx_min, lx_max, ly_min, ly_max = vec["bounds"]
+            if lx_max <= lx_min or ly_max <= ly_min:
+                continue
+            resolved.append((lp, vec))
+            if lx_min < ux_min: ux_min = lx_min
+            if lx_max > ux_max: ux_max = lx_max
+            if ly_min < uy_min: uy_min = ly_min
+            if ly_max > uy_max: uy_max = ly_max
+        if not resolved:
+            return np.empty((0, cols), dtype=np.float32)
+        union_w = ux_max - ux_min
+        union_h = uy_max - uy_min
+        spacing_mm = min(union_w, union_h) / float(density)
+        if spacing_mm <= 0:
+            return np.empty((0, cols), dtype=np.float32)
+
+        all_segs: list[np.ndarray] = []
+        for lp, vec in resolved:
+            lx_min, lx_max, ly_min, ly_max = vec["bounds"]
+            gx_min, gx_max = lx_min, lx_max
+            gy_min, gy_max = ly_min, ly_max
+            layer_w = gx_max - gx_min
+            layer_h = gy_max - gy_min
+            cell = spacing_mm
+            nx = max(1, int(math.floor(layer_w / cell)))
+            ny = max(1, int(math.floor(layer_h / cell)))
+            # Safety net: if a freak aspect ratio still pushes nx*ny
+            # over the cap, scale spacing up *for this layer only* so
+            # the grid fits.
+            if nx * ny > self._ARROW_MAX_GRID_CELLS:
+                scale = math.sqrt(nx * ny / self._ARROW_MAX_GRID_CELLS)
+                cell *= scale
+                nx = max(1, int(math.floor(layer_w / cell)))
+                ny = max(1, int(math.floor(layer_h / cell)))
+            gx_axis = gx_min + cell * (np.arange(nx) + 0.5)
+            gy_axis = gy_min + cell * (np.arange(ny) + 0.5)
+            gx_grid, gy_grid = np.meshgrid(gx_axis, gy_axis)
+            gx_flat = gx_grid.ravel()
+            gy_flat = gy_grid.ravel()
+            tri_idx = vec["trifinder"](gx_flat, gy_flat)
+            mask = tri_idx >= 0
+            if not mask.any():
+                continue
+            px = gx_flat[mask]
+            py = gy_flat[mask]
+            ti = tri_idx[mask]
+            Jx = vec["Jx"][ti]
+            Jy = vec["Jy"][ti]
+            mag = np.hypot(Jx, Jy)
+            if mag.max() <= 0:
+                continue
+            # 95th-percentile reference so a single FEM-singularity spike
+            # near a SOURCE/SINK pin doesn't shrink every other arrow.
+            ref = float(np.percentile(mag, 95.0))
+            if ref <= 0:
+                ref = float(mag.max())
+            nmag = np.clip(mag / ref, 0.0, 1.0)
+            length = spacing_mm * (
+                min_len_frac + (max_len_frac - min_len_frac) * np.sqrt(nmag)
+            )
+            inv_mag = np.divide(1.0, mag,
+                                out=np.zeros_like(mag), where=mag > 0)
+            dirx = Jx * inv_mag
+            diry = Jy * inv_mag
+
+            half_len = length * 0.5
+            tail_x = px - half_len * dirx
+            tail_y = py - half_len * diry
+            tip_x = px + half_len * dirx
+            tip_y = py + half_len * diry
+
+            head_len = length * head_frac
+            wl_x = tip_x + head_len * (-dirx * cos_a + diry * sin_a)
+            wl_y = tip_y + head_len * (-dirx * sin_a - diry * cos_a)
+            wr_x = tip_x + head_len * (-dirx * cos_a - diry * sin_a)
+            wr_y = tip_y + head_len * (dirx * sin_a - diry * cos_a)
+
+            n_arrows = px.size
+            segs = np.empty((n_arrows * 6, cols), dtype=np.float32)
+            segs[0::6, 0] = tail_x; segs[0::6, 1] = tail_y
+            segs[1::6, 0] = tip_x;  segs[1::6, 1] = tip_y
+            segs[2::6, 0] = tip_x;  segs[2::6, 1] = tip_y
+            segs[3::6, 0] = wl_x;   segs[3::6, 1] = wl_y
+            segs[4::6, 0] = tip_x;  segs[4::6, 1] = tip_y
+            segs[5::6, 0] = wr_x;   segs[5::6, 1] = wr_y
+            if in_3d:
+                # Lift arrow vertices slightly above the layer top so
+                # GL_DEPTH_TEST doesn't fight the copper mesh under them.
+                # ``z`` is pre-exaggeration mm; vertical-exaggeration in
+                # the model matrix scales both layer z and this lift
+                # together, so the offset stays proportional.
+                z_lift = float(lp.get("z", 0.0)) + self._ARROW_Z_LIFT_MM
+                segs[:, 2] = z_lift
+            all_segs.append(segs)
+
+        if not all_segs:
+            return np.empty((0, cols), dtype=np.float32)
+        return np.concatenate(all_segs, axis=0)
+
+    def _refresh_arrows(self) -> None:
+        """Push the current-arrow overlay (or clear it) based on the
+        side-panel state. Works in both 2D and 3D — in 3D each arrow is
+        lifted to its layer's stackup z so it floats on the copper top
+        face."""
+        if (not hasattr(self, "show_arrows_box")
+                or self._gl_viewer is None):
+            return
+        if (not self.show_arrows_box.isChecked()
+                or not self._layer_probes):
+            self._gl_viewer.clear_arrows()
+            return
+        density = float(self.arrow_spacing_slider.value())
+        segs = self._build_arrow_segments(self._layer_probes, density)
+        if segs.size == 0:
+            self._gl_viewer.clear_arrows()
+            return
+        self._gl_viewer.set_arrows(segs, color=(1.0, 1.0, 1.0))
+
+    def _render(self) -> None:
+        # Optional per-stage timing. When ``self._render_profile`` is a
+        # list (set by tools/bench_recolor.py) each stage appends a
+        # ``(name, seconds)`` pair; when it's None ``_mark`` is a cheap
+        # no-op so production renders pay nothing.
+        _prof = getattr(self, "_render_profile", None)
+        _t0 = time.perf_counter()
+        _tprev = _t0
+
+        def _mark(_name: str) -> None:
+            nonlocal _tprev
+            if _prof is not None:
+                _now = time.perf_counter()
+                _prof.append((_name, _now - _tprev))
+                _tprev = _now
+
+        phys_list, rails, mode = self._current_selection()
+        label, unit, derive_fn = self._mode_derive_fn(mode)
+        is_via_current = (mode == _VIA_CURRENT_MODE)
+
+        # Copper-mesh cmap follows the active mode: every other mode
+        # paints the copper from its per-vertex scalar field, so we
+        # need the viridis ramp. Via Current paints the heatmap onto
+        # the vias instead — the copper drops out as context, so we
+        # push a flat-grey LUT and ignore the per-vertex values.
+        self._ensure_gl_cmap("neutral" if is_via_current else "data")
+
+        # Drop cached probe state until we build new layer probes.
+        # In Via Current mode the per-vertex copper values are blanked
+        # (vs_arr is zeroed below), so reporting them as "Via Current"
+        # would mislead — fall back to the underlying voltage label /
+        # unit so the hover bar still reads a meaningful number for
+        # the copper underneath the cursor. The via overlay (the
+        # ``_via_hover_info`` suffix) is what surfaces the actual
+        # current reading when the cursor sits on a via.
+        if is_via_current:
+            self._probe_label = "Voltage"
+            self._probe_unit = "V"
+        else:
+            self._probe_label = label
+            self._probe_unit = unit
+        self._layer_probes: list[dict] = []
+
+        if not phys_list or not rails:
+            self._gl_viewer.clear_mesh()
+            self._gl_viewer.clear_outlines()
+            self._gl_viewer.clear_cylinders()
+            self._gl_viewer.clear_arrows()
+            self._gl_viewer.clear_series_bars()
+            self._gl_viewer.clear_stub_triangles()
+            self._gl_viewer.set_overlay_top_right("")
+            self._gl_viewer.clear_markers()
+            self._refresh_board_outline()
+            if not phys_list:
+                self.summary_label.setText("(no layers selected)")
+            else:
+                self.summary_label.setText("(no rails selected)")
+            return
+
+        # Combine every per-net layer in the selected rail groups across
+        # every visible physical layer into one GPU batch. Per-layer
+        # interpolators come back alongside for the CPU-side probe + the
+        # Voltage Drop reference lookup.
+        xs, ys, zs, vs, tris, layer_probes = self._build_rail_arrays(
+            phys_list, rails, derive_fn,
+        )
+        self._layer_probes = layer_probes
+        _mark("build_rail_arrays")
+        if xs.size == 0 or tris.size == 0:
+            self._gl_viewer.clear_mesh()
+            self._gl_viewer.clear_outlines()
+            self._gl_viewer.clear_cylinders()
+            self._gl_viewer.clear_arrows()
+            self._gl_viewer.clear_series_bars()
+            self._gl_viewer.clear_stub_triangles()
+            self._gl_viewer.set_overlay_top_right("")
+            self._gl_viewer.clear_markers()
+            self._refresh_board_outline()
+            self.summary_label.setText("(no mesh — selected layers have no copper on these rails)")
+            return
+
+        # Vertices referenced by at least one triangle. Orphan vertices
+        # (pinned to V=0 by the FEM solver to keep the linear system
+        # well-conditioned) are invisible in the heatmap but would
+        # otherwise dominate min/max stats — especially in Voltage Drop
+        # mode where they'd appear as a fake -V_source drop.
+        used_idx = np.unique(tris.ravel())
+        vs_used = vs[used_idx] if used_idx.size > 0 else vs
+
+        # _build_rail_arrays returns numpy arrays directly; alias them
+        # so the downstream code (which used to wrap lists) keeps reading.
+        xs_arr = xs
+        ys_arr = ys
+        vs_arr = vs
+        tris_arr = tris
+        drop_reference: float | None = None
+        drop_reference_at: str = ""
+
+        if is_via_current:
+            # Range comes from the per-via |I| report, restricted to vias
+            # on the selected rails (independent of which physical layers
+            # are toggled visible — flipping layers shouldn't rescale the
+            # colour bar). Per-vertex copper values aren't meaningful in
+            # this mode, so we zero them out; the neutral LUT collapses
+            # every entry to the same grey anyway.
+            vmin, vmax, self._via_current_lookup = (
+                self._via_current_lookup_and_range(rails)
+            )
+            logging.getLogger(__name__).debug(
+                "Via Current: %d vias on rails=%s, raw range=[%.6g, %.6g] A",
+                len(self._via_current_lookup), rails, vmin, vmax,
+            )
+            vs_arr = np.zeros_like(vs_arr, dtype=np.float64)
+        else:
+            self._via_current_lookup = {}
+            vmin, vmax = float(vs_used.min()), float(vs_used.max())
+            vmax = _slider_data_max(vs_used, mode, vmax)
+            if vmax <= vmin:
+                vmax = vmin + 1e-12
+
+        # Voltage Drop mode: anchor the reference at the SOURCE (highest
+        # voltage on the rail across any visible layer) and subtract it
+        # so the heatmap reads 0 V at the source and goes NEGATIVE
+        # toward the sinks. Pin voltages are sampled from the
+        # *per-layer* interpolator matching each pin's layer_id, so the
+        # reference is correct even when multiple physical layers are on.
+        if mode == _VOLTAGE_DROP_MODE:
+            target_layer_ids = {self._phys_name_to_layer_id.get(p)
+                                for p in phys_list}
+            target_layer_ids.discard(None)
+            rail_members = set(self._effective_rail_members(rails))
+            # layer_id → list of layer_probes (could be >1 if multiple
+            # nets in the rail group are on the same physical layer).
+            probes_by_layer: dict[int, list[dict]] = {}
+            for lp in layer_probes:
+                probes_by_layer.setdefault(lp["layer_id"], []).append(lp)
+
+            def _sample_pin_voltage(layer_id: int, x_mm: float,
+                                     y_mm: float, net: str) -> float | None:
+                # Prefer the probe whose net matches the pin's net; fall
+                # back to whichever probe on the same layer reports a
+                # non-masked sample.
+                candidates = probes_by_layer.get(layer_id, [])
+                ordered = sorted(candidates,
+                                  key=lambda lp: 0 if lp["net"] == net else 1)
+                for lp in ordered:
+                    interp = self._ensure_interpolator(lp)
+                    if interp is None:
+                        continue
+                    s = interp(x_mm, y_mm)
+                    try:
+                        if hasattr(s, "mask") and \
+                                bool(np.ma.getmaskarray(s).item()):
+                            continue
+                        v = float(s)
+                    except (TypeError, ValueError):
+                        continue
+                    if np.isfinite(v):
+                        return v
+                return None
+
+            def _collect_candidates(role_filter: str | None
+                                    ) -> list[tuple[float, str]]:
+                out: list[tuple[float, str]] = []
+                for d in (self.metadata or {}).get("directives", []):
+                    if role_filter is not None and d.get("role") != role_filter:
+                        continue
+                    for term in (d.get("terminals") or {}).values():
+                        for pin in term.get("pins", []):
+                            lid = pin.get("layer_id")
+                            if lid not in target_layer_ids:
+                                continue
+                            pnet = pin.get("net", "")
+                            if rail_members and pnet not in rail_members:
+                                continue
+                            v_at = _sample_pin_voltage(
+                                lid, pin.get("x_mm"), pin.get("y_mm"), pnet,
+                            )
+                            if v_at is None:
+                                continue
+                            out.append(
+                                (v_at, f"{d.get('label') or d.get('designator', '?')}"
+                                       f".{pin.get('pad', '?')}")
+                            )
+                return out
+
+            candidates = _collect_candidates("SOURCE")
+            if not candidates:
+                candidates = _collect_candidates(None)
+
+            if candidates:
+                drop_reference, drop_reference_at = max(candidates,
+                                                         key=lambda t: t[0])
+                vs_arr = vs_arr - drop_reference
+                # Recompute range against the used (non-orphan) subset
+                # only, otherwise orphan pins shifted by -drop_reference
+                # would set a fake floor at -V_source.
+                vs_used = vs_arr[used_idx] if used_idx.size > 0 else vs_arr
+                vmin, vmax = float(vs_used.min()), float(vs_used.max())
+                vmax = _slider_data_max(vs_used, mode, vmax)
+                if vmax <= vmin:
+                    vmax = vmin + 1e-12
+                # Re-shift each layer probe's values + rebuild samplers
+                # so the hover probe reports the shifted (drop) values too.
+                # Pre-setting ``interpolator`` here (rather than clearing it
+                # to None) is deliberate: Voltage and Voltage Drop share a
+                # _layer_cache entry, so a lazily-built sampler would write
+                # the *shifted* field back into the cache and corrupt plain
+                # Voltage mode. _FastTriSampler builds in ~50-150 ms, so the
+                # eager rebuild no longer stalls the way LinearTriInterpolator
+                # did.
+                for lp in layer_probes:
+                    shifted = lp["values"] - drop_reference
+                    lp["values"] = shifted
+                    lp["interpolator"] = _FastTriSampler(
+                        lp["triangulation"], shifted,
+                    )
+
+        x_min, x_max = float(xs_arr.min()), float(xs_arr.max())
+        y_min, y_max = float(ys_arr.min()), float(ys_arr.max())
+        self._data_bounds = (x_min, x_max, y_min, y_max)
+
+        # Default colour-scale window (percentile-clipped for spike-prone
+        # modes so FEM singularities don't crush the visible range).
+        # Use the used (non-orphan) subset for the percentile calc too.
+        # Via Current applies a similar clip — real boards have a
+        # long-tail distribution (lots of low-current stitching vias,
+        # a handful of high-current vias near regulators), so a raw
+        # min..max map crushes 99% of the vias into the bottom of the
+        # LUT. Clipping at P99 keeps the bulk of the vias spanning the
+        # ramp while leaving outliers visible (clamped to the top).
+        if is_via_current:
+            display_min, display_max = self._via_current_display_range(
+                self._via_current_lookup, vmin, vmax,
+            )
+        else:
+            vs_used = vs_arr[used_idx] if used_idx.size > 0 else vs_arr
+            display_min, display_max = self._useful_display_range(
+                vs_used, mode, vmin, vmax,
+            )
+
+        # Resolve the linear vs log colour scale for this render. Log is
+        # only meaningful for the wide-dynamic-range modes and needs a
+        # strictly positive window, so it's decided here — once — and the
+        # GL push, the scale bar and the baked via overlays all key off
+        # ``self._log_active`` / ``self._log_floor`` for a consistent map.
+        log_eligible = mode in _LOG_ELIGIBLE_MODES
+        self._log_active = (self._log_scale and log_eligible
+                            and math.isfinite(vmax) and vmax > 0.0)
+        if self._log_active:
+            self._log_floor = max(vmax * 10.0 ** (-_LOG_SCALE_DECADES),
+                                   1e-300)
+            # A log axis can't show zero / negatives — floor the window.
+            # It also keeps the bulk readable AND the spikes on-scale by
+            # itself, so the default window spans the full (floored) data
+            # range rather than the linear-scale percentile clip.
+            vmin = max(vmin, self._log_floor)
+            display_min, display_max = vmin, vmax
+        else:
+            self._log_floor = 1e-12
+
+        # If the heatmap selection (layers/rails/mode/rail-only-filter/scale)
+        # hasn't changed since the last render — e.g. a 2D ↔ 3D toggle, which
+        # only rebuilds the mesh geometry — keep the user's current clamp
+        # instead of snapping back to the auto-detected default. A linear↔log
+        # switch counts as a change so the window resets to the new default.
+        selection_sig = (tuple(phys_list), tuple(rails), mode,
+                         self.rail_only_box.isChecked(), self._log_active)
+        preserve_scale = (self._last_scale_selection == selection_sig)
+        self._last_scale_selection = selection_sig
+        if preserve_scale:
+            levels_min, levels_max = self._vmin, self._vmax
+        else:
+            self._vmin, self._vmax = display_min, display_max
+            levels_min, levels_max = display_min, display_max
+
+        # Push everything to the GPU. set_mesh is the heavy upload; on
+        # mode-only switches it's a no-op (xs/ys/tris unchanged) — TODO
+        # could detect and skip, but the upload is cheap (<5ms typical).
+        # ``zs`` is per-vertex z (mm, pre-exaggeration); only used by the
+        # 3D mode's perspective MVP — ignored by the 2D ortho path.
+        _mark("prep")
+        self._gl_viewer.set_mesh(xs_arr, ys_arr, tris_arr,
+                                  data_bounds=self._data_bounds,
+                                  zs=zs.astype(np.float32))
+        # Values + levels are pushed through _gl_scale: identity on a
+        # linear scale, log10 (floored) on a log scale. Pushing both in
+        # the same space means the GL viewer's linear normalisation
+        # shader produces the correct log mapping with no shader change.
+        self._gl_viewer.set_values(self._gl_scale(vs_arr).astype(np.float32))
+        self._gl_viewer.set_levels(float(self._gl_scale(levels_min)),
+                                    float(self._gl_scale(levels_max)))
+        _mark("gl_mesh_upload")
+
+        # Carry the user's chosen colour scheme through the re-render
+        # (mode / layer / rail switches must not snap it back to default).
+        self.scale_controller.setLogVisible(log_eligible)
+        self._update_scale_controller(vmin, vmax, display_min, display_max,
+                                       self._cmap_name, label, unit,
+                                       reset_selection=not preserve_scale,
+                                       log_active=self._log_active)
+        _mark("scale_controller")
+
+        # Markers + legend (also overlaid via the GLMeshViewer's QPainter
+        # layer, so they don't trigger Qt's raster-fallback compositor).
+        # The Vias-tab "Go" highlight is appended regardless of the
+        # show_markers checkbox so the user can still find the via they
+        # just jumped to.
+        self._update_markers_and_legend(phys_list, rails)
+        _mark("markers_legend")
+
+        # Layer + pad outlines (GL_LINES). Cheap toggle — segments are
+        # cached at first use, so flipping either checkbox just uploads /
+        # clears one VBO pair.
+        self._refresh_outlines(layer_probes, phys_list, rails)
+        _mark("outlines")
+
+        # Stub-copper overlay — polygons of copper the FEM excluded.
+        # Always pushed so users see what's there even when arrows /
+        # outlines / heatmap-vias are off. Default is flat grey; if the
+        # user opts into colour-by-V we sample the same-net solved
+        # layer at each stub's centroid using ``mode`` + ``drop_reference``.
+        self._push_stubs(phys_list, rails, mode=mode,
+                          drop_reference=drop_reference)
+        _mark("stubs")
+
+        # Series-component bars — gradient rectangles between the two
+        # terminal pin positions of each RESISTOR directive.
+        self._push_series_bars(phys_list, rails, mode,
+                               drop_reference=drop_reference)
+        _mark("series_bars")
+
+        # Via cylinders — only meaningful in 3D mode (in 2D they'd
+        # collapse to overlapping circles at z=0). The heatmap-vias path
+        # needs the same Voltage-Drop reference the layer heatmap used.
+        # Via Current mode always pushes cylinders in 3D; in 2D the
+        # per-via colours are emitted via the marker overlay path inside
+        # :meth:`_update_markers_and_legend`.
+        self._last_drop_reference = drop_reference
+        if self.view_3d_box.isChecked():
+            self._push_via_cylinders(phys_list, rails, mode=mode)
+        else:
+            self._gl_viewer.clear_cylinders()
+        _mark("via_cylinders")
+
+        # Current-flow arrow overlay (2D only). Cheap if disabled.
+        self._refresh_arrows()
+        _mark("arrows")
+
+        # Board outline overlay — independent of layer/rail selection.
+        self._refresh_board_outline()
+        _mark("board_outline")
+
+        # Fit to data ONLY on the very first render (or while we're
+        # still waiting for the deferred initial fit after Qt sizes the
+        # widget). Subsequent renders — layer toggles, mode/rail
+        # changes — leave the user's pan/zoom alone.
+        if self._need_initial_fit:
+            self._fit_board_to_canvas(x_min, x_max, y_min, y_max)
+
+        # Summary stats over the mesh's actual values — orphan vertices
+        # excluded (same reason as the scale-range filtering above). In
+        # Via Current mode the per-vertex copper values are blanked, so
+        # we report stats over the per-via |I| set instead.
+        if is_via_current:
+            via_vals = list(self._via_current_lookup.values())
+            if via_vals:
+                arr = np.asarray(via_vals, dtype=np.float64)
+                self.summary_label.setText(
+                    f"<b>{label}</b><br>"
+                    f"min = {arr.min():.4g} {unit}<br>"
+                    f"max = {arr.max():.4g} {unit}<br>"
+                    f"mean = {arr.mean():.4g} {unit}<br>"
+                    f"vias: {arr.size:,}"
+                )
+            else:
+                self.summary_label.setText(
+                    f"<b>{label}</b><br>"
+                    "(no vias on the selected rails)"
+                )
+        else:
+            vs_used = vs_arr[used_idx] if used_idx.size > 0 else vs_arr
+            self.summary_label.setText(
+                f"<b>{label}</b><br>"
+                f"min = {vs_used.min():.4g} {unit}<br>"
+                f"max = {vs_used.max():.4g} {unit}<br>"
+                f"mean = {vs_used.mean():.4g} {unit}<br>"
+                f"vertices: {len(vs_used):,}"
+            )
+        _mark("summary")
+        if _prof is not None:
+            _prof.append(("TOTAL", time.perf_counter() - _t0))
+
+    # --- Side-panel scale controller ----------------------------------------
+
+    def _update_scale_controller(self, data_min: float, data_max: float,
+                                 sel_min: float, sel_max: float,
+                                 cmap_name: str, label: str, unit: str,
+                                 reset_selection: bool = True,
+                                 log_active: bool = False
+                                 ) -> None:
+        """Push fresh data bounds + label/unit into the scale controller.
+
+        With ``reset_selection=True`` (default) the user clamp snaps back
+        to (sel_min, sel_max) — that's the right behaviour across layer /
+        rail / mode changes (e.g. a Voltage Drop clamp of -0.05..-0.01 is
+        nonsense when you switch to Current Density). Callers re-rendering
+        the same selection (e.g. a 2D/3D toggle) pass ``False`` so the
+        user's existing clamp is preserved.
+
+        ``log_active`` is the effective scale type — the gradient strip
+        needs it set before :meth:`ScaleController.setRange` so the
+        handles land at the right (log-spaced) positions.
+        """
+        self._cmap_name = cmap_name
+        self.scale_controller.setColormap(cmap_name)
+        self.scale_controller.setLogActive(log_active)
+        self.scale_controller.setLabelUnit(label, unit)
+        self.scale_controller.setRange(data_min, data_max,
+                                         sel_min=sel_min, sel_max=sel_max,
+                                         reset_selection=reset_selection)
+
+    def _via_current_display_range(
+        self,
+        lookup: dict[tuple[str, float, float], float],
+        data_min: float, data_max: float,
+    ) -> tuple[float, float]:
+        """Pick the default Via Current colour-scale window.
+
+        Long-tail distributions (most vias near 0 A, a few outliers
+        near a regulator) crush the bulk of the vias into the bottom
+        of the LUT under a raw min..max map. Two adjustments:
+
+        1. When there are enough samples for a percentile to be
+           meaningful (>= 8 vias), clip the top to
+           :data:`_DISPLAY_PERCENTILE_HIGH` of the data so the bulk
+           of the vias span the ramp.
+        2. When every via reports the same current (or the range is
+           numerically degenerate), widen the window to ±10% around
+           the value so all vias don't collapse to LUT entry 0.
+        """
+        if not lookup:
+            return data_min, data_max
+        arr = np.asarray(list(lookup.values()), dtype=np.float64)
+        span = data_max - data_min
+        # Degenerate-range case: all vias carry essentially the same
+        # current. Without this widening, ``t = (cur - vmin) / span``
+        # collapses to 0 for every via and the whole batch renders at
+        # LUT index 0 (the deep-purple end of viridis).
+        if span <= max(1e-9, abs(data_min) * 1e-6):
+            anchor = float(arr.mean()) if arr.size else data_min
+            half = max(abs(anchor) * 0.1, 1e-6)
+            return anchor - half, anchor + half
+        if arr.size < 8:
+            return data_min, data_max
+        sel_max = float(np.percentile(arr, self._display_percentile_high))
+        # Only clip when the percentile is meaningfully below the raw
+        # max — otherwise the slider's drag-to-real-max range
+        # collapses and the heatmap reads the same as the unclipped
+        # case anyway.
+        if sel_max >= data_max * 0.95:
+            return data_min, data_max
+        # Guard against a clip that collapses the range (happens when
+        # the bulk of the vias share a single value and only a few
+        # outliers stretch the raw max). Fall back to the unclipped
+        # range and let the user drag the scale if they care.
+        if sel_max - data_min <= max(1e-9, abs(data_min) * 1e-6):
+            return data_min, data_max
+        return data_min, sel_max
+
+    def _useful_display_range(self, vs_arr: np.ndarray, mode: str,
+                              data_min: float, data_max: float,
+                              ) -> tuple[float, float]:
+        """Pick the default colour-scale window.
+
+        For modes prone to FEM singularities at pinned-voltage vertices
+        (Current Density, Power Density), the top end is clipped to
+        :data:`_DISPLAY_PERCENTILE_HIGH` of the data so a handful of
+        outlier vertices near a SOURCE/SINK pin don't crush the rest of
+        the board to the bottom of the colour scale. Returns
+        ``(sel_min, sel_max)`` ready to hand to the rasterisation step
+        and the scale controller.
+        """
+        if mode not in _SPIKE_PRONE_MODES or len(vs_arr) < 100:
+            return data_min, data_max
+        sel_max = float(np.percentile(vs_arr, self._display_percentile_high))
+        # Only clip if the percentile is meaningfully below the actual
+        # max — otherwise the slider's drag-to-real-max range collapses.
+        if sel_max >= data_max * 0.95:
+            return data_min, data_max
+        if sel_max <= data_min:
+            sel_max = data_min + (data_max - data_min) * 1e-3
+        return data_min, sel_max
+
+    # --- Directive-pin overlay -----------------------------------------------
+
+    # Marker style per role — colours stand out against the viridis heatmap
+    # AND on the dark viewbox background. ``symbol`` is a pyqtgraph marker
+    # name (one of 'o', 's', 't', 'd', 'star', '+', 'x', 'p', 'h', 't1' …).
+    # NOTE: keys match the role string produced by
+    # altium_loader.build_solve_metadata() — that strips the trailing "Spec"
+    # off the dataclass name and uppercases it (so ResistorSpec → RESISTOR).
+    _ROLE_MARKER_STYLE: dict[str, dict] = {
+        "SOURCE":    {"symbol": "tri_up",   "color": "#ff3030", "size": 18, "label": "SOURCE"},
+        "SINK":      {"symbol": "tri_down", "color": "#3aa8ff", "size": 16, "label": "SINK"},
+        "RESISTOR":  {"symbol": "s",        "color": "#3aff8a", "size": 12, "label": "SERIES"},
+        "REGULATOR": {"symbol": "d",        "color": "#ff66ff", "size": 14, "label": "REGULATOR"},
+    }
+
+    # --- Directive-pin marker + legend overlay -----------------------------
+
+    # Glyph used in the legend swatch for each marker symbol name. Drawn
+    # in the swatch column of the legend chip (right-side overlay).
+    _LEGEND_GLYPHS: dict[str, str] = {
+        "star":     "★",
+        "o":        "●",
+        "s":        "■",
+        "d":        "◆",
+        "bolt":     "⚡",
+        "target":   "◎",
+        "tri_up":   "▲",
+        "tri_down": "▼",
+    }
+
+    def _refresh_outlines(self, layer_probes: list[dict],
+                           phys_list: list[str],
+                           rail_names: list[str] | str | None = None) -> None:
+        """Push the combined layer-outline + pad-outline overlay to the GL
+        viewer as one GL_LINES batch.
+
+        Layer outlines (gated by ``show_outlines_box``) trace each visible
+        (layer, net) shape in the physical layer's swatch colour. Stub
+        outlines (same gate, same colour) trace the no-current copper
+        pieces that the FEM filter excluded — these aren't in
+        ``layer_probes`` because there's no FEM solution for them, so we
+        walk ``metadata['stubs']`` separately. Pad outlines (gated by
+        ``show_pads_box``) trace every SMT / through-hole pad on each
+        visible copper layer in black.
+
+        Each segment is promoted to 3D with z = the layer's stackup z, so
+        the outline sits flush with the copper's top face. In 3D mode a
+        second copy is emitted at the BOTTOM of the extruded copper prism
+        (``z - copper_thickness``) so the polygon is traced on both faces
+        of the plate. Empty result clears the overlay.
+        """
+        in_3d = self.view_3d_box.isChecked()
+        thickness = self._COPPER_THICKNESS_MM if in_3d else 0.0
+        pos_chunks: list[np.ndarray] = []
+        col_chunks: list[np.ndarray] = []
+
+        def _emit(segs_xy: np.ndarray, z_top: float,
+                  rgb: np.ndarray) -> None:
+            if segs_xy.size == 0:
+                return
+            segs_top = np.empty((segs_xy.shape[0], 3), dtype=np.float32)
+            segs_top[:, :2] = segs_xy
+            segs_top[:, 2] = z_top
+            pos_chunks.append(segs_top)
+            col_chunks.append(np.broadcast_to(rgb,
+                                              (segs_xy.shape[0], 3)).copy())
+            if thickness > 0.0:
+                segs_bot = np.empty((segs_xy.shape[0], 3), dtype=np.float32)
+                segs_bot[:, :2] = segs_xy
+                segs_bot[:, 2] = z_top - thickness
+                pos_chunks.append(segs_bot)
+                col_chunks.append(
+                    np.broadcast_to(rgb, (segs_xy.shape[0], 3)).copy()
+                )
+
+        if self.show_outlines_box.isChecked():
+            for lp in layer_probes:
+                segs = lp.get("outline_segments")
+                if segs is None or segs.size == 0:
+                    continue
+                phys = lp.get("physical", "")
+                qc = QColor(self._layer_color_for(phys))
+                rgb = np.array([qc.redF(), qc.greenF(), qc.blueF()],
+                               dtype=np.float32)
+                _emit(segs, self._layer_z_for(phys), rgb)
+
+            # Stub copper has no FEM solution and is absent from
+            # layer_probes, but the user still expects to see the same
+            # layer-coloured outline around it (it's real copper). Walk
+            # metadata['stubs'] using the same visible-layer + rail-net
+            # filter that _push_stubs applies, so the outline overlay
+            # tracks exactly what the grey fill is showing.
+            if self.metadata is not None:
+                stubs = self.metadata.get("stubs") or []
+                if stubs:
+                    visible_layer_ids: dict[int, str] = {}
+                    for phys in phys_list:
+                        lid = self._phys_name_to_layer_id.get(phys)
+                        if lid is not None:
+                            visible_layer_ids[lid] = phys
+                    rail_members = (set(self._effective_rail_members(rail_names))
+                                    if rail_names is not None else set())
+                    for stub in stubs:
+                        lid = stub.get("layer_id")
+                        phys = visible_layer_ids.get(lid)
+                        if phys is None:
+                            continue
+                        net = stub.get("net")
+                        if rail_members and net not in rail_members:
+                            continue
+                        segs = self._stub_outline_segments(stub)
+                        if segs.size == 0:
+                            continue
+                        qc = QColor(self._layer_color_for(phys))
+                        rgb = np.array([qc.redF(), qc.greenF(), qc.blueF()],
+                                       dtype=np.float32)
+                        _emit(segs, self._layer_z_for(phys), rgb)
+
+        if self.show_pads_box.isChecked() and self.metadata is not None:
+            black = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            visible_layer_ids: dict[int, str] = {}
+            for phys in phys_list:
+                lid = self._phys_name_to_layer_id.get(phys)
+                if lid is not None:
+                    visible_layer_ids[lid] = phys
+            if visible_layer_ids:
+                pad_segs_by_layer = self._pad_outline_segments_by_layer()
+                for lid, phys in visible_layer_ids.items():
+                    segs = pad_segs_by_layer.get(lid)
+                    if segs is None or segs.size == 0:
+                        continue
+                    _emit(segs, self._layer_z_for(phys), black)
+
+        if self.show_all_copper_box.isChecked() and self.metadata is not None:
+            visible_layer_ids = {}
+            for phys in phys_list:
+                lid = self._phys_name_to_layer_id.get(phys)
+                if lid is not None:
+                    visible_layer_ids[lid] = phys
+            if visible_layer_ids:
+                rail_members = (set(self._effective_rail_members(rail_names))
+                                if rail_names is not None else set())
+                segs_by_pair = self._all_copper_segments_by_layer_net()
+                for (lid, net), segs in segs_by_pair.items():
+                    if segs.size == 0:
+                        continue
+                    if rail_members and net in rail_members:
+                        continue
+                    phys = visible_layer_ids.get(lid)
+                    if phys is None:
+                        continue
+                    qc = QColor(self._layer_color_for(phys))
+                    rgb = np.array([qc.redF(), qc.greenF(), qc.blueF()],
+                                   dtype=np.float32)
+                    _emit(segs, self._layer_z_for(phys), rgb)
+
+        if pos_chunks:
+            self._gl_viewer.set_outlines(
+                np.concatenate(pos_chunks, axis=0),
+                np.concatenate(col_chunks, axis=0),
+            )
+        else:
+            self._gl_viewer.clear_outlines()
+
+    # Half-width of the board-outline ribbon in mm. 0.2 mm reads as a
+    # bold accent at typical board zooms without obscuring fine copper
+    # features near the edge.
+    _BOARD_OUTLINE_HALF_WIDTH_MM: float = 0.2
+
+    def _refresh_board_outline(self) -> None:
+        """Push or clear the board-outline ribbon overlay.
+
+        The metadata ``board_outline`` is a closed polyline of [x, y] in
+        mm (origin-corrected). It's triangulated into a fixed-mm-wide
+        ribbon with mitered interior joins so the line thickness is
+        uniform across drivers and reads boldly at any zoom (a raw
+        GL_LINES pass would be clamped to 1 px on most Core profile
+        drivers). Drawn on top of the heatmap in both 2D and 3D modes.
+        """
+        if not self.show_board_outline_box.isChecked():
+            self._gl_viewer.clear_board_outline()
+            return
+        points = (self.metadata or {}).get("board_outline") or []
+        if len(points) < 3:
+            self._gl_viewer.clear_board_outline()
+            return
+
+        ring = np.asarray(points, dtype=np.float64)
+        n = ring.shape[0]
+        # Per-vertex mitered offset normal: average of the incoming and
+        # outgoing edge normals, scaled so the projected offset matches
+        # the requested half-width along each adjacent edge. Clamped to
+        # 4× half-width to keep sharp corners from spiking out.
+        edges = np.roll(ring, -1, axis=0) - ring
+        edge_len = np.linalg.norm(edges, axis=1)
+        edge_len[edge_len == 0.0] = 1.0
+        edge_dir = edges / edge_len[:, None]
+        # Right-hand normal in 2D: (dx, dy) -> (dy, -dx).
+        edge_normal = np.empty_like(edge_dir)
+        edge_normal[:, 0] = edge_dir[:, 1]
+        edge_normal[:, 1] = -edge_dir[:, 0]
+        prev_normal = np.roll(edge_normal, 1, axis=0)
+        bisector = edge_normal + prev_normal
+        bis_len = np.linalg.norm(bisector, axis=1)
+        # Degenerate (collinear reversal) — fall back to the outgoing normal.
+        flat = bis_len < 1e-9
+        bisector[flat] = edge_normal[flat]
+        bis_len[flat] = 1.0
+        bisector /= bis_len[:, None]
+        # Miter length: half-width / cos(theta/2) = half-width / dot(bisector, normal).
+        hw = self._BOARD_OUTLINE_HALF_WIDTH_MM
+        dot = np.einsum("ij,ij->i", bisector, edge_normal)
+        dot = np.where(np.abs(dot) < 0.25, np.sign(dot) * 0.25, dot)
+        miter_len = hw / dot
+        offset = bisector * miter_len[:, None]
+        outer = ring + offset
+        inner = ring - offset
+
+        # Build GL_TRIANGLES (one quad per edge = 2 triangles = 6 verts).
+        idx = np.arange(n)
+        nxt = (idx + 1) % n
+        o_a = outer[idx]
+        i_a = inner[idx]
+        o_b = outer[nxt]
+        i_b = inner[nxt]
+        # tri 1: o_a, i_a, o_b ;  tri 2: o_b, i_a, i_b
+        positions_2d = np.empty((n * 6, 2), dtype=np.float32)
+        positions_2d[0::6] = o_a
+        positions_2d[1::6] = i_a
+        positions_2d[2::6] = o_b
+        positions_2d[3::6] = o_b
+        positions_2d[4::6] = i_a
+        positions_2d[5::6] = i_b
+        positions = np.zeros((positions_2d.shape[0], 3), dtype=np.float32)
+        positions[:, :2] = positions_2d
+        # Lift slightly above z=0 in 3D so the ribbon doesn't z-fight
+        # with anything drawn at the same plane.
+        if self.view_3d_box.isChecked():
+            positions[:, 2] = 0.01
+
+        # Bold contrasting colour — warm orange reads on both viridis
+        # and the standard dark/light themes without being mistaken for
+        # any of the layer swatches.
+        colour = np.array([1.0, 0.55, 0.0], dtype=np.float32)
+        colors = np.broadcast_to(colour, positions.shape).copy()
+        self._gl_viewer.set_board_outline(positions, colors)
+
+    def _pad_outline_segments_by_layer(self) -> dict[int, np.ndarray]:
+        """Build (and cache) the per-copper-layer GL_LINES pad outline
+        segments from ``metadata['pads']``. Returns an ``layer_id ->
+        (N, 2) float32 array`` mapping (one GL_LINES pair per segment).
+        Cached after first build — pads never change for a given pickle.
+        """
+        cached = getattr(self, "_pad_segments_cache", None)
+        if cached is not None:
+            return cached
+        by_layer: dict[int, list[np.ndarray]] = {}
+        for pad in (self.metadata or {}).get("pads", []) or []:
+            ring = pad.get("outline") or []
+            if len(ring) < 3:
+                continue
+            ring_arr = np.asarray(ring, dtype=np.float32)
+            # Build GL_LINES pairs from the closed ring; if the ring isn't
+            # already closed (last != first), close it explicitly so the
+            # outline forms a complete loop.
+            if not np.allclose(ring_arr[0], ring_arr[-1]):
+                ring_arr = np.vstack([ring_arr, ring_arr[:1]])
+            pairs = np.empty((2 * (ring_arr.shape[0] - 1), 2),
+                             dtype=np.float32)
+            pairs[0::2] = ring_arr[:-1]
+            pairs[1::2] = ring_arr[1:]
+            for lid in pad.get("layer_ids") or []:
+                by_layer.setdefault(int(lid), []).append(pairs)
+        merged: dict[int, np.ndarray] = {}
+        for lid, chunks in by_layer.items():
+            merged[lid] = (np.concatenate(chunks, axis=0)
+                            if chunks else np.empty((0, 2), dtype=np.float32))
+        self._pad_segments_cache = merged
+        return merged
+
+    def _all_copper_segments_by_layer_net(
+        self,
+    ) -> dict[tuple[int, str], np.ndarray]:
+        """Build (and cache) per-(layer_id, net) GL_LINES outline segments
+        from ``metadata['all_copper']``.
+
+        Each entry's exterior + holes get unrolled into GL_LINES vertex
+        pairs (one segment per consecutive ring vertex pair, ring closed
+        explicitly when needed). Cached after first build — the underlying
+        polygon rings never change for a given pickle.
+        """
+        cached = getattr(self, "_all_copper_segments_cache", None)
+        if cached is not None:
+            return cached
+        result: dict[tuple[int, str], np.ndarray] = {}
+        records = (self.metadata or {}).get("all_copper", []) or []
+        for rec in records:
+            lid = int(rec.get("layer_id", -1))
+            net = rec.get("net", "")
+            if lid < 0:
+                continue
+            ring_chunks: list[np.ndarray] = []
+            for poly in rec.get("polygons", []) or []:
+                rings: list[np.ndarray] = []
+                ext = poly.get("exterior")
+                if ext is not None and len(ext) >= 2:
+                    rings.append(np.asarray(ext, dtype=np.float32))
+                for hole in poly.get("holes", []) or []:
+                    if hole is not None and len(hole) >= 2:
+                        rings.append(np.asarray(hole, dtype=np.float32))
+                for ring in rings:
+                    if not np.allclose(ring[0], ring[-1]):
+                        ring = np.vstack([ring, ring[:1]])
+                    pairs = np.empty(
+                        (2 * (ring.shape[0] - 1), 2), dtype=np.float32,
+                    )
+                    pairs[0::2] = ring[:-1]
+                    pairs[1::2] = ring[1:]
+                    ring_chunks.append(pairs)
+            if not ring_chunks:
+                continue
+            key = (lid, net)
+            existing = result.get(key)
+            merged = (np.concatenate(ring_chunks, axis=0) if len(ring_chunks) > 1
+                      else ring_chunks[0])
+            if existing is None:
+                result[key] = merged
+            else:
+                result[key] = np.concatenate([existing, merged], axis=0)
+        self._all_copper_segments_cache = result
+        return result
+
+    # --- Stub-copper overlay -----------------------------------------------
+
+    # RGB of the stub-copper polygons — dim grey so they're visibly
+    # present but obviously distinct from the heatmap LUT colours.
+    # The viewer's clear-colour is black, so this sits clearly above the
+    # background without competing with the viridis-coloured rails.
+    _STUB_COLOR_RGB: tuple[float, float, float] = (
+        0x60 / 255.0, 0x60 / 255.0, 0x60 / 255.0,
+    )
+
+    def _stubs_coloured_by_voltage(self, mode: str | None) -> bool:
+        """True when stub copper is shaded from the active colour scheme
+        rather than flat grey.
+
+        Stub voltage colouring is opt-in (the ``colour_stubs_box`` toggle)
+        and only meaningful for the Voltage / Voltage Drop modes — current
+        and power are zero inside a stub by definition. When this returns
+        False a colour-scheme change can't affect the stubs, so the fast
+        recolour path (:meth:`_recolor_overlays`) can skip re-pushing them.
+        """
+        return (
+            getattr(self, "colour_stubs_box", None) is not None
+            and not self.colour_stubs_box.isChecked()
+            and mode in ("Voltage", _VOLTAGE_DROP_MODE)
+        )
+
+    def _push_stubs(self, phys_list: list[str],
+                    rail_names: list[str] | str,
+                    *, mode: str | None = None,
+                    drop_reference: float | None = None) -> None:
+        """Build triangle geometry for every stub copper piece on the
+        visible layers + selected rail groups, and push it as one batch
+        to the GL viewer.
+
+        Stubs are copper pieces the FEM filter excluded (no current
+        path through them). We render them anyway so the user can SEE
+        the copper exists; otherwise the heatmap looks like the copper
+        vanished. By default each stub is flat dim grey (obviously
+        "no data"); when the user toggles ``colour_stubs_box`` AND the
+        active mode is Voltage / Voltage Drop, each stub is instead
+        coloured by its approximate voltage — sampled from the same-net
+        solved layer at the stub's centroid. Voltage is constant across
+        each stub (no current flows through it).
+
+        The triangle *positions* depend only on the visible layer/rail
+        set and the 2D/3D z — never on the colour scheme or scale — so
+        they're cached (single entry, keyed on exactly those inputs).
+        A colour-scheme / scale change reuses the cached positions and
+        only re-bakes the per-vertex colour array, which is what makes
+        the :meth:`_recolor_overlays` fast path cheap. Per-stub
+        triangulation is itself cached on the stub dict, so even a cache
+        miss just re-aggregates cached triangles.
+        """
+        if self.metadata is None or not phys_list:
+            self._gl_viewer.clear_stub_triangles()
+            return
+        stubs = self.metadata.get("stubs") or []
+        if not stubs:
+            self._gl_viewer.clear_stub_triangles()
+            return
+        visible_layer_ids: dict[int, str] = {}
+        for phys in phys_list:
+            lid = self._phys_name_to_layer_id.get(phys)
+            if lid is not None:
+                visible_layer_ids[lid] = phys
+        if not visible_layer_ids:
+            self._gl_viewer.clear_stub_triangles()
+            return
+        rail_members = set(self._effective_rail_members(rail_names))
+        in_3d = self._gl_viewer.view_mode() == "3d"
+
+        # Reuse cached positions when the visible stub set + z mode are
+        # unchanged (e.g. this call arrived via a colour-scheme toggle).
+        geom_key = (frozenset(visible_layer_ids), frozenset(rail_members),
+                    in_3d)
+        cache = self._stub_geom_cache
+        if cache is not None and cache[0] == geom_key:
+            positions, spans = cache[1], cache[2]
+        else:
+            positions, spans = self._build_stub_geometry(
+                stubs, visible_layer_ids, rail_members, in_3d)
+            self._stub_geom_cache = (geom_key, positions, spans)
+
+        if positions is None:
+            self._gl_viewer.clear_stub_triangles()
+            return
+        colors = self._bake_stub_colors(spans, mode, drop_reference)
+        self._gl_viewer.set_stub_triangles(positions, colors)
+
+    def _build_stub_geometry(
+        self, stubs: list[dict], visible_layer_ids: dict[int, str],
+        rail_members: set[str], in_3d: bool,
+    ) -> tuple[np.ndarray | None, list[tuple[dict, str | None, int]]]:
+        """Aggregate the stub triangle positions for the visible stub set.
+
+        Returns ``(positions, spans)`` — ``positions`` is the concatenated
+        ``(M, 3)`` float32 vertex array (or ``None`` when no stub is
+        visible) and ``spans`` is a parallel list of
+        ``(stub, net, vertex_count)`` so :meth:`_bake_stub_colors` can
+        rebuild the colour array without re-triangulating. Triangulation
+        itself is cached per stub by :meth:`_triangulate_stub`.
+        """
+        pos_chunks: list[np.ndarray] = []
+        spans: list[tuple[dict, str | None, int]] = []
+        for stub in stubs:
+            lid = stub.get("layer_id")
+            if lid not in visible_layer_ids:
+                continue
+            net = stub.get("net")
+            if rail_members and net not in rail_members:
+                continue
+            tris = self._triangulate_stub(stub)
+            if tris.size == 0:
+                continue
+            z = (self._layer_z_for(visible_layer_ids[lid])
+                 if in_3d else 0.0)
+            xyz = np.empty((tris.shape[0], 3), dtype=np.float32)
+            xyz[:, :2] = tris
+            xyz[:, 2] = z
+            pos_chunks.append(xyz)
+            spans.append((stub, net, xyz.shape[0]))
+        if not pos_chunks:
+            return None, []
+        return np.concatenate(pos_chunks, axis=0), spans
+
+    def _bake_stub_colors(
+        self, spans: list[tuple[dict, str | None, int]],
+        mode: str | None, drop_reference: float | None,
+    ) -> np.ndarray:
+        """Build the per-vertex stub colour array for cached geometry.
+
+        Each stub is flat dim grey unless stub voltage-colouring is active
+        (:meth:`_stubs_coloured_by_voltage`), in which case it takes the
+        LUT colour of its sampled centroid voltage. ``spans`` is the list
+        :meth:`_build_stub_geometry` returned alongside the positions.
+        """
+        total = sum(n for _stub, _net, n in spans)
+        colors = np.empty((total, 3), dtype=np.float32)
+        default_color = np.asarray(self._STUB_COLOR_RGB, dtype=np.float32)
+
+        # Voltage-coloured mode only makes sense for Voltage / Voltage
+        # Drop modes. Current density and power density are zero in a
+        # stub by definition — colouring stubs with the lowest LUT entry
+        # would be visually misleading, so fall back to grey.
+        colour_by_v = self._stubs_coloured_by_voltage(mode)
+        lut: np.ndarray | None = None
+        vmin = vmax = 0.0
+        if colour_by_v:
+            lut = _build_cmap_lut(self._cmap_name)
+            vmin = float(self._vmin)
+            vmax = float(self._vmax)
+            if vmax <= vmin:
+                vmax = vmin + 1e-30
+        use_drop = colour_by_v and mode == _VOLTAGE_DROP_MODE
+        drop_ref_f = (float(drop_reference)
+                      if (use_drop and drop_reference is not None) else 0.0)
+
+        offset = 0
+        for stub, net, n in spans:
+            piece_color = default_color
+            if colour_by_v and lut is not None:
+                v_sample = self._sample_stub_voltage(stub, net)
+                if v_sample is not None:
+                    val = v_sample - drop_ref_f if use_drop else v_sample
+                    piece_color = self._lut_lookup(lut, val, vmin, vmax)
+            colors[offset:offset + n] = piece_color
+            offset += n
+        return colors
+
+    def _sample_stub_voltage(self, stub: dict,
+                             net_name: str | None) -> float | None:
+        """Estimate the voltage of a stub piece by sampling the same-net
+        FEM solution at the stub's centroid.
+
+        Tries every physical layer that has a solved (layer, net) pair.
+        Caches the answer on the stub dict — voltages are constant per
+        solve so the lookup only needs to happen once per stub.
+        """
+        if net_name is None:
+            return None
+        cached = stub.get("_v_sample_cache")
+        if cached is not None:
+            return cached if cached != "missing" else None
+        cx, cy = stub.get("_centroid", (None, None))
+        if cx is None:
+            from shapely.geometry import Polygon as _Polygon
+            ext = stub.get("exterior")
+            # Accept numpy (N, 2) array or legacy nested-list; shapely's
+            # Polygon takes either via its sequence-of-coordinates ctor.
+            if ext is None or (hasattr(ext, "size") and ext.size == 0):
+                stub["_v_sample_cache"] = "missing"
+                return None
+            poly = _Polygon(ext, holes=stub.get("holes") or [])
+            if poly.is_empty:
+                stub["_v_sample_cache"] = "missing"
+                return None
+            c = poly.centroid
+            cx, cy = float(c.x), float(c.y)
+            stub["_centroid"] = (cx, cy)
+        for phys in self._physicals:
+            v = self._sample_via_voltage(phys, net_name, cx, cy)
+            if v is not None:
+                stub["_v_sample_cache"] = v
+                return v
+        # Centroid lies outside all solved meshes for this net (the stub is
+        # geometrically disconnected from the solved copper, which is exactly
+        # why it's a stub). Fall back to the nearest solved vertex so that
+        # colour-by-V can still assign a meaningful voltage.
+        v = self._nearest_vertex_voltage(net_name, cx, cy)
+        if v is not None:
+            stub["_v_sample_cache"] = v
+            return v
+        stub["_v_sample_cache"] = "missing"
+        return None
+
+    def _nearest_vertex_voltage(self, net_name: str,
+                                cx: float, cy: float) -> float | None:
+        """Return the voltage of the nearest solved vertex for *net_name*.
+
+        Scans every (physical layer, net_name) pair in the solution and
+        returns the potential of the vertex closest to (cx, cy). Used as a
+        fallback when centroid interpolation fails because the stub centroid
+        lies outside the triangulated solved-copper region.
+        """
+        best_dist_sq = float("inf")
+        best_v: float | None = None
+        for phys in self._physicals:
+            li = self._index_by_pair.get((phys, net_name))
+            if li is None:
+                continue
+            ls = self.solution.layer_solutions[li]
+            for xys, pot in zip(ls.vertex_xys, ls.potentials):
+                if xys.shape[0] == 0:
+                    continue
+                dx = xys[:, 0] - cx
+                dy = xys[:, 1] - cy
+                d2 = dx * dx + dy * dy
+                idx = int(np.argmin(d2))
+                if d2[idx] < best_dist_sq:
+                    best_dist_sq = d2[idx]
+                    best_v = float(pot[idx])
+        return best_v
+
+    # World-space half-width (mm) of the colored part of the series-component bar.
+    # Total colored width = 2 × this = 0.2 mm.
+    _SERIES_BAR_HALF_WIDTH_MM: float = 0.2
+    # Extra half-width (mm) added on each side for the black outline border.
+    # Total bar width including outline = 2 × (hw + border) = 0.3 mm.
+    _SERIES_BAR_BORDER_MM: float = 0.05
+    # How far (mm) the bar's z sits proud of the copper centroid z on the
+    # top and bottom copper layers, so it visually rests on the surface.
+    _SERIES_BAR_Z_LIFT_MM: float = 0.001
+    # Extrusion height (mm) of the bar above its mounting surface in 3D mode.
+    # Set to 0 to revert to a flat rectangle.  Tunable — increase for more
+    # visual prominence, decrease if it obscures nearby copper detail.
+    _SERIES_BAR_HEIGHT_MM: float = 0.005
+
+    def _push_series_bars(self, phys_list: list[str],
+                          rail_names: list[str] | str,
+                          mode: str,
+                          drop_reference: float | None = None) -> None:
+        """Build gradient-filled rectangle geometry for every RESISTOR
+        (series) directive visible on the current layers + selected rails,
+        and push it as one triangle batch to the GL viewer.
+
+        Each bar runs between the centroid of terminal "P" pins and the
+        centroid of terminal "N" pins. The rectangle is ``_SERIES_BAR_HALF_WIDTH_MM``
+        wide (world-space mm) and is coloured by the active heatmap mode:
+
+        * **Voltage / Voltage Drop** — smooth gradient from the P-side
+          heatmap colour to the N-side colour.
+        * **Current Density** — uniform colour computed from I = ΔV / R.
+        * **Power Density** — uniform colour from P = I² · R.
+        """
+        if self.metadata is None or not phys_list:
+            self._gl_viewer.clear_series_bars()
+            return
+
+        directives = self.metadata.get("directives") or []
+        rail_members = set(self._effective_rail_members(rail_names))
+        target_layer_ids: set[int] = {
+            self._phys_name_to_layer_id[p]
+            for p in phys_list
+            if p in self._phys_name_to_layer_id
+        }
+        id_to_phys = {v: k for k, v in self._phys_name_to_layer_id.items()}
+        in_3d = self.view_3d_box.isChecked()
+
+        lut = _build_cmap_lut(self._cmap_name)
+        vmin = float(self._vmin)
+        vmax = float(self._vmax)
+        if vmax <= vmin:
+            vmax = vmin + 1e-30
+        drop_ref = float(drop_reference) if drop_reference is not None else 0.0
+
+        # Two chunk lists. ``under_*`` rects are drawn BEFORE the heatmap
+        # mesh so a bottom-side bar sits visually beneath the bottom
+        # copper in 2D (depth test is off in 2D, so order = layer order).
+        # ``over_*`` rects are drawn after the mesh, on top. In 3D the
+        # extruded bar's z handles ordering, so everything goes over.
+        under_pos_chunks: list[np.ndarray] = []
+        under_col_chunks: list[np.ndarray] = []
+        over_pos_chunks: list[np.ndarray] = []
+        over_col_chunks: list[np.ndarray] = []
+        hw = self._SERIES_BAR_HALF_WIDTH_MM
+        hw_out = hw + self._SERIES_BAR_BORDER_MM
+        z_lift = self._SERIES_BAR_Z_LIFT_MM
+        max_rank = len(self._physicals) - 1
+        half_cu = self._COPPER_THICKNESS_MM / 2.0
+        black = (0.0, 0.0, 0.0)
+
+        def _bar_is_on_bottom(phys1: str | None,
+                              phys2: str | None) -> bool:
+            r1 = self._phys_stackup_rank.get(phys1, 0) if phys1 else 0
+            r2 = self._phys_stackup_rank.get(phys2, 0) if phys2 else 0
+            return min(r1, r2) == max_rank
+
+        def _z_for_bar(phys1: str | None,
+                       phys2: str | None) -> tuple[float, float]:
+            """Return ``(z_base, extrude_sign)`` for the bar.
+
+            z_base: the z the bar sits on (copper surface + tiny lift).
+            extrude_sign: +1 when the bar extrudes away from the viewer
+            in the +z direction (top layer / inner layers); −1 when it
+            extrudes toward −z (bottom copper layer faces downward).
+            """
+            z1 = self._layer_z_for(phys1) if phys1 else 0.0
+            z2 = self._layer_z_for(phys2) if phys2 else 0.0
+            z_mid = (z1 + z2) * 0.5
+            if _bar_is_on_bottom(phys1, phys2):
+                return z_mid - half_cu - z_lift, -1.0
+            return z_mid + half_cu + z_lift, 1.0
+
+        for d in directives:
+            if d.get("role") != "RESISTOR":
+                continue
+            terminals = d.get("terminals") or {}
+            p_term = terminals.get("P") or {}
+            n_term = terminals.get("N") or {}
+            p_pins = p_term.get("pins") or []
+            n_pins = n_term.get("pins") or []
+            if not p_pins or not n_pins:
+                continue
+
+            # Find the first pin on a visible layer for each terminal.
+            def _pick_pin(pins: list[dict]) -> dict | None:
+                for pin in pins:
+                    if pin.get("layer_id") in target_layer_ids:
+                        return pin
+                # fall back to any pin that has an associated visible phys
+                return pins[0] if pins else None
+
+            p_pin = _pick_pin(p_pins)
+            n_pin = _pick_pin(n_pins)
+            if p_pin is None or n_pin is None:
+                continue
+
+            # Skip if neither terminal pin is on the rail.
+            if rail_members:
+                p_net = p_pin.get("net", "")
+                n_net = n_pin.get("net", "")
+                if p_net not in rail_members and n_net not in rail_members:
+                    continue
+
+            x1 = float(p_pin.get("x_mm", 0.0))
+            y1 = float(p_pin.get("y_mm", 0.0))
+            x2 = float(n_pin.get("x_mm", 0.0))
+            y2 = float(n_pin.get("y_mm", 0.0))
+
+            phys1 = id_to_phys.get(p_pin.get("layer_id"))
+            phys2 = id_to_phys.get(n_pin.get("layer_id"))
+            if in_3d:
+                z, extrude_sign = _z_for_bar(phys1, phys2)
+            else:
+                z, extrude_sign = 0.0, 1.0
+            # Route this bar's triangles to the right batch. In 2D the
+            # bottom-side bar must draw under the mesh so the bottom
+            # copper covers it; all others go over the mesh as usual.
+            if not in_3d and _bar_is_on_bottom(phys1, phys2):
+                pos_chunks = under_pos_chunks
+                col_chunks = under_col_chunks
+            else:
+                pos_chunks = over_pos_chunks
+                col_chunks = over_col_chunks
+
+            # Sample voltage at each pin; fall back to the opposite pin's
+            # net if the pin's own net has no solution on this layer.
+            def _sample(pin: dict) -> float | None:
+                lid = pin.get("layer_id")
+                phys = id_to_phys.get(lid)
+                if phys is None:
+                    phys = phys_list[0]
+                net = pin.get("net", "")
+                v = self._sample_via_voltage(phys, net,
+                                             float(pin.get("x_mm", 0.0)),
+                                             float(pin.get("y_mm", 0.0)))
+                if v is None:
+                    # try any visible layer for this net
+                    for pl in phys_list:
+                        v = self._sample_via_voltage(
+                            pl, net,
+                            float(pin.get("x_mm", 0.0)),
+                            float(pin.get("y_mm", 0.0)),
+                        )
+                        if v is not None:
+                            break
+                return v
+
+            v1 = _sample(p_pin)
+            v2 = _sample(n_pin)
+            if v1 is None and v2 is None:
+                continue
+            if v1 is None:
+                v1 = v2
+            if v2 is None:
+                v2 = v1
+
+            # Convert raw voltages to the display value for this mode.
+            if mode in ("Voltage", _VOLTAGE_DROP_MODE):
+                val1 = v1 - drop_ref
+                val2 = v2 - drop_ref
+                c1 = self._shade(lut, val1, vmin, vmax)
+                c2 = self._shade(lut, val2, vmin, vmax)
+            elif mode == _VIA_CURRENT_MODE:
+                # Via Current mode doesn't define a value for series
+                # resistors — colour them with the same neutral shade
+                # the copper uses so they read as context, not data.
+                neutral_rgb = tuple(c / 255.0 for c in (160, 160, 160))
+                c1 = c2 = neutral_rgb
+            else:
+                r_ohm = float(d.get("value") or 0.0)
+                if r_ohm <= 0.0:
+                    r_ohm = 1e-3
+                i_abs = abs(v1 - v2) / r_ohm
+                if mode == "Current Density":
+                    val = i_abs
+                else:  # Power Density
+                    val = i_abs * i_abs * r_ohm
+                c = self._shade(lut, val, vmin, vmax)
+                c1 = c2 = c
+
+            # Perpendicular unit vector for bar width.
+            ddx, ddy = x2 - x1, y2 - y1
+            length = math.sqrt(ddx * ddx + ddy * ddy)
+            if length < 1e-6:
+                continue
+            nx, ny = -ddy / length, ddx / length
+
+            # Outer black box corners (at hw_out).
+            a_ox, a_oy = x1 + nx * hw_out, y1 + ny * hw_out  # P end, +side
+            b_ox, b_oy = x1 - nx * hw_out, y1 - ny * hw_out  # P end, -side
+            c_ox, c_oy = x2 - nx * hw_out, y2 - ny * hw_out  # N end, -side
+            d_ox, d_oy = x2 + nx * hw_out, y2 + ny * hw_out  # N end, +side
+
+            # Helper: horizontal quad (2 tris) at a constant z, colored
+            # gradient from ca (P end) to cb (N end).
+            def _hquad(hw_: float, z_: float, ca, cb) -> tuple:
+                ax_, ay_ = x1 + nx * hw_, y1 + ny * hw_
+                bx_, by_ = x1 - nx * hw_, y1 - ny * hw_
+                cx__, cy__ = x2 - nx * hw_, y2 - ny * hw_
+                dx__, dy__ = x2 + nx * hw_, y2 + ny * hw_
+                pos_ = np.array([
+                    [ax_, ay_, z_], [bx_, by_, z_], [cx__, cy__, z_],
+                    [ax_, ay_, z_], [cx__, cy__, z_], [dx__, dy__, z_],
+                ], dtype=np.float32)
+                col_ = np.array([ca, ca, cb, ca, cb, cb], dtype=np.float32)
+                return pos_, col_
+
+            # Helper: vertical quad (2 tris) connecting edge (p1→p2) from
+            # z_bot to z_top, colored ca at p1 end and cb at p2 end.
+            def _vquad(p1x, p1y, p2x, p2y, z_bot, z_top, ca, cb) -> tuple:
+                pos_ = np.array([
+                    [p1x, p1y, z_bot], [p2x, p2y, z_bot], [p2x, p2y, z_top],
+                    [p1x, p1y, z_bot], [p2x, p2y, z_top], [p1x, p1y, z_top],
+                ], dtype=np.float32)
+                col_ = np.array([ca, cb, cb, ca, cb, ca], dtype=np.float32)
+                return pos_, col_
+
+            # Helper: two-strip black outline frame around a coloured cap,
+            # at the cap's own z. Sitting at the same z guarantees the
+            # outline reads next to the cap regardless of how the box's
+            # far black face depth-resolves on the viewer's GPU.
+            def _hframe(z_: float) -> tuple:
+                # +perp strip: from hw to hw_out on the +nx,+ny side
+                ai_x, ai_y = x1 + nx * hw, y1 + ny * hw
+                ao_x, ao_y = x1 + nx * hw_out, y1 + ny * hw_out
+                di_x, di_y = x2 + nx * hw, y2 + ny * hw
+                do_x, do_y = x2 + nx * hw_out, y2 + ny * hw_out
+                # -perp strip
+                bi_x, bi_y = x1 - nx * hw, y1 - ny * hw
+                bo_x, bo_y = x1 - nx * hw_out, y1 - ny * hw_out
+                ci_x, ci_y = x2 - nx * hw, y2 - ny * hw
+                co_x, co_y = x2 - nx * hw_out, y2 - ny * hw_out
+                pos_ = np.array([
+                    # +perp strip: ai, ao, do | ai, do, di
+                    [ai_x, ai_y, z_], [ao_x, ao_y, z_], [do_x, do_y, z_],
+                    [ai_x, ai_y, z_], [do_x, do_y, z_], [di_x, di_y, z_],
+                    # -perp strip: bi, ci, co | bi, co, bo
+                    [bi_x, bi_y, z_], [ci_x, ci_y, z_], [co_x, co_y, z_],
+                    [bi_x, bi_y, z_], [co_x, co_y, z_], [bo_x, bo_y, z_],
+                ], dtype=np.float32)
+                col_ = np.tile(np.array(black, dtype=np.float32), (12, 1))
+                return pos_, col_
+
+            height = self._SERIES_BAR_HEIGHT_MM
+            if in_3d and height > 0.0:
+                # 3D extruded box with colored caps on both ends so the
+                # bar reads the same from above and below. Each cap is
+                # paired with a coplanar black outline frame at the same
+                # z, so the outline is anchored to the cap and can't be
+                # lost when the far black face is occluded by copper or
+                # falls outside depth-buffer precision.
+                z_top = z + extrude_sign * height
+                z_cap = z_top + extrude_sign * 5e-4  # outer cap, away from board
+                z_cap_inner = z - extrude_sign * 5e-4  # inner cap, board side
+
+                # Black box walls (4 sides). No top/base face needed —
+                # the cap-coplanar frames close the silhouette.
+                p, c = _vquad(a_ox, a_oy, d_ox, d_oy, z, z_top, black, black)
+                pos_chunks.append(p); col_chunks.append(c)
+                p, c = _vquad(b_ox, b_oy, c_ox, c_oy, z, z_top, black, black)
+                pos_chunks.append(p); col_chunks.append(c)
+                p, c = _vquad(a_ox, a_oy, b_ox, b_oy, z, z_top, black, black)
+                pos_chunks.append(p); col_chunks.append(c)
+                p, c = _vquad(d_ox, d_oy, c_ox, c_oy, z, z_top, black, black)
+                pos_chunks.append(p); col_chunks.append(c)
+
+                # Colored heatmap caps + coplanar black outline frames.
+                p, c = _hquad(hw, z_cap, c1, c2)
+                pos_chunks.append(p); col_chunks.append(c)
+                p, c = _hframe(z_cap)
+                pos_chunks.append(p); col_chunks.append(c)
+                p, c = _hquad(hw, z_cap_inner, c1, c2)
+                pos_chunks.append(p); col_chunks.append(c)
+                p, c = _hframe(z_cap_inner)
+                pos_chunks.append(p); col_chunks.append(c)
+            else:
+                # 2D flat (or height == 0): black outline rect + colored rect.
+                z_fg = z + 5e-4
+                p, c = _hquad(hw_out, z, black, black)
+                pos_chunks.append(p); col_chunks.append(c)
+                p, c = _hquad(hw, z_fg, c1, c2)
+                pos_chunks.append(p); col_chunks.append(c)
+
+        if not under_pos_chunks and not over_pos_chunks:
+            self._gl_viewer.clear_series_bars()
+            return
+        all_pos = under_pos_chunks + over_pos_chunks
+        all_col = under_col_chunks + over_col_chunks
+        under_count = sum(c.shape[0] for c in under_pos_chunks)
+        self._gl_viewer.set_series_bars(
+            np.concatenate(all_pos, axis=0),
+            np.concatenate(all_col, axis=0),
+            under_mesh_count=under_count,
+        )
+
+    @staticmethod
+    def _lut_lookup(lut: np.ndarray, value: float,
+                    vmin: float, vmax: float) -> np.ndarray:
+        """Look up an RGB triplet (float32, [0..1]) from the LUT for
+        ``value`` normalised into ``[vmin, vmax]``."""
+        if not np.isfinite(value):
+            return np.asarray((0.5, 0.5, 0.5), dtype=np.float32)
+        t = (value - vmin) / (vmax - vmin)
+        t = max(0.0, min(1.0, t))
+        idx = int(round(t * (lut.shape[0] - 1)))
+        rgba = lut[idx]
+        # LUT entries are uint8 RGBA; convert to float RGB.
+        return np.asarray(rgba[:3], dtype=np.float32) / 255.0
+
+    def _triangulate_stub(self, stub: dict) -> np.ndarray:
+        """Triangulate a stub polygon, caching the result on the metadata dict.
+
+        Returns an (N*3, 2) float32 array of vertex coords; consecutive
+        triples form one GL_TRIANGLES triangle.
+
+        Fast path: ``altium_loader._build_stub_record`` pre-triangulates
+        every stub at solve time and ships the result in the pickle as
+        ``stub['triangles_xy']`` — already in the (N*3, 2) float32 layout
+        the GL stub batch wants, so the viewer just uploads it. Old
+        pickles (or stubs where the loader's triangle call failed) fall
+        through to the lazy Triangle-library path below.
+
+        Lazy path: Shewchuk's Triangle (via the ``triangle`` PyPI
+        package) does a constrained Delaunay of the exterior + interior
+        rings with one hole marker per interior — fills non-convex shapes
+        (including those with holes) exactly. The earlier
+        ``shapely.ops.triangulate`` + ``poly.contains(centroid)``
+        approach was a vertex-set Delaunay bounded by the convex hull:
+        it left gaps in concavities and produced wrong fills for complex
+        stub shapes (e.g. the expansion-board copper island with cutouts).
+        """
+        cached = stub.get("_tris_cache")
+        if cached is not None:
+            return cached
+        prebuilt = stub.get("triangles_xy")
+        if prebuilt is not None:
+            arr = np.asarray(prebuilt, dtype=np.float32)
+            stub["_tris_cache"] = arr
+            return arr
+        from shapely.geometry import Polygon as _Polygon
+        ext = stub.get("exterior")
+        if ext is None or (hasattr(ext, "size") and ext.size == 0) or (
+                not hasattr(ext, "size") and not ext):
+            exterior = []
+        else:
+            # Accept either a numpy (N, 2) array (new format) or a nested
+            # list (legacy format) — shapely's Polygon takes both.
+            exterior = ext
+        holes = stub.get("holes") or []
+        try:
+            poly = _Polygon(exterior, holes=holes) if len(exterior) >= 3 else None
+        except Exception:
+            poly = None
+        if poly is None or poly.is_empty:
+            empty = np.empty((0, 2), dtype=np.float32)
+            stub["_tris_cache"] = empty
+            return empty
+
+        verts, segs, hole_markers = self._poly_to_triangle_input(poly)
+        if not verts or not segs:
+            empty = np.empty((0, 2), dtype=np.float32)
+            stub["_tris_cache"] = empty
+            return empty
+
+        try:
+            import triangle as _triangle
+            tri_input: dict = {
+                "vertices": verts,
+                "segments": segs,
+            }
+            if hole_markers:
+                tri_input["holes"] = hole_markers
+            # ``p`` = constrained planar straight-line graph triangulation;
+            # ``Q`` silences Triangle's stdout. No ``q`` / ``a`` quality
+            # switches — we just want a geometrically faithful fill, not
+            # a FEM-quality mesh.
+            out = _triangle.triangulate(tri_input, "pQ")
+        except Exception:
+            out = None
+
+        out_verts = out.get("vertices") if out else None
+        out_tris = out.get("triangles") if out else None
+        if (out_verts is None or out_tris is None
+                or len(out_tris) == 0):
+            arr = np.empty((0, 2), dtype=np.float32)
+        else:
+            v_arr = np.asarray(out_verts, dtype=np.float32)
+            t_arr = np.asarray(out_tris, dtype=np.int32)
+            # Expand index list into a flat (N*3, 2) GL_TRIANGLES vertex
+            # soup — matches the buffer layout the GL stub batch wants.
+            arr = v_arr[t_arr.ravel()].astype(np.float32, copy=False)
+        stub["_tris_cache"] = arr
+        return arr
+
+    @staticmethod
+    def _poly_to_triangle_input(poly) -> tuple[
+        list[tuple[float, float]],
+        list[tuple[int, int]],
+        list[tuple[float, float]],
+    ]:
+        """Convert a shapely Polygon into Triangle-library input.
+
+        Returns ``(vertices, segments, hole_markers)``. Each ring (the
+        exterior + every interior) contributes its vertices once (the
+        duplicated closing vertex is dropped) and a closed loop of
+        segment indices. Hole markers are representative points inside
+        each interior ring, which tells Triangle to leave the hole
+        region un-meshed. Shared with the stub-outline builder so the
+        outline and the triangulation see exactly the same geometry.
+        """
+        from shapely.geometry import Polygon as _Polygon
+        verts: list[tuple[float, float]] = []
+        segs: list[tuple[int, int]] = []
+        hole_markers: list[tuple[float, float]] = []
+
+        def _add_ring(ring) -> None:
+            if ring is None or ring.is_empty:
+                return
+            coords = list(ring.coords)
+            if len(coords) >= 2 and coords[0] == coords[-1]:
+                coords = coords[:-1]
+            if len(coords) < 3:
+                return
+            i_first = len(verts)
+            for x, y in coords:
+                verts.append((float(x), float(y)))
+            n = len(coords)
+            for i in range(n):
+                segs.append((i_first + i, i_first + (i + 1) % n))
+
+        _add_ring(poly.exterior)
+        for hole_ring in poly.interiors:
+            _add_ring(hole_ring)
+            try:
+                hp = _Polygon(hole_ring).representative_point()
+                hole_markers.append((float(hp.x), float(hp.y)))
+            except Exception:
+                continue
+        return verts, segs, hole_markers
+
+    def _stub_outline_segments(self, stub: dict) -> np.ndarray:
+        """Build (and cache) GL_LINES outline segments for a stub piece.
+
+        Returns an ``(N, 2)`` float32 array where consecutive vertex
+        pairs form one segment. Traces the exterior + every hole; result
+        is cached on the stub dict so toggling the outline overlay is a
+        pure buffer upload.
+
+        Accepts both the new pickle format (numpy ``(N, 2)`` float32 arrays
+        for exterior + each hole) and the legacy format (nested Python
+        lists). Both go through ``np.asarray`` so the downstream code is
+        identical.
+        """
+        cached = stub.get("_outline_cache")
+        if cached is not None:
+            return cached
+        exterior = stub.get("exterior")
+        if exterior is None:
+            exterior_arr = np.empty((0, 2), dtype=np.float32)
+        else:
+            exterior_arr = np.asarray(exterior, dtype=np.float32)
+        holes = stub.get("holes") or []
+        rings: list[np.ndarray] = []
+        if exterior_arr.shape[0] >= 3:
+            rings.append(exterior_arr)
+        for hole in holes:
+            hole_arr = np.asarray(hole, dtype=np.float32)
+            if hole_arr.shape[0] >= 3:
+                rings.append(hole_arr)
+        pairs_chunks: list[np.ndarray] = []
+        for ring in rings:
+            # Close the ring if the source data didn't (extraction stores
+            # exterior/holes as open rings — first vertex != last).
+            if not np.allclose(ring[0], ring[-1]):
+                ring = np.vstack([ring, ring[:1]])
+            if ring.shape[0] < 2:
+                continue
+            pairs = np.empty((2 * (ring.shape[0] - 1), 2), dtype=np.float32)
+            pairs[0::2] = ring[:-1]
+            pairs[1::2] = ring[1:]
+            pairs_chunks.append(pairs)
+        if not pairs_chunks:
+            arr = np.empty((0, 2), dtype=np.float32)
+        else:
+            arr = np.concatenate(pairs_chunks, axis=0)
+        stub["_outline_cache"] = arr
+        return arr
+
+    def _ensure_gl_cmap(self, kind: str) -> None:
+        """Make sure the LUT uploaded to the GL viewer's copper-mesh
+        cmap texture matches ``kind``.
+
+        ``kind`` is ``"data"`` (the viridis ramp keyed on per-vertex
+        values — every mode except Via Current) or ``"neutral"`` (a
+        flat-grey LUT used in Via Current mode so the copper renders
+        as context behind the heatmapped vias). The viewer caches the
+        active kind so this is a no-op when the LUT hasn't changed.
+        """
+        if self._gl_cmap_kind == kind:
+            return
+        if kind == "neutral":
+            self._gl_viewer.set_colormap(_build_neutral_cmap_lut())
+        else:
+            self._gl_viewer.set_colormap(_build_cmap_lut(self._cmap_name))
+        self._gl_cmap_kind = kind
+
+    def _gl_scale(self, v):
+        """Map real heatmap value(s) into the space the colour lookup
+        runs in: identity on a linear scale, ``log10`` (floored at
+        ``_log_floor``) on a log scale. Accepts a scalar or an ndarray
+        and never mutates its input.
+
+        Pushing both the per-vertex values and the level clamps through
+        this keeps the GL viewer's linear normalisation shader correct
+        for the log scale with no shader change — see :meth:`_render`."""
+        if not self._log_active:
+            return v
+        return np.log10(np.maximum(v, self._log_floor))
+
+    def _shade(self, lut: np.ndarray, value: float,
+               vmin: float, vmax: float) -> tuple[float, float, float]:
+        """LUT colour for one scalar value, honouring the active linear /
+        log scale. Wraps :func:`_sample_cmap_lut` so the CPU-baked
+        overlays (via cylinders, series bars, 2D via markers) pick up the
+        log scale the same way the GPU-shaded copper mesh does."""
+        return _sample_cmap_lut(
+            lut, self._gl_scale(value),
+            self._gl_scale(vmin), self._gl_scale(vmax))
+
+    def _on_scale_type_changed(self, is_log: bool) -> None:
+        """The Linear / Logarithmic dropdown changed — re-render so the
+        copper mesh, the via overlays and the gradient strip all switch
+        scale together. ``_render`` re-derives ``_log_active`` (the
+        dropdown is disabled for ineligible modes, but guard anyway)."""
+        if is_log == self._log_scale:
+            return
+        self._log_scale = is_log
+        self._render()
+
+    def _via_current_lookup_and_range(
+        self, rail_names: list[str],
+    ) -> tuple[float, float, dict[tuple[str, float, float], float]]:
+        """For Via Current mode: return ``(vmin, vmax, lookup)``.
+
+        ``lookup`` maps ``(net, x_mm, y_mm)`` to the via's
+        max-|segment-current| (matches the Vias-tab ``current`` column)
+        for every via whose net is in the effective rail set. The
+        range is taken across that whole set — independent of which
+        physical layers are toggled visible — so flipping layers
+        doesn't move the colormap. Falls back to ``(0.0, 1.0)`` when
+        no via matches the rail filter.
+        """
+        rail_members = set(self._effective_rail_members(rail_names))
+        rows = self._get_or_compute_via_rows()
+        lookup: dict[tuple[str, float, float], float] = {}
+        for r in rows:
+            net = r.get("net", "")
+            if rail_members and net not in rail_members:
+                continue
+            cur = r.get("current")
+            if cur is None:
+                continue
+            cur_f = float(cur)
+            if not math.isfinite(cur_f):
+                continue
+            key = (net,
+                   float(r.get("x_mm", 0.0)),
+                   float(r.get("y_mm", 0.0)))
+            lookup[key] = cur_f
+        if not lookup:
+            return 0.0, 1.0, lookup
+        vals = list(lookup.values())
+        vmin = min(vals)
+        vmax = max(vals)
+        if vmax <= vmin:
+            vmax = vmin + 1e-12
+        return vmin, vmax, lookup
+
+    # --- Via cylinders (3D-mode only) --------------------------------------
+
+    # Cylinder tessellation — 10 sides keeps the silhouette smooth at
+    # typical zoom without flooding the GPU when there are 100+ vias.
+    _VIA_CYL_SEGMENTS: int = 10
+    # Minimum world-mm radius for vias whose ``diameter_mm`` is missing
+    # or oddly small (we still want them to be visible cylinders).
+    _VIA_CYL_MIN_RADIUS_MM: float = 0.2
+    # RGB colour of the via cylinders (matches the 2D orange via marker).
+    _VIA_CYL_COLOR_RGB: tuple[float, float, float] = (
+        0xff / 255.0, 0x8c / 255.0, 0x00 / 255.0,
+    )
+    # Plated-through-hole pad styling — light grey so PTHs are visually
+    # distinct from the orange vias in both the 2D marker overlay and the
+    # 3D cylinder view. PTHs span every enabled copper layer (Altium pads
+    # have no blind/buried span) so their cylinders run the full stack.
+    _PTH_COLOR_HEX: str = "#b8b8b8"
+    _PTH_CYL_COLOR_RGB: tuple[float, float, float] = (
+        0xb8 / 255.0, 0xb8 / 255.0, 0xb8 / 255.0,
+    )
+
+    def _push_via_cylinders(self, phys_list: list[str],
+                            rail_names: list[str] | str,
+                            *, mode: str | None = None) -> None:
+        """Build cylinder triangle geometry for every via that touches
+        the visible physical layers + the selected rail groups, and push
+        it as one batch to the GLMeshViewer. Empty input clears the
+        cylinders.
+
+        When the "Heatmap vias" toggle is on, each via is split into one
+        cylinder per inter-layer segment, coloured by the active mode's
+        heatmap (voltage / drop interpolate top↔bottom along the via;
+        current and power are constant per segment). Otherwise vias are
+        drawn solid orange to match the 2D marker."""
+        if self.metadata is None or not phys_list:
+            self._gl_viewer.clear_cylinders()
+            return
+        # Map layer_id → physical name → rank → z. Use the same rank-
+        # based z as the heatmap meshes so cylinders connect cleanly.
+        id_to_phys = {v: k for k, v in self._phys_name_to_layer_id.items()}
+        visible_ids = {self._phys_name_to_layer_id.get(p)
+                       for p in phys_list}
+        visible_ids.discard(None)
+        rail_members = set(self._effective_rail_members(rail_names))
+
+        # Via Current mode supersedes the "Heatmap vias" toggle — the
+        # mode IS the heatmap, so we always colour every visible via /
+        # PTH by its max-|segment-current| (looked up from
+        # :attr:`_via_current_lookup`, populated in :meth:`_render`).
+        via_current_on = (mode == _VIA_CURRENT_MODE)
+        heatmap_on = via_current_on or (
+            mode is not None
+            and getattr(self, "heatmap_vias_box", None) is not None
+            and self.heatmap_vias_box.isChecked()
+        )
+        lut: np.ndarray | None = None
+        vmin = vmax = 0.0
+        fallback_r_seg = 1.0e-3
+        drop_ref = 0.0
+        stackup_ids: list[int] = []
+        if heatmap_on:
+            lut = _build_cmap_lut(self._cmap_name)
+            vmin = float(self._vmin)
+            vmax = float(self._vmax)
+            if vmax <= vmin:
+                vmax = vmin + 1e-30
+            # Each via dict now carries its own segments list with per-hop R;
+            # this fallback only applies if that's missing (e.g. legacy pickle).
+            fallback_r_seg = float(
+                (self.metadata.get("physics_constants", {}) or {})
+                .get("fallback_via_resistance_ohm", 1.0e-3)
+            )
+            if (mode == _VOLTAGE_DROP_MODE
+                    and self._last_drop_reference is not None):
+                drop_ref = float(self._last_drop_reference)
+            stackup_ids = [row["layer_id"]
+                           for row in self.metadata.get("stackup", [])]
+
+        pos_chunks: list[np.ndarray] = []
+        col_chunks: list[np.ndarray] = []
+        for v in self.metadata.get("vias", []):
+            ls_id = v.get("layer_start")
+            le_id = v.get("layer_end")
+            if ls_id is None or le_id is None:
+                continue
+            # Skip vias that don't touch any visible layer.
+            lo_id = min(ls_id, le_id)
+            hi_id = max(ls_id, le_id)
+            spanned = [lid for lid in (lo_id, hi_id) if lid in id_to_phys]
+            if not spanned:
+                continue
+            if not any(visible_ids & set(spanned)):
+                continue
+            # Skip vias not on the rail (when a rail is selected).
+            if rail_members and v.get("net") not in rail_members:
+                continue
+            phys_top = id_to_phys.get(lo_id)
+            phys_bot = id_to_phys.get(hi_id)
+            if phys_top is None or phys_bot is None:
+                continue
+            z_top = self._layer_z_for(phys_top)
+            z_bot = self._layer_z_for(phys_bot)
+            if z_top == z_bot:
+                continue
+            x = float(v.get("x_mm", 0.0))
+            y = float(v.get("y_mm", 0.0))
+            # Draw at drill diameter — that's the actual barrel that carries
+            # current between layers (and what the FEM uses for R). The
+            # outer pad diameter belongs to the per-layer copper plane,
+            # which is already drawn as part of the layer mesh. Fall back
+            # to pad diameter if drill data is missing.
+            drill_mm = float(v.get("hole_diameter_mm") or 0.0)
+            outer_mm = float(v.get("diameter_mm") or 0.0)
+            radius = (drill_mm if drill_mm > 0.0 else outer_mm) * 0.5
+            radius = max(radius, self._VIA_CYL_MIN_RADIUS_MM)
+
+            # Heatmap path: per-segment cylinders coloured by mode. Falls
+            # back to the solid-orange branch below when we can't sample
+            # voltages on at least two of the via's spanned layers.
+            heatmap_chunks: list[tuple[np.ndarray, np.ndarray]] = []
+            if via_current_on and lut is not None:
+                # Via Current mode: one cylinder per via, coloured by
+                # the via's max-|segment-current| (matches the Vias-tab
+                # value and the scale-controller range).
+                key = (v.get("net", ""), x, y)
+                cur = self._via_current_lookup.get(key)
+                if cur is not None:
+                    c = self._shade(lut, cur, vmin, vmax)
+                    pos, col = _generate_via_cylinder(
+                        x, y, z_top, z_bot, radius, c,
+                        n_segments=self._VIA_CYL_SEGMENTS,
+                    )
+                    heatmap_chunks = [(pos, col)]
+            elif heatmap_on and lut is not None and mode is not None:
+                heatmap_chunks = self._heatmap_via_chunks(
+                    v, x, y, radius, lo_id, hi_id,
+                    stackup_ids, id_to_phys,
+                    mode, lut, vmin, vmax, fallback_r_seg, drop_ref,
+                )
+
+            if heatmap_chunks:
+                for pos, col in heatmap_chunks:
+                    pos_chunks.append(pos)
+                    col_chunks.append(col)
+            else:
+                pos, col = _generate_via_cylinder(
+                    x, y, z_top, z_bot, radius,
+                    self._VIA_CYL_COLOR_RGB,
+                    n_segments=self._VIA_CYL_SEGMENTS,
+                )
+                pos_chunks.append(pos)
+                col_chunks.append(col)
+
+        # Plated through-hole pads — same per-site gating as vias (visible
+        # layer ∩ rail). Default to light grey; when the heatmap-vias/PTH
+        # toggle is on they're coloured the same way as via cylinders via
+        # the shared :meth:`_heatmap_via_chunks` helper (PTH dicts carry
+        # the same ``net`` + ``segments`` keys vias do).
+        for p in self.metadata.get("pths", []):
+            ls_id = p.get("layer_start")
+            le_id = p.get("layer_end")
+            if ls_id is None or le_id is None:
+                continue
+            lo_id = min(ls_id, le_id)
+            hi_id = max(ls_id, le_id)
+            spanned = [lid for lid in (lo_id, hi_id) if lid in id_to_phys]
+            if not spanned:
+                continue
+            if not any(visible_ids & set(spanned)):
+                continue
+            if rail_members and p.get("net") not in rail_members:
+                continue
+            phys_top = id_to_phys.get(lo_id)
+            phys_bot = id_to_phys.get(hi_id)
+            if phys_top is None or phys_bot is None:
+                continue
+            z_top = self._layer_z_for(phys_top)
+            z_bot = self._layer_z_for(phys_bot)
+            if z_top == z_bot:
+                continue
+            x = float(p.get("x_mm", 0.0))
+            y = float(p.get("y_mm", 0.0))
+            # Drill diameter, same reasoning as the via path above.
+            drill_mm = float(p.get("hole_diameter_mm") or 0.0)
+            outer_mm = float(p.get("diameter_mm") or 0.0)
+            radius = (drill_mm if drill_mm > 0.0 else outer_mm) * 0.5
+            radius = max(radius, self._VIA_CYL_MIN_RADIUS_MM)
+
+            heatmap_chunks: list[tuple[np.ndarray, np.ndarray]] = []
+            if via_current_on:
+                # Via Current mode: PTH pads aren't part of the cached
+                # Vias-tab report (it iterates ``metadata['vias']``
+                # only), so they have no entry in
+                # ``_via_current_lookup``. Render them as the default
+                # light-grey PTH colour to keep them visible without
+                # implying a current reading we don't have.
+                pass
+            elif heatmap_on and lut is not None and mode is not None:
+                heatmap_chunks = self._heatmap_via_chunks(
+                    p, x, y, radius, lo_id, hi_id,
+                    stackup_ids, id_to_phys,
+                    mode, lut, vmin, vmax, fallback_r_seg, drop_ref,
+                )
+
+            if heatmap_chunks:
+                for pos, col in heatmap_chunks:
+                    pos_chunks.append(pos)
+                    col_chunks.append(col)
+            else:
+                pos, col = _generate_via_cylinder(
+                    x, y, z_top, z_bot, radius,
+                    self._PTH_CYL_COLOR_RGB,
+                    n_segments=self._VIA_CYL_SEGMENTS,
+                )
+                pos_chunks.append(pos)
+                col_chunks.append(col)
+
+        if pos_chunks:
+            self._gl_viewer.set_cylinders(
+                np.concatenate(pos_chunks, axis=0),
+                np.concatenate(col_chunks, axis=0),
+            )
+        else:
+            self._gl_viewer.clear_cylinders()
+
+    def _heatmap_via_chunks(
+        self, via: dict, x: float, y: float, radius: float,
+        lo_id: int, hi_id: int,
+        stackup_ids: list[int], id_to_phys: dict[int, str],
+        mode: str, lut: np.ndarray, vmin: float, vmax: float,
+        fallback_r_seg: float, drop_ref: float,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Per-segment cylinder geometry for one via, coloured by mode.
+
+        Voltage / Voltage Drop produce a smooth top↔bottom gradient on
+        each segment; Current Density / Power Density produce a single
+        colour per segment (the value is constant along the resistor).
+        Returns an empty list when the via has fewer than two sampleable
+        layers — caller falls back to the solid-orange path.
+        """
+        net = via.get("net", "")
+        if not net or net in ("?", "NO_NET"):
+            return []
+        try:
+            i_start = stackup_ids.index(lo_id)
+            i_end = stackup_ids.index(hi_id)
+        except ValueError:
+            return []
+        span_ids = stackup_ids[i_start:i_end + 1]
+        if len(span_ids) < 2:
+            return []
+        # (layer_id, z, raw_voltage) for every layer in the span where copper
+        # for this net exists. Layers without a sampleable voltage are dropped
+        # — the resulting segment list matches the FEM coupling network.
+        sampled: list[tuple[int, float, float]] = []
+        for lid in span_ids:
+            phys = id_to_phys.get(lid)
+            if phys is None:
+                continue
+            v_at = self._sample_via_voltage(phys, net, x, y)
+            if v_at is None:
+                continue
+            sampled.append((lid, self._layer_z_for(phys), v_at))
+        if len(sampled) < 2:
+            # Only one layer was sampleable. For Voltage / Voltage Drop we can
+            # still colour the whole cylinder barrel with that one voltage —
+            # via resistance is negligible so a solid shade is a good
+            # approximation. Current / Power need at least two voltage samples
+            # to compute a meaningful value, so those modes fall back.
+            if len(sampled) == 1 and mode in ("Voltage", _VOLTAGE_DROP_MODE):
+                phys_lo = id_to_phys.get(lo_id)
+                phys_hi = id_to_phys.get(hi_id)
+                if phys_lo is None or phys_hi is None:
+                    return []
+                z_lo = self._layer_z_for(phys_lo)
+                z_hi = self._layer_z_for(phys_hi)
+                if z_lo == z_hi:
+                    return []
+                val = sampled[0][2] - drop_ref
+                c = self._shade(lut, val, vmin, vmax)
+                pos, col = _generate_via_cylinder(
+                    x, y, z_lo, z_hi, radius, c,
+                    n_segments=self._VIA_CYL_SEGMENTS,
+                )
+                # Single cap at the one layer we could sample.
+                _, z_cap, v_cap = sampled[0]
+                c_cap = self._shade(lut, v_cap - drop_ref, vmin, vmax)
+                cap_pos, cap_col = _generate_disk_cap(
+                    x, y, z_cap, radius, c_cap,
+                    n_segments=self._VIA_CYL_SEGMENTS,
+                )
+                return [(pos, col), (cap_pos, cap_col)]
+            return []
+
+        # Per-hop R lookup, keyed unordered so (a,b) and (b,a) both match.
+        r_by_pair: dict[frozenset[int], float] = {}
+        for seg in via.get("segments") or []:
+            r_by_pair[frozenset((seg["layer_a"], seg["layer_b"]))] = (
+                float(seg["resistance_ohm"])
+            )
+
+        chunks: list[tuple[np.ndarray, np.ndarray]] = []
+        for (lid_a, z_a, v_a), (lid_b, z_b, v_b) in zip(sampled, sampled[1:]):
+            if z_a == z_b:
+                continue
+            if mode in ("Voltage", _VOLTAGE_DROP_MODE):
+                top_val = v_a - drop_ref
+                bot_val = v_b - drop_ref
+                ct = self._shade(lut, top_val, vmin, vmax)
+                cb = self._shade(lut, bot_val, vmin, vmax)
+                pos, col = _generate_via_cylinder_gradient(
+                    x, y, z_a, z_b, radius, ct, cb,
+                    n_segments=self._VIA_CYL_SEGMENTS,
+                )
+            else:
+                # Current / power are constant along each inter-layer barrel
+                # resistor — colour the whole segment one shade. R is the
+                # actual per-hop value the FEM used (varies with drill,
+                # plating, and dielectric thickness traversed).
+                r_seg = r_by_pair.get(
+                    frozenset((lid_a, lid_b)), fallback_r_seg,
+                )
+                i_seg = (v_a - v_b) / r_seg if r_seg > 0 else 0.0
+                if mode == "Current Density":
+                    val = abs(i_seg)
+                else:  # Power Density (and any unexpected mode → power)
+                    val = i_seg * i_seg * r_seg
+                c = self._shade(lut, val, vmin, vmax)
+                pos, col = _generate_via_cylinder(
+                    x, y, z_a, z_b, radius, c,
+                    n_segments=self._VIA_CYL_SEGMENTS,
+                )
+            chunks.append((pos, col))
+
+        # For Voltage / Voltage Drop add a filled disk cap at the top and
+        # bottom of the via so the endpoint colour is clearly visible at each
+        # copper-layer junction. The cap colour matches the sampled voltage at
+        # that layer, which is the same value the copper-mesh shader draws at
+        # (x, y) — so any z-fighting with the copper surface is invisible
+        # (both surfaces are the same colour). Caps are omitted for
+        # Current / Power Density because those modes assign per-segment values
+        # rather than per-layer endpoint values.
+        if chunks and mode in ("Voltage", _VOLTAGE_DROP_MODE):
+            _, z_top_cap, v_top_cap = sampled[0]
+            _, z_bot_cap, v_bot_cap = sampled[-1]
+            ct_cap = self._shade(lut, v_top_cap - drop_ref, vmin, vmax)
+            cb_cap = self._shade(lut, v_bot_cap - drop_ref, vmin, vmax)
+            pos_t, col_t = _generate_disk_cap(
+                x, y, z_top_cap, radius, ct_cap,
+                n_segments=self._VIA_CYL_SEGMENTS,
+            )
+            pos_b, col_b = _generate_disk_cap(
+                x, y, z_bot_cap, radius, cb_cap,
+                n_segments=self._VIA_CYL_SEGMENTS,
+            )
+            chunks = [(pos_t, col_t)] + chunks + [(pos_b, col_b)]
+
+        return chunks
+
+    def _via_voltage_kdtree(
+        self, phys_name: str, net_name: str,
+    ) -> tuple | None:
+        """Lazily build (and cache for the viewer's lifetime) a nearest-
+        vertex voltage lookup for the (physical layer, net) solution
+        layer. Returns ``(cKDTree, potentials)`` — a kd-tree of mesh
+        vertex (x, y) positions plus the matching per-vertex potentials —
+        or ``None`` if no such layer exists / its mesh is empty.
+
+        Padne adds via + directive-pin coupling sites to the Triangle
+        mesher as Steiner points, so every point this samples (via
+        centres, resistor pins) IS a mesh vertex — the nearest-vertex
+        potential is then the exact mesh-side voltage there.
+
+        This used to build a matplotlib ``LinearTriInterpolator``, whose
+        implicit ``TrapezoidMapTriFinder`` build is O(seconds) on a large
+        plane (e.g. GND) and froze the GUI for several seconds the first
+        time a heavy rail was shown — the per-(phys, net) cache is why
+        only the *first* toggle stalled. A ``cKDTree`` build is pure C and
+        ~100x faster — the same swap the Vias / Pins report tables
+        already made (see :meth:`_compute_via_report`).
+
+        Orphan vertices — those not referenced by any triangle, which the
+        FEM pins to V=0 to keep the linear system non-singular — are
+        excluded so an off-copper sample never snaps to a fake 0 V node.
+        """
+        key = (phys_name, net_name)
+        if key in self._via_voltage_kdtree_cache:
+            return self._via_voltage_kdtree_cache[key]
+        li = self._index_by_pair.get(key)
+        if li is None:
+            self._via_voltage_kdtree_cache[key] = None
+            return None
+        ls = self.solution.layer_solutions[li]
+        xs_parts: list[np.ndarray] = []
+        ys_parts: list[np.ndarray] = []
+        vs_parts: list[np.ndarray] = []
+        for xys, tris_local, pot in zip(
+            ls.vertex_xys, ls.triangles, ls.potentials,
+        ):
+            if xys.shape[0] == 0 or tris_local.size == 0:
+                continue
+            used = np.unique(tris_local.ravel())
+            xs_parts.append(xys[used, 0])
+            ys_parts.append(xys[used, 1])
+            vs_parts.append(pot[used])
+        if not xs_parts:
+            self._via_voltage_kdtree_cache[key] = None
+            return None
+        from scipy.spatial import cKDTree
+        pts = np.column_stack([
+            np.concatenate(xs_parts), np.concatenate(ys_parts),
+        ])
+        entry = (cKDTree(pts), np.concatenate(vs_parts))
+        self._via_voltage_kdtree_cache[key] = entry
+        return entry
+
+    def _sample_via_voltage(
+        self, phys_name: str, net_name: str, x: float, y: float,
+    ) -> float | None:
+        """Sample the (phys, net) voltage at (x, y) via a nearest mesh-
+        vertex lookup. ``None`` only if the (phys, net) layer doesn't
+        exist or has no mesh.
+
+        For via centres and directive pins the (x, y) IS a mesh vertex
+        (a padne Steiner point), so the nearest vertex is an exact hit.
+        For a point off the solved copper — a stub centroid, or a via in
+        a clearance gap — the nearest mesh vertex on the same net is
+        still the best estimate: the coupling node is always close by,
+        and voltage is near-constant over copper carrying little current.
+        """
+        entry = self._via_voltage_kdtree(phys_name, net_name)
+        if entry is None:
+            return None
+        tree, vs = entry
+        _dist, idx = tree.query((x, y))
+        f = float(vs[int(idx)])
+        return f if np.isfinite(f) else None
+
+    # Colour buckets used by the 2D Via Current marker overlay. 64 is
+    # fine enough that adjacent buckets are visually indistinguishable
+    # at typical zoom, while keeping the number of MarkerGroup draw
+    # calls bounded no matter how many vias the board has.
+    _VIA_CURRENT_BUCKETS: int = 128
+    # Minimum pixel diameter for 2D Via Current markers. When the user
+    # zooms out so far that a via's physical footprint would be
+    # sub-pixel, the marker stays at this floor so vias never shrink
+    # to invisible dots. At those zoom levels markers will overlap —
+    # the user explicitly asked for this trade-off so the heatmap
+    # remains readable.
+    _VIA_MARKER_MIN_PX: float = 6.0
+    # Fallback diameter (mm) for vias with no diameter / hole metadata.
+    # 0.4 mm matches the conservative default used by the cylinder
+    # path's ``_VIA_CYL_MIN_RADIUS_MM``.
+    _VIA_MARKER_FALLBACK_DIAM_MM: float = 0.4
+
+    def _build_via_current_marker_groups(
+        self, target_layer_ids: set[int], rail_members: set[str],
+    ) -> list[MarkerGroup]:
+        """Build a list of MarkerGroups for the 2D Via Current overlay.
+
+        Vias whose span includes a visible layer AND whose net is on
+        the selected rails are looked up in :attr:`_via_current_lookup`
+        for their max-|segment-current|, then bucketed into
+        :data:`_VIA_CURRENT_BUCKETS` colour bins. One MarkerGroup per
+        non-empty bucket gives a heatmap-coloured marker per via with
+        a bounded number of draw calls. Each marker's drawn pixel
+        diameter scales with the via's physical pad diameter (so
+        zooming in reveals the real footprint), floored at
+        :data:`_VIA_MARKER_MIN_PX` (so zooming out doesn't collapse
+        vias into invisible dots).
+        """
+        if not self._via_current_lookup or self.metadata is None:
+            return []
+        lut = _build_cmap_lut(self._cmap_name)
+        vmin = float(self._vmin)
+        vmax = float(self._vmax)
+        if vmax <= vmin:
+            vmax = vmin + 1e-12
+        n_buckets = max(2, int(self._VIA_CURRENT_BUCKETS))
+        # bucket -> list of (x, y, diameter_mm)
+        buckets: dict[int, list[tuple[float, float, float]]] = {}
+        for v in self.metadata.get("vias", []):
+            net = v.get("net", "")
+            if rail_members and net not in rail_members:
+                continue
+            ls_id = v.get("layer_start")
+            le_id = v.get("layer_end")
+            if ls_id is None or le_id is None:
+                continue
+            lo, hi = (ls_id, le_id) if ls_id <= le_id else (le_id, ls_id)
+            if not any(lo <= lid <= hi for lid in target_layer_ids):
+                continue
+            x = float(v.get("x_mm", 0.0))
+            y = float(v.get("y_mm", 0.0))
+            cur = self._via_current_lookup.get((net, x, y))
+            if cur is None:
+                continue
+            t = (cur - vmin) / (vmax - vmin)
+            t = max(0.0, min(1.0, t))
+            bucket = int(round(t * (n_buckets - 1)))
+            # Match the 3D cylinder convention: drill diameter is the
+            # actual current-carrying barrel and the value the FEM
+            # solved with, so the 2D marker tracks the same metric.
+            # Pad diameter (the annular ring) varies more across via
+            # classes — using it makes power vs signal vias look
+            # noticeably different even when their drill bores are
+            # similar. Fall back to pad diameter, then to a sane
+            # default, if drill data is missing.
+            drill = float(v.get("hole_diameter_mm") or 0.0)
+            outer = float(v.get("diameter_mm") or 0.0)
+            diameter_mm = drill if drill > 0.0 else (
+                outer if outer > 0.0 else self._VIA_MARKER_FALLBACK_DIAM_MM
+            )
+            buckets.setdefault(bucket, []).append((x, y, diameter_mm))
+        groups: list[MarkerGroup] = []
+        lut_max = lut.shape[0] - 1
+        bucket_div = max(1, n_buckets - 1)
+        for bucket, items in buckets.items():
+            lut_idx = int(round(bucket / bucket_div * lut_max))
+            r, g, b = int(lut[lut_idx, 0]), int(lut[lut_idx, 1]), int(lut[lut_idx, 2])
+            hex_color = f"#{r:02x}{g:02x}{b:02x}"
+            n = len(items)
+            xs_arr = np.fromiter((it[0] for it in items), dtype=np.float64,
+                                  count=n)
+            ys_arr = np.fromiter((it[1] for it in items), dtype=np.float64,
+                                  count=n)
+            diam_arr = np.fromiter((it[2] for it in items), dtype=np.float64,
+                                    count=n)
+            groups.append(MarkerGroup(
+                xs=xs_arr,
+                ys=ys_arr,
+                color=hex_color,
+                symbol="o",
+                size=8,  # ignored when world_diameters_mm is set
+                edge_color="#000000",
+                edge_width=0.4,
+                world_diameters_mm=diam_arr,
+                min_pixel_diameter=self._VIA_MARKER_MIN_PX,
+            ))
+        return groups
+
+    def _update_markers_and_legend(self, phys_list: list[str],
+                                   rail_names: list[str] | str) -> None:
+        """Build the marker overlay + legend HTML for the current view and
+        push both to the GL viewer.
+
+        Role markers (SOURCE / SINK / SERIES / REGULATOR) and the orange
+        via dots are gated behind the "Show pin markers" checkbox. The
+        Vias-tab "Go" highlight (a yellow ring at
+        :attr:`_highlight_via_xy`) is ALWAYS drawn regardless of that
+        checkbox so the user can still find a via they just jumped to.
+        """
+        groups: list[MarkerGroup] = []
+        legend_rows: list[tuple[str, str, str]] = []
+        # Hover-index for SOURCE/SINK markers is rebuilt from the same
+        # pin walk below, so drop the stale cache up-front.
+        self._marker_hover_index_cache = None
+
+        show_role_markers = self.show_markers_box.isChecked()
+        target_layer_ids: set[int] = set()
+        for phys in phys_list:
+            lid = self._phys_name_to_layer_id.get(phys)
+            if lid is not None:
+                target_layer_ids.add(lid)
+
+        # In 3D mode, each marker needs its layer's z so projection
+        # through the MVP places it on the correct copper plane.
+        in_3d = self.view_3d_box.isChecked()
+        id_to_phys = {v: k for k, v in self._phys_name_to_layer_id.items()}
+        mode = self.mode_combo.currentText()
+        is_via_current = (mode == _VIA_CURRENT_MODE)
+
+        if (show_role_markers and self.metadata is not None
+                and phys_list and target_layer_ids):
+            rail_members = set(self._effective_rail_members(rail_names))
+
+            per_role: dict[str, tuple[list[float], list[float],
+                                        list[float]]] = {}
+            hover_rows: list[dict] = []
+            for d in self.metadata.get("directives", []):
+                role = d.get("role")
+                if role not in self._ROLE_MARKER_STYLE:
+                    continue
+                directive_current = self._directive_current_for_hover(d)
+                directive_label = str(d.get("label") or d.get("designator")
+                                      or "")
+                for term_name, term in (d.get("terminals") or {}).items():
+                    term_pins = term.get("pins") or []
+                    # Per-pin current = directive total / pins in THIS
+                    # terminal. The lumped element couples to each pin in
+                    # a terminal through equal-valued star resistors, so
+                    # with similar copper potentials at the pins the
+                    # current splits evenly. A terminal with no pins
+                    # (multi-channel directives can have empty terminals)
+                    # contributes no markers, so the divisor is never 0.
+                    n_pins = len(term_pins)
+                    if (directive_current is not None
+                            and np.isfinite(directive_current)
+                            and n_pins > 0):
+                        per_pin_current: float | None = (
+                            directive_current / n_pins
+                        )
+                    else:
+                        per_pin_current = None
+                    for pin in term_pins:
+                        lid = pin.get("layer_id")
+                        if lid not in target_layer_ids:
+                            continue
+                        if rail_members and pin.get("net") not in rail_members:
+                            continue
+                        xs, ys, zs = per_role.setdefault(role, ([], [], []))
+                        px = pin.get("x_mm", 0.0)
+                        py = pin.get("y_mm", 0.0)
+                        xs.append(px)
+                        ys.append(py)
+                        phys_for_pin = id_to_phys.get(lid)
+                        zs.append(self._layer_z_for(phys_for_pin)
+                                   if phys_for_pin else 0.0)
+                        if role in ("SOURCE", "SINK"):
+                            hover_rows.append({
+                                "x_mm": float(px),
+                                "y_mm": float(py),
+                                "role": role,
+                                "label": directive_label,
+                                "terminal": term_name,
+                                "net": pin.get("net", ""),
+                                "physical": phys_for_pin or "",
+                                "current_a": per_pin_current,
+                                "directive_current_a": directive_current,
+                                "terminal_pin_count": n_pins,
+                                "size_px": int(
+                                    self._ROLE_MARKER_STYLE[role]["size"]
+                                ),
+                            })
+
+            self._set_marker_hover_rows(hover_rows)
+
+            for role, (xs, ys, zs) in per_role.items():
+                if not xs:
+                    continue
+                style = self._ROLE_MARKER_STYLE[role]
+                groups.append(MarkerGroup(
+                    xs=np.asarray(xs, dtype=np.float64),
+                    ys=np.asarray(ys, dtype=np.float64),
+                    zs=np.asarray(zs, dtype=np.float64),
+                    color=style["color"],
+                    symbol=style["symbol"],
+                    size=int(style["size"]),
+                    edge_color="#000000",
+                    edge_width=0.8,
+                ))
+                legend_rows.append((style["label"], style["symbol"],
+                                     style["color"]))
+
+            # Via *markers* (orange dots) — skipped in 3D where the via
+            # *cylinders* (drawn natively in GL) take over the same role.
+            # Also skipped in Via Current mode — those vias come in via
+            # the per-bucket coloured marker batch below so the 2D view
+            # shows the same heatmap the cylinders show in 3D.
+            if not in_3d and not is_via_current:
+                via_pts: set[tuple[float, float]] = set()
+                for lid in target_layer_ids:
+                    vxs, vys = self._collect_via_positions(lid, rail_members)
+                    for vx, vy in zip(vxs, vys):
+                        via_pts.add((vx, vy))
+                if via_pts:
+                    via_xs = np.fromiter((p[0] for p in via_pts), dtype=np.float64)
+                    via_ys = np.fromiter((p[1] for p in via_pts), dtype=np.float64)
+                    groups.append(MarkerGroup(
+                        xs=via_xs,
+                        ys=via_ys,
+                        color="#ff8c00",
+                        symbol="o",
+                        size=6,
+                        edge_color="#000000",
+                        edge_width=0.4,
+                    ))
+                    legend_rows.append(("VIA", "o", "#ff8c00"))
+
+                # PTH (plated through-hole) markers — same gating, light
+                # grey so they don't compete with the orange via dots.
+                # 3D path uses the cylinder batch instead.
+                pth_pts: set[tuple[float, float]] = set()
+                for lid in target_layer_ids:
+                    pxs, pys = self._collect_pth_positions(lid, rail_members)
+                    for px, py in zip(pxs, pys):
+                        pth_pts.add((px, py))
+                if pth_pts:
+                    pth_xs = np.fromiter((p[0] for p in pth_pts), dtype=np.float64)
+                    pth_ys = np.fromiter((p[1] for p in pth_pts), dtype=np.float64)
+                    groups.append(MarkerGroup(
+                        xs=pth_xs,
+                        ys=pth_ys,
+                        color=self._PTH_COLOR_HEX,
+                        symbol="o",
+                        size=6,
+                        edge_color="#000000",
+                        edge_width=0.4,
+                    ))
+                    legend_rows.append(("PTH", "o", self._PTH_COLOR_HEX))
+
+        # Via Current mode (2D fallback): emit one MarkerGroup per
+        # colour bucket so each via shows its current value. The
+        # scale controller already explains the ramp, so we don't add
+        # legend rows for the bucketed groups.
+        if (is_via_current and not in_3d
+                and target_layer_ids and self.metadata is not None):
+            rail_members = set(self._effective_rail_members(rail_names))
+            groups.extend(self._build_via_current_marker_groups(
+                target_layer_ids, rail_members,
+            ))
+
+        # Jump-highlight ring — always shown, drawn last so it sits on
+        # top of every other marker. In 3D place it on the top of the
+        # stackup (z=0) so it's clearly visible above the via cylinder.
+        if self._highlight_via_xy is not None:
+            hx, hy = self._highlight_via_xy
+            groups.append(MarkerGroup(
+                xs=np.array([hx], dtype=np.float64),
+                ys=np.array([hy], dtype=np.float64),
+                zs=np.array([0.0], dtype=np.float64),
+                color="#ffff00",
+                symbol="o",
+                size=28,
+                edge_color="#000000",
+                edge_width=2.5,
+            ))
+
+        self._gl_viewer.set_markers(groups)
+
+        if legend_rows:
+            rows_html = "".join(
+                "<tr>"
+                f"<td><span style='color:{color}; font-size:11pt;'>"
+                f"{self._LEGEND_GLYPHS.get(symbol, '●')}</span></td>"
+                f"<td style='padding-left:6px;'>{_esc(lbl)}</td>"
+                "</tr>"
+                for lbl, symbol, color in legend_rows
+            )
+            self._legend_html = f"<table style='border-spacing:0;'>{rows_html}</table>"
+        else:
+            self._legend_html = ""
+        self._gl_viewer.set_overlay_top_right(self._legend_html)
+
+    # --- CAD-style fixed-scale viewport (via GLMeshViewer) -----------------
+
+    def _fit_board_to_canvas(self, x_min: float, x_max: float,
+                             y_min: float, y_max: float) -> None:
+        """Pick the largest mm-per-pixel that still fits the board into the
+        current GL canvas, with a small margin, and apply it centred on the
+        board. Guarded against re-entry from the synchronous ``viewChanged``
+        signal that ``fit_to_data`` emits.
+        """
+        if self._gl_viewer is None:
+            return
+        self._suppress_view_changed = True
+        try:
+            self._gl_viewer.fit_to_data(padding=1.05)
+            _, _, self._mm_per_pixel = self._gl_viewer.view_center_scale()
+        finally:
+            self._suppress_view_changed = False
+        self._need_initial_fit = False
+
+    def _on_gl_view_changed(self) -> None:
+        """GLMeshViewer fired a view-change (pan/zoom/resize) signal.
+
+        Two cases:
+
+        * **Deferred initial fit**: ``_render`` ran before Qt had sized
+          the widget, so the initial ``_fit_board_to_canvas`` used a
+          stale size. The first real resize triggers this signal — we
+          re-fit now that ``self.width()/height()`` are correct.
+        * **User pan / zoom / window resize**: just cache the new
+          mm-per-pixel so future code (e.g. window-resize handlers) can
+          preserve the user's chosen zoom CAD-style.
+        """
+        if self._suppress_view_changed or self._gl_viewer is None:
+            return
+        if self._need_initial_fit and self._data_bounds is not None:
+            x_min, x_max, y_min, y_max = self._data_bounds
+            self._fit_board_to_canvas(x_min, x_max, y_min, y_max)
+            return
+        _, _, mpp = self._gl_viewer.view_center_scale()
+        if mpp > 0:
+            self._mm_per_pixel = mpp
+        # Arrows are anchored to layer bounds (not screen pixels), so
+        # pan / zoom / 3D dolly don't change their world-space positions
+        # — no rebuild needed on view change.
+
+    def _on_arrows_toggled(self, _checked: bool) -> None:
+        """Arrow checkbox flipped — push the overlay (or clear it).
+        Cheap; doesn't trigger a full _render."""
+        self._refresh_arrows()
+
+    def _on_arrow_density_changed(self, value: int) -> None:
+        """Live update of the arrow-density label, with a debounced
+        rebuild so dragging the slider doesn't trigger a full meshgrid
+        + trifinder pass on every intermediate value."""
+        self.arrow_spacing_label.setText(f"Arrow density: {value}")
+        if (not self.show_arrows_box.isChecked()
+                or self._gl_viewer is None):
+            return
+        from PySide6.QtCore import QTimer
+        timer = getattr(self, "_arrow_density_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._refresh_arrows)
+            self._arrow_density_timer = timer
+        timer.start(80)
+
+    def _collect_via_positions(self, target_layer_id: int | None,
+                               rail_members: set[str],
+                               ) -> tuple[list[float], list[float]]:
+        """Vias whose span includes ``target_layer_id`` AND whose net is in
+        ``rail_members``. Returns parallel xs/ys lists for ``ax.scatter``."""
+        if target_layer_id is None or self.metadata is None:
+            return [], []
+        xs: list[float] = []
+        ys: list[float] = []
+        for v in self.metadata.get("vias", []):
+            ls = v.get("layer_start")
+            le = v.get("layer_end")
+            if ls is None or le is None:
+                continue
+            lo, hi = (ls, le) if ls <= le else (le, ls)
+            if not (lo <= target_layer_id <= hi):
+                continue
+            if rail_members and v.get("net") not in rail_members:
+                continue
+            xs.append(v.get("x_mm", 0.0))
+            ys.append(v.get("y_mm", 0.0))
+        return xs, ys
+
+    def _collect_pth_positions(self, target_layer_id: int | None,
+                               rail_members: set[str],
+                               ) -> tuple[list[float], list[float]]:
+        """Plated-through-hole pads whose span includes ``target_layer_id``
+        AND whose net is in ``rail_members``. Mirrors
+        :meth:`_collect_via_positions`; PTHs span the full enabled stack so
+        every visible copper layer hits the same set of pads (the marker-
+        builder dedups across layers)."""
+        if target_layer_id is None or self.metadata is None:
+            return [], []
+        xs: list[float] = []
+        ys: list[float] = []
+        for p in self.metadata.get("pths", []):
+            ls = p.get("layer_start")
+            le = p.get("layer_end")
+            if ls is None or le is None:
+                continue
+            lo, hi = (ls, le) if ls <= le else (le, ls)
+            if not (lo <= target_layer_id <= hi):
+                continue
+            if rail_members and p.get("net") not in rail_members:
+                continue
+            xs.append(p.get("x_mm", 0.0))
+            ys.append(p.get("y_mm", 0.0))
+        return xs, ys
+
+    def _on_colormap_changed(self, cmap_name: str) -> None:
+        """The colour-scale dropdown picked a new scheme. Recolour every
+        heatmapped surface — *without* the full :meth:`_render` rebuild.
+
+        A scheme change touches no geometry and no scalar values: the
+        copper mesh recolours on the GPU straight from the 1-D LUT texture
+        (the ``set_colormap`` push below), and the gradient strip is
+        repainted by the ScaleController itself. The only CPU-side work
+        left is re-baking the overlays that carry baked LUT colours — stub
+        copper, series bars and (in 3D / Via Current) the via cylinders —
+        which :meth:`_recolor_overlays` handles. Skipping ``_render`` here
+        avoids rebuilding the rail mesh batch, re-uploading the vertex
+        buffers and recomputing the colour-scale range on every toggle.
+
+        In Via Current mode the copper keeps its flat-grey LUT
+        (``_gl_cmap_kind == "neutral"``) — only the via overlays recolour.
+        """
+        if cmap_name == self._cmap_name:
+            return
+        self._cmap_name = cmap_name
+        # Re-push the copper-mesh LUT when the data ramp is the live one.
+        # _ensure_gl_cmap would no-op here (kind unchanged), so push direct.
+        if self._gl_cmap_kind == "data" and self._gl_viewer is not None:
+            self._gl_viewer.set_colormap(_build_cmap_lut(self._cmap_name))
+        self._recolor_overlays()
+
+    def _recolor_overlays(self) -> None:
+        """Re-push only the overlays whose colours are baked CPU-side from
+        the active colour scheme: stub copper, series-component bars and
+        (in 3D / Via Current) the via cylinders.
+
+        This is the colour-scheme counterpart of
+        :meth:`_reshade_baked_via_overlays` (used by the scale-slider
+        path); it additionally covers the stub and series-bar overlays,
+        which also carry baked LUT colours. The copper mesh is *not*
+        touched here — it recolours from the GPU LUT texture alone.
+        """
+        if self._gl_viewer is None:
+            return
+        phys_list, rails, mode = self._current_selection()
+        if not phys_list or not rails:
+            return
+        is_via_current = (mode == _VIA_CURRENT_MODE)
+        # 2D Via Current bakes its per-via colours into the marker
+        # overlay, which only refreshes cleanly through the full render
+        # path (same reason _reshade_baked_via_overlays falls back here).
+        if is_via_current and not self.view_3d_box.isChecked():
+            self._render()
+            return
+        drop_reference = self._last_drop_reference
+        # Stub copper carries baked LUT colours only when "colour by V"
+        # is active; otherwise it's flat grey and the scheme change can't
+        # touch it — skip the (geometry-rebuilding) re-push in that case.
+        if self._stubs_coloured_by_voltage(mode):
+            self._push_stubs(phys_list, rails, mode=mode,
+                             drop_reference=drop_reference)
+        # Series-component bars always carry a baked LUT gradient.
+        self._push_series_bars(phys_list, rails, mode,
+                               drop_reference=drop_reference)
+        # Via cylinders (3D) carry baked LUT colours only when the
+        # heatmap is painted onto them — Via Current mode, or any mode
+        # with the Heatmap-vias toggle on. Otherwise they're solid orange.
+        heatmap_vias = (
+            getattr(self, "heatmap_vias_box", None) is not None
+            and self.heatmap_vias_box.isChecked()
+        )
+        if self.view_3d_box.isChecked() and (is_via_current or heatmap_vias):
+            self._push_via_cylinders(phys_list, rails, mode=mode)
+
+    def _on_scale_range_changed(self, vmin: float, vmax: float) -> None:
+        """ScaleController emitted a new clamp — push it to the GL viewer
+        as a uniform update. Instant for the copper mesh (just a uniform);
+        the via overlays in Via Current mode and the cylinder heatmap in
+        other modes hold per-vertex baked colours that *don't* react to
+        the uniform, so when one of those is active we also re-bake the
+        affected overlay against the new range."""
+        if vmax <= vmin:
+            vmax = vmin + 1e-12
+        self._vmin, self._vmax = vmin, vmax
+        if self._gl_viewer is not None:
+            # GL values were uploaded in _gl_scale space — the level
+            # clamp must travel through the same transform to match.
+            self._gl_viewer.set_levels(float(self._gl_scale(vmin)),
+                                        float(self._gl_scale(vmax)))
+        self._reshade_baked_via_overlays()
+
+    def _reshade_baked_via_overlays(self) -> None:
+        """Re-push the via cylinders / 2D markers when their colours
+        come from a baked LUT lookup (Via Current mode, or any other
+        mode with the Heatmap-vias toggle on). Called after the user
+        manipulates the scale slider, since the GL viewer's levels
+        uniform only re-shades the copper mesh.
+
+        2D Via Current goes through the full :meth:`_render` so the
+        marker overlay refreshes via the same path the 2D↔3D toggle
+        uses — calling just :meth:`_update_markers_and_legend` in
+        isolation wasn't enough on some Qt builds (the paint event
+        coalesced behind the GL viewer's pending state and the
+        markers stayed at their previous colours until something
+        heavier kicked a full repaint).
+        """
+        mode = self.mode_combo.currentText()
+        is_via_current = (mode == _VIA_CURRENT_MODE)
+        heatmap_vias = (getattr(self, "heatmap_vias_box", None) is not None
+                        and self.heatmap_vias_box.isChecked())
+        if not (is_via_current or heatmap_vias):
+            return
+        phys_list, rails, _ = self._current_selection()
+        if not phys_list or not rails:
+            return
+        if self.view_3d_box.isChecked():
+            self._push_via_cylinders(phys_list, rails, mode=mode)
+        elif is_via_current:
+            self._render()
+
+    # --- Mouse hover (GLMeshViewer signal) ----------------------------------
+
+    # --- 3D view toggle ------------------------------------------------------
+
+    # Fallback uniform spacing (mm) when the stackup metadata doesn't
+    # carry per-layer thicknesses. Used only when ``_phys_z_mm`` lacks
+    # an entry for the requested layer.
+    _LAYER_Z_SPACING_MM: float = 0.4
+    # Copper "plate" thickness in 3D mode (pre-exaggeration mm). Picked
+    # at ~25% of the layer spacing so the copper looks like a visible
+    # plate from oblique angles without dominating the layer gaps.
+    # Each layer's flat mesh is extruded into a prism of this thickness
+    # in 3D; 2D mode renders the flat mesh untouched.
+    _COPPER_THICKNESS_MM: float = 0.0025
+
+    def _layer_z_for(self, phys: str) -> float:
+        """World-z (in mm, pre-exaggeration) for a given physical layer.
+        Top of the stackup is z=0; lower layers go negative. Prefers the
+        cumulative copper + dielectric centreline from the stackup
+        metadata; falls back to rank × ``_LAYER_Z_SPACING_MM`` only when
+        the layer is missing from the stackup."""
+        z = self._phys_z_mm.get(phys)
+        if z is not None:
+            return z
+        rank = self._phys_stackup_rank.get(phys, 0)
+        return -rank * self._LAYER_Z_SPACING_MM
+
+    def _on_view_3d_toggled(self, checked: bool) -> None:
+        """Switch the GL viewer between 2D and 3D modes and re-render so
+        the per-vertex z values get re-built for the new mode (zeros in
+        2D, layer-rank-derived in 3D).
+
+        The ``_preserve_view_on_toggle`` flag (set by the Ctrl+Alt+2/3
+        hotkeys) tells us the GL viewer's mode has already been switched
+        via :meth:`gl_mesh_viewer.set_view_mode_preserving` — skip the
+        standard re-fit path so the preserved camera survives.
+        """
+        if not getattr(self, "_preserve_view_on_toggle", False):
+            self._gl_viewer.set_view_mode("3d" if checked else "2d")
+        # _render rebuilds arrows internally so they get re-emitted with
+        # (N, 3) z-lifted vertices in 3D or flat (N, 2) in 2D.
+        self._render()
+
+    def _on_layer_spacing_changed(self, value: int) -> None:
+        """Live update of the 3D vertical-exaggeration uniform — affects
+        both the mesh-layer separation and the via cylinder length.
+        Cheap (one uniform), no mesh rebuild, so dragging stays smooth."""
+        self._gl_viewer.set_vertical_exaggeration(float(value))
+        self.layer_spacing_label.setText(f"Layer spacing: {value}×")
+
+    # --- Keyboard hotkeys ---------------------------------------------------
+
+    def _install_hotkeys(self) -> None:
+        """Window-scoped keyboard shortcuts. ``Qt.WindowShortcut`` so they
+        fire whenever the viewer window has focus but defer to the text
+        boxes (Min/Max scale, etc.) when one of them has focus."""
+        bindings = (
+            ("2", self._hotkey_2d_mode),
+            ("3", self._hotkey_3d_mode),
+            ("Ctrl+Alt+2", self._hotkey_2d_mode_preserving),
+            ("Ctrl+Alt+3", self._hotkey_3d_mode_preserving),
+            ("0", self._hotkey_reset_3d_view),
+            ("O", self._hotkey_toggle_outlines),
+            ("P", self._hotkey_toggle_pads),
+            ("C", self._hotkey_toggle_all_copper),
+            ("I", self._hotkey_toggle_markers),
+            ("R", self._hotkey_toggle_rail_only),
+            ("T", self._hotkey_toggle_cursor_tooltip),
+            ("A", self._hotkey_toggle_arrows),
+            ("V", self._hotkey_toggle_heatmap_vias),
+            ("M", self._hotkey_cycle_mode),
+            ("Shift+M", self._hotkey_cycle_mode_reverse),
+            ("H", self._hotkey_cycle_colormap),
+            ("Shift+H", self._hotkey_cycle_colormap_reverse),
+            ("B", self._toggle_sidebar),
+        )
+        # Hold references so the shortcuts don't get garbage-collected.
+        self._hotkey_shortcuts = []
+        for key, slot in bindings:
+            sc = QShortcut(QKeySequence(key), self)
+            sc.activated.connect(slot)
+            self._hotkey_shortcuts.append(sc)
+
+    def _toggle_sidebar(self) -> None:
+        """Show / hide the heatmap-tab side panel so the user can give the
+        viewport the panel's 260px of horizontal real estate. The slim
+        toggle button between the panel and the plot stays visible either
+        way, and its triangle flips ▶ / ◀ to mirror the new state."""
+        was_visible = self._sidebar_scroll.isVisible()
+        self._sidebar_scroll.setVisible(not was_visible)
+        self._sidebar_toggle_btn.setCollapsed(was_visible)
+
+    def _hotkey_2d_mode(self) -> None:
+        self.view_3d_box.setChecked(False)
+
+    def _hotkey_3d_mode(self) -> None:
+        self.view_3d_box.setChecked(True)
+
+    def _hotkey_2d_mode_preserving(self) -> None:
+        """Switch to 2D while keeping the same world region framed —
+        the 3D look-at point becomes the 2D centre, camera distance
+        becomes mm-per-pixel via the perspective FOV."""
+        if not self.view_3d_box.isChecked():
+            return
+        self._gl_viewer.set_view_mode_preserving("2d")
+        self._preserve_view_on_toggle = True
+        try:
+            self.view_3d_box.setChecked(False)
+        finally:
+            self._preserve_view_on_toggle = False
+
+    def _hotkey_3d_mode_preserving(self) -> None:
+        """Switch to 3D while keeping the same world region framed —
+        the 2D centre becomes the look-at point and the camera enters
+        top-down at a distance that matches the 2D mm-per-pixel."""
+        if self.view_3d_box.isChecked():
+            return
+        self._gl_viewer.set_view_mode_preserving("3d")
+        self._preserve_view_on_toggle = True
+        try:
+            self.view_3d_box.setChecked(True)
+        finally:
+            self._preserve_view_on_toggle = False
+
+    def _hotkey_reset_3d_view(self) -> None:
+        """No-op in 2D — '0' only resets the view when the user is
+        actually looking at the 3D model."""
+        if self.view_3d_box.isChecked():
+            self._gl_viewer.reset_3d_view()
+
+    def _hotkey_toggle_outlines(self) -> None:
+        self.show_outlines_box.toggle()
+
+    def _hotkey_toggle_pads(self) -> None:
+        self.show_pads_box.toggle()
+
+    def _hotkey_toggle_all_copper(self) -> None:
+        self.show_all_copper_box.toggle()
+
+    def _hotkey_toggle_markers(self) -> None:
+        self.show_markers_box.toggle()
+
+    def _hotkey_toggle_rail_only(self) -> None:
+        self.rail_only_box.toggle()
+
+    def _hotkey_toggle_cursor_tooltip(self) -> None:
+        self.cursor_tooltip_box.toggle()
+
+    def _hotkey_toggle_arrows(self) -> None:
+        self.show_arrows_box.toggle()
+
+    def _hotkey_toggle_heatmap_vias(self) -> None:
+        self.heatmap_vias_box.toggle()
+
+    def _hotkey_cycle_mode(self) -> None:
+        self._cycle_mode(+1)
+
+    def _hotkey_cycle_mode_reverse(self) -> None:
+        self._cycle_mode(-1)
+
+    def _cycle_mode(self, step: int) -> None:
+        count = self.mode_combo.count()
+        if count == 0:
+            return
+        idx = (self.mode_combo.currentIndex() + step) % count
+        self.mode_combo.setCurrentIndex(idx)
+
+    def _hotkey_cycle_colormap(self) -> None:
+        self._cycle_colormap(+1)
+
+    def _hotkey_cycle_colormap_reverse(self) -> None:
+        self._cycle_colormap(-1)
+
+    def _cycle_colormap(self, step: int) -> None:
+        """Step the heatmap colour-scheme dropdown forward / backward,
+        wrapping at the ends. Setting the index drives the same
+        currentIndexChanged path a dropdown click uses, so the gradient
+        strip and viewport recolour automatically."""
+        combo = self.scale_controller.cmap_combo
+        count = combo.count()
+        if count == 0:
+            return
+        idx = (combo.currentIndex() + step) % count
+        combo.setCurrentIndex(idx)
+
+    def _on_gl_clicked(self, _world_x: float, _world_y: float) -> None:
+        """Left-click in the viewport (no drag) → clear the Vias-tab
+        jump highlight if it's currently shown. No-op otherwise."""
+        if self._highlight_via_xy is not None:
+            self._highlight_via_xy = None
+            self._render()
+
+    # --- Voltage-difference (Shift-drag) tool -------------------------------
+    #
+    # When the user holds Shift while hovering copper in either Voltage or
+    # Voltage Drop mode, an anchor is captured at the cursor and a thin
+    # white line is drawn from there to the live cursor position. The
+    # status-bar probe label gains a "Difference = X V" suffix that
+    # reports the live cursor's voltage minus the anchor voltage. The
+    # over-copper / mode checks happen exactly once on shift-press — once
+    # the tool is active, the line tracks the cursor regardless of where
+    # it ends up.
+
+    def eventFilter(self, obj, event) -> bool:
+        """Application-wide hook for Shift press/release. Filter is
+        installed on the QApplication so we see modifier-key events
+        regardless of which child widget has focus — required because
+        Qt only dispatches key events to the focused widget by default,
+        and the GL viewer doesn't get focus until the user clicks it.
+
+        Auto-repeat suppression keeps a held key from re-anchoring on
+        every OS keyboard-repeat tick. The window-deactivate branch is
+        a safety net for Alt-Tab — the user releases Shift in another
+        window, our window never sees the release event, so we treat
+        any deactivate while the tool is active as an implicit release.
+        """
+        et = event.type()
+        if et == QEvent.KeyPress and event.key() == Qt.Key_Shift:
+            if (not event.isAutoRepeat()
+                    and self.isActiveWindow()):
+                self._on_shift_pressed()
+        elif et == QEvent.KeyRelease and event.key() == Qt.Key_Shift:
+            if (not event.isAutoRepeat()
+                    and self._measure_anchor_xy is not None):
+                self._on_shift_released()
+        elif et == QEvent.WindowDeactivate and obj is self:
+            if self._measure_anchor_xy is not None:
+                self._on_shift_released()
+        elif et == QEvent.Resize and obj is getattr(self, "_gl_viewer", None):
+            # Keep the colour-scale overlay pinned bottom-left as the GL
+            # viewer resizes (window resize, sidebar collapse, etc.).
+            self._position_scale_overlay()
+        return False
+
+    def _position_scale_overlay(self) -> None:
+        """Pin the heatmap colour-scale strip to the GL viewer's
+        bottom-left corner. Safe to call before the overlay / viewer
+        exist (no-op) — wired to every GL-viewer resize via
+        :meth:`eventFilter`."""
+        bar = getattr(self, "_scale_overlay", None)
+        gl = getattr(self, "_gl_viewer", None)
+        if bar is None or gl is None:
+            return
+        margin = 12
+        y = gl.height() - bar.height() - margin
+        bar.move(margin, max(margin, y))
+        bar.raise_()
+
+    def closeEvent(self, event) -> None:
+        """Uninstall the application-wide Shift filter on window close
+        so QApplication doesn't keep dispatching events at a dangling
+        Python object."""
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+        super().closeEvent(event)
+
+    def _on_shift_pressed(self) -> None:
+        mode = self.mode_combo.currentText()
+        if mode not in ("Voltage", _VOLTAGE_DROP_MODE):
+            return
+        # 2D only. In 3D the anchor would sit on a specific layer's z
+        # plane but the cursor's "current voltage" comes from a ray-pick
+        # that can land on a different layer — the resulting difference
+        # would mix two unrelated readings.
+        if self.view_3d_box.isChecked():
+            return
+        if not self._layer_probes:
+            return
+        # Probe the live cursor position (rather than the last hover
+        # event) so the anchor reflects exactly where the user pressed
+        # Shift, even if the throttled hover handler hasn't fired since.
+        local = self._gl_viewer.mapFromGlobal(QCursor.pos())
+        if not (0 <= local.x() < self._gl_viewer.width()
+                and 0 <= local.y() < self._gl_viewer.height()):
+            return
+        hit = self._probe_voltage_at_pixel(local.x(), local.y())
+        if hit is None:
+            return
+        voltage, world_xy = hit
+        self._measure_anchor_xy = world_xy
+        self._measure_anchor_voltage = float(voltage)
+        # Seed the line with a zero-length segment so it appears at the
+        # anchor immediately; subsequent mouse moves grow the far endpoint.
+        self._gl_viewer.set_measurement_line(
+            world_xy[0], world_xy[1], world_xy[0], world_xy[1],
+        )
+
+    def _on_shift_released(self) -> None:
+        if self._measure_anchor_xy is None:
+            return
+        self._measure_anchor_xy = None
+        self._measure_anchor_voltage = None
+        self._gl_viewer.clear_measurement_line()
+
+    def _probe_voltage_at_pixel(
+        self, x_px: float, y_px: float,
+    ) -> tuple[float, tuple[float, float]] | None:
+        """Return ``(voltage_V, (world_x, world_y))`` for the cursor at
+        ``(x_px, y_px)`` in widget-logical pixels, or ``None`` if there's
+        no copper / no usable voltage at that point. Uses the same FEM
+        probe + stub-fallback flow as :meth:`_on_gl_mouse_hovered` so
+        anything the status bar shows a voltage for is a valid anchor."""
+        is_3d = self.view_3d_box.isChecked()
+        if is_3d:
+            hit = self._probe_at_point_3d(x_px, y_px)
+            if hit is not None:
+                v, lp = hit
+                z = self._layer_z_for(lp.get("physical", ""))
+                wx, wy = self._gl_viewer.screen_to_world_at_z(x_px, y_px, z)
+                return float(v), (wx, wy)
+            stub_hit = self._probe_at_stub_3d(x_px, y_px)
+            if stub_hit is not None and stub_hit[0] is not None:
+                phys = stub_hit[1].get("physical", "")
+                z = self._layer_z_for(phys)
+                wx, wy = self._gl_viewer.screen_to_world_at_z(x_px, y_px, z)
+                return float(stub_hit[0]), (wx, wy)
+            return None
+        wx, wy = self._gl_viewer.screen_to_world(x_px, y_px)
+        hit = self._probe_at_point(wx, wy)
+        if hit is not None:
+            return float(hit[0]), (wx, wy)
+        stub_hit = self._probe_at_stub(wx, wy)
+        if stub_hit is not None and stub_hit[0] is not None:
+            return float(stub_hit[0]), (wx, wy)
+        return None
+
+    def _apply_measurement_difference(
+        self, world_x: float, world_y: float,
+        current_voltage: float | None,
+    ) -> str:
+        """If the Shift-drag tool is active, update the overlay line to
+        span from the anchor to ``(world_x, world_y)`` and return the
+        ``"   Difference = X V"`` suffix to append to the status-bar
+        text. Returns an empty string when no measurement is in
+        progress, or cancels the measurement if the active mode is no
+        longer Voltage / Voltage Drop."""
+        if self._measure_anchor_xy is None or self._measure_anchor_voltage is None:
+            return ""
+        if (self.mode_combo.currentText() not in ("Voltage", _VOLTAGE_DROP_MODE)
+                or self.view_3d_box.isChecked()):
+            self._on_shift_released()
+            return ""
+        ax, ay = self._measure_anchor_xy
+        self._gl_viewer.set_measurement_line(ax, ay, world_x, world_y)
+        if current_voltage is None or not np.isfinite(current_voltage):
+            return "   Difference = (n/a)"
+        diff = float(current_voltage) - self._measure_anchor_voltage
+        return f"   Difference = {diff:.5g} V"
+
+    def _on_gl_mouse_hovered(self, world_x: float, world_y: float,
+                             inside: bool) -> None:
+        """GLMeshViewer reported a mouse-move at world coords (mm).
+
+        Throttled to :data:`HOVER_THROTTLE_S` so a high-DPI mouse doesn't
+        flood the CPU. Skipped during drag (the GLMeshViewer is panning,
+        so probe values would be meaningless mid-drag anyway).
+
+        2D mode: the signal's (world_x, world_y) is the answer — walk the
+        cached probe list top-first and report the first layer whose
+        copper covers it. 3D mode: a single screen pixel maps to a whole
+        camera ray, so the same pixel hits different (x, y) at each
+        layer's z. We re-unproject per layer using the GL viewer's MVP
+        inverse, and report the topmost layer whose copper covers the
+        ray's intersection with that layer's z plane.
+        """
+        if QApplication.mouseButtons() != Qt.NoButton:
+            return
+        if not inside:
+            self.probe_label_widget.setText("Hover the plot to probe values")
+            self._hide_cursor_tooltip()
+            return
+        now = time.monotonic()
+        # Use the tighter throttle while the cursor tooltip is on — it
+        # visibly tracks the mouse, so any stutter is jarring. The bottom
+        # probe label is more forgiving, so the default 30 Hz is fine.
+        throttle = (CURSOR_TOOLTIP_THROTTLE_S
+                    if self.cursor_tooltip_box.isChecked()
+                    else HOVER_THROTTLE_S)
+        if now - self._last_probe_at < throttle:
+            return
+        self._last_probe_at = now
+        if not self._layer_probes:
+            self.probe_label_widget.setText("Hover the plot to probe values")
+            self._hide_cursor_tooltip()
+            return
+        if self.view_3d_box.isChecked():
+            px, py = self._gl_viewer.last_hover_pixel()
+            hit = self._probe_at_point_3d(px, py)
+            if hit is not None:
+                _, lp = hit
+                z = self._layer_z_for(lp.get("physical", ""))
+                world_x, world_y = self._gl_viewer.screen_to_world_at_z(
+                    px, py, z)
+        else:
+            hit = self._probe_at_point(world_x, world_y)
+        if hit is None:
+            # Fall back to stub (no-current copper) probe.
+            if self.view_3d_box.isChecked():
+                px_, py_ = self._gl_viewer.last_hover_pixel()
+                stub_hit = self._probe_at_stub_3d(px_, py_)
+            else:
+                stub_hit = self._probe_at_stub(world_x, world_y)
+            via_row = self._pick_hovered_via(world_x, world_y)
+            via_part = (self._format_via_hover_text(via_row)
+                        if via_row is not None else "")
+            marker_row = self._pick_hovered_marker(world_x, world_y)
+            marker_part = (self._format_marker_hover_text(marker_row)
+                           if marker_row is not None else "")
+            if stub_hit is not None:
+                v_stub, stub_info = stub_hit
+                net_part = (f"   Net = {stub_info['net']}"
+                            if stub_info.get("net") else "")
+                layer_part = (f"   Layer = {stub_info['physical']}"
+                              if stub_info.get("physical") else "")
+                v_part = (f"   Voltage ≈ {v_stub:.5g} V   (no current)"
+                          if v_stub is not None else "   (no current)")
+                diff_part = self._apply_measurement_difference(
+                    world_x, world_y, v_stub,
+                )
+                self.probe_label_widget.setText(
+                    f"x = {world_x:>8.3f} mm   y = {world_y:>8.3f} mm"
+                    f"{v_part}{net_part}{layer_part}"
+                    f"{via_part}{marker_part}{diff_part}"
+                )
+                self._update_cursor_tooltip((v_stub, stub_info),
+                                            via_row=via_row,
+                                            marker_row=marker_row)
+                return
+            diff_part = self._apply_measurement_difference(
+                world_x, world_y, None,
+            )
+            self.probe_label_widget.setText(
+                f"x = {world_x:>8.3f} mm   y = {world_y:>8.3f} mm   "
+                f"(no copper at this point){via_part}{marker_part}{diff_part}"
+            )
+            self._update_cursor_tooltip(None, via_row=via_row,
+                                        marker_row=marker_row)
+            return
+        v_float, lp = hit
+        net_part = f"   Net = {lp['net']}" if lp.get("net") else ""
+        layer_part = (f"   Layer = {lp['physical']}"
+                      if lp.get("physical") else "")
+        via_row = self._pick_hovered_via(world_x, world_y)
+        via_part = (self._format_via_hover_text(via_row)
+                    if via_row is not None else "")
+        marker_row = self._pick_hovered_marker(world_x, world_y)
+        marker_part = (self._format_marker_hover_text(marker_row)
+                       if marker_row is not None else "")
+        diff_part = self._apply_measurement_difference(
+            world_x, world_y, v_float,
+        )
+        self.probe_label_widget.setText(
+            f"x = {world_x:>8.3f} mm   y = {world_y:>8.3f} mm   "
+            f"{self._probe_label} = {v_float:.5g} {self._probe_unit}"
+            f"{net_part}{layer_part}{via_part}{marker_part}{diff_part}"
+        )
+        self._update_cursor_tooltip((v_float, lp), via_row=via_row,
+                                    marker_row=marker_row)
+
+    def _on_cursor_tooltip_toggled(self, checked: bool) -> None:
+        """Hide the tooltip when turned off; immediately show it at the
+        current cursor position when turned on, so the user doesn't have
+        to wiggle the mouse to "wake it up"."""
+        if not checked:
+            self._hide_cursor_tooltip()
+            return
+        # Synthesize a hover event at the cursor's current position so
+        # the tooltip appears immediately. Skip silently if the cursor
+        # isn't over the GL viewport.
+        local = self._gl_viewer.mapFromGlobal(QCursor.pos())
+        if not (0 <= local.x() < self._gl_viewer.width()
+                and 0 <= local.y() < self._gl_viewer.height()):
+            return
+        # Seed the GL viewer's last-hover pixel so the 3D-mode per-layer
+        # picker has a fresh value to unproject (it normally lags one
+        # real mouse-move behind, but here we haven't had one yet).
+        self._gl_viewer.set_last_hover_pixel(local.x(), local.y())
+        wx, wy = self._gl_viewer.screen_to_world(local.x(), local.y())
+        # Bypass the throttle so the synthetic probe runs even if a
+        # real hover fired within the last few ms.
+        self._last_probe_at = 0.0
+        self._on_gl_mouse_hovered(wx, wy, True)
+
+    # --- Cursor tooltip (custom floating label) -----------------------------
+    #
+    # Qt's QToolTip has built-in re-use / debouncing logic that makes
+    # showText calls stutter when the content barely changes from one
+    # frame to the next — the tooltip "sticks" instead of tracking the
+    # cursor. We sidestep that entirely by drawing our own frameless
+    # label that we move() ourselves every hover event.
+
+    def _ensure_cursor_tooltip_label(self) -> QLabel:
+        """Lazily build the floating QLabel used as the cursor tooltip."""
+        label = getattr(self, "_cursor_tooltip_label", None)
+        if label is not None:
+            return label
+        # Qt.ToolTip = frameless, no focus, stays above its parent window.
+        # WA_TransparentForMouseEvents so we never steal hover events
+        # from the GL viewer when the label happens to slide under the
+        # cursor at the screen edge.
+        label = QLabel(self._gl_viewer, Qt.ToolTip | Qt.FramelessWindowHint)
+        label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        label.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        label.setFocusPolicy(Qt.NoFocus)
+        _t = _T()
+        label.setStyleSheet(
+            "QLabel {"
+            f" background-color: {_t['bg']};"
+            f" color: {_t['fg']};"
+            f" border: 1px solid {_t['border']};"
+            " padding: 4px 8px;"
+            " font-family: Consolas, monospace;"
+            " font-size: 9pt;"
+            "}"
+        )
+        label.hide()
+        self._cursor_tooltip_label = label
+        return label
+
+    def _hide_cursor_tooltip(self) -> None:
+        label = getattr(self, "_cursor_tooltip_label", None)
+        if label is not None and label.isVisible():
+            label.hide()
+
+    def _update_cursor_tooltip(
+        self, hit: tuple[float | None, dict] | None,
+        via_row: dict | None = None,
+        marker_row: dict | None = None,
+    ) -> None:
+        """Show/move/hide the at-cursor tooltip based on the checkbox.
+        ``hit`` is ``(value, probe)`` from :meth:`_probe_at_point` (solved
+        copper) or ``_probe_at_stub`` (no-current copper), or ``None`` if
+        the cursor is over bare substrate.  For stub hits ``value`` may be
+        ``None`` and the probe dict carries ``is_stub=True``.
+
+        ``via_row`` is the Vias-tab row dict for the via under the
+        cursor, or ``None``. When non-None, the tooltip appends per-via
+        current / voltage lines — and stays visible even when ``hit`` is
+        ``None`` (e.g. in 3D when the user is hovering a via barrel
+        between visible copper layers, where there is no per-pixel
+        copper probe to drive the rest of the tooltip).
+
+        ``marker_row`` is the SOURCE/SINK marker row under the cursor,
+        or ``None``. Same any-of-three rule applies — the tooltip stays
+        visible while the user is parked on a marker, even when not
+        over copper."""
+        if not self.cursor_tooltip_box.isChecked() \
+                or (hit is None and via_row is None and marker_row is None):
+            self._hide_cursor_tooltip()
+            return
+        lines: list[str] = []
+        if hit is not None:
+            v_float, lp = hit
+            if lp.get("is_stub"):
+                if v_float is not None:
+                    lines.append(f"Voltage ≈ {v_float:.5g} V")
+                lines.append("(no current)")
+            else:
+                lines.append(
+                    f"{self._probe_label}: {v_float:.5g} {self._probe_unit}"
+                )
+            if lp.get("net"):
+                lines.append(f"Net: {lp['net']}")
+            if lp.get("physical"):
+                lines.append(f"Layer: {lp['physical']}")
+        if via_row is not None:
+            cur = via_row.get("current")
+            if cur is not None and np.isfinite(cur):
+                lines.append(f"Via current: {cur:.4g} A")
+        if marker_row is not None:
+            lines.extend(self._format_marker_tooltip_lines(marker_row))
+        if not lines:
+            self._hide_cursor_tooltip()
+            return
+        label = self._ensure_cursor_tooltip_label()
+        label.setText("\n".join(lines))
+        label.adjustSize()
+        # Anchor below-right of the cursor (Windows-cursor convention).
+        # Clamp to the current screen so the label stays fully visible
+        # when the cursor is near the right / bottom edge.
+        gx = QCursor.pos().x() + 16
+        gy = QCursor.pos().y() + 20
+        screen = label.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            geo = screen.availableGeometry()
+            gx = min(gx, geo.right() - label.width() - 2)
+            gy = min(gy, geo.bottom() - label.height() - 2)
+            gx = max(gx, geo.left() + 2)
+            gy = max(gy, geo.top() + 2)
+        label.move(gx, gy)
+        if not label.isVisible():
+            label.show()
+
+    def _ensure_interpolator(self, lp: dict) -> _FastTriSampler | None:
+        """Return the layer probe's voltage sampler, building it lazily
+        on first call.
+
+        Built lazily on first cursor hover (not at render time) so a rail
+        toggle never pays for it. :class:`_FastTriSampler` builds in
+        ~50–150 ms even on a 300k-triangle GND plane — its predecessor,
+        ``LinearTriInterpolator``, took 3–10 s and froze the GUI for
+        several seconds the first time the cursor crossed a heavy plane.
+        The result is written back to the ``_layer_cache`` entry (via
+        ``_cache_key``) so subsequent renders of the same (layer, mode)
+        pair reuse the already-built object.
+        """
+        interp = lp.get("interpolator")
+        if interp is not None:
+            return interp
+        tri = lp.get("triangulation")
+        if tri is None:
+            return None
+        interp = _FastTriSampler(tri, lp["values"])
+        lp["interpolator"] = interp
+        cache_key = lp.get("_cache_key")
+        if cache_key is not None:
+            entry = self._layer_cache.get(cache_key)
+            if entry is not None:
+                entry["interpolator"] = interp
+        return interp
+
+    def _probe_at_point(self, x: float, y: float
+                        ) -> tuple[float, dict] | None:
+        """Walk :attr:`_layer_probes` top-first, return ``(value, probe)``
+        for the topmost visible layer whose copper covers (x, y). ``None``
+        if the cursor is on bare substrate (or off-mesh) on every layer.
+        """
+        if not self._layer_probes:
+            return None
+        pt = _sg.Point(x, y)
+        for lp in self._layer_probes:
+            prepped = lp.get("prepared_shape")
+            if prepped is None:
+                continue
+            try:
+                if not prepped.contains(pt):
+                    continue
+            except Exception:
+                continue
+            interp = self._ensure_interpolator(lp)
+            if interp is None:
+                continue
+            sample = interp(x, y)
+            try:
+                if hasattr(sample, "mask") and \
+                        bool(np.ma.getmaskarray(sample).item()):
+                    continue
+                v = float(sample)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(v):
+                continue
+            return v, lp
+        return None
+
+    def _probe_at_point_3d(self, x_px: float, y_px: float
+                            ) -> tuple[float, dict] | None:
+        """3D-mode probe: ray-intersect the camera ray with each visible
+        layer's z plane (top-first) and return the first hit whose copper
+        covers the intersection point. Compensates for perspective so the
+        cursor lands on the copper the user is actually looking at,
+        regardless of camera angle / vertical-exaggeration."""
+        if not self._layer_probes:
+            return None
+        for lp in self._layer_probes:
+            prepped = lp.get("prepared_shape")
+            if prepped is None:
+                continue
+            phys = lp.get("physical", "")
+            z = self._layer_z_for(phys)
+            wx, wy = self._gl_viewer.screen_to_world_at_z(x_px, y_px, z)
+            try:
+                if not prepped.contains(_sg.Point(wx, wy)):
+                    continue
+            except Exception:
+                continue
+            interp = self._ensure_interpolator(lp)
+            if interp is None:
+                continue
+            sample = interp(wx, wy)
+            try:
+                if hasattr(sample, "mask") and \
+                        bool(np.ma.getmaskarray(sample).item()):
+                    continue
+                v = float(sample)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(v):
+                continue
+            return v, lp
+        return None
+
+    # --- Via hover probe ----------------------------------------------------
+
+    def _get_or_build_via_hover_index(self):
+        """Cache the per-via arrays used by hover lookup.
+
+        Built lazily on first hover from the same row list the Vias tab
+        uses, so the heavy ``_compute_via_report`` cost is shared. The
+        cache is a dict so the 2D path (xy disk test) and the 3D path
+        (screen-space ray-cylinder test) can share most state. Returns
+        ``None`` when there are no usable via rows.
+
+        ``z_tops`` / ``z_bots`` come from the via's full ``layer_start``
+        → ``layer_end`` metadata span, NOT the sampled-layer span in the
+        Vias-tab row — so when the user hovers a section of barrel that
+        crosses a layer without copper on this net, the 3D ray test
+        still hits.
+        """
+        cached = getattr(self, "_via_hover_index_cache", None)
+        if cached is not None:
+            return cached
+        if self.metadata is None:
+            self._via_hover_index_cache = None
+            return None
+        rows = self._get_or_compute_via_rows()
+        if not rows:
+            self._via_hover_index_cache = None
+            return None
+        # Map (x_mm, y_mm, net) → full via dict so we can read the
+        # original layer_start/layer_end for the 3D z-span. Rounded to
+        # 1 nm to absorb the round-trip-through-pickle float noise.
+        via_lookup: dict[tuple[float, float, str], dict] = {}
+        for v in self.metadata.get("vias", []):
+            net = v.get("net", "")
+            if not net:
+                continue
+            key = (round(float(v.get("x_mm", 0.0)), 6),
+                   round(float(v.get("y_mm", 0.0)), 6),
+                   net)
+            via_lookup[key] = v
+        id_to_phys = {v: k for k, v in self._phys_name_to_layer_id.items()}
+
+        xs_list: list[float] = []
+        ys_list: list[float] = []
+        radii_list: list[float] = []
+        z_top_list: list[float] = []
+        z_bot_list: list[float] = []
+        rows_keep: list[dict] = []
+        for r in rows:
+            x = float(r["x_mm"])
+            y = float(r["y_mm"])
+            net = r.get("net", "")
+            key = (round(x, 6), round(y, 6), net)
+            v = via_lookup.get(key)
+            if v is not None:
+                ls = v.get("layer_start")
+                le = v.get("layer_end")
+                if ls is None or le is None:
+                    continue
+                lid_top = min(ls, le)   # top = lowest id = nearest z=0
+                lid_bot = max(ls, le)
+            else:
+                # Row-only fallback: use the sampled-layer span.
+                layer_ids = r.get("layer_ids") or []
+                if len(layer_ids) < 2:
+                    continue
+                lid_top, lid_bot = layer_ids[0], layer_ids[-1]
+            phys_top = id_to_phys.get(lid_top)
+            phys_bot = id_to_phys.get(lid_bot)
+            if phys_top is None or phys_bot is None:
+                continue
+            radius = max(float(r.get("diameter_mm") or 0.0) * 0.5, 0.15)
+            xs_list.append(x)
+            ys_list.append(y)
+            radii_list.append(radius)
+            z_top_list.append(self._layer_z_for(phys_top))
+            z_bot_list.append(self._layer_z_for(phys_bot))
+            rows_keep.append(r)
+
+        if not rows_keep:
+            self._via_hover_index_cache = None
+            return None
+        xs = np.array(xs_list, dtype=np.float64)
+        ys = np.array(ys_list, dtype=np.float64)
+        radii = np.array(radii_list, dtype=np.float64)
+        self._via_hover_index_cache = {
+            "xs": xs,
+            "ys": ys,
+            "radii": radii,
+            "r2": radii * radii,
+            "z_tops": np.array(z_top_list, dtype=np.float64),
+            "z_bots": np.array(z_bot_list, dtype=np.float64),
+            "rows": rows_keep,
+        }
+        return self._via_hover_index_cache
+
+    def _format_via_hover_text(self, row: dict) -> str:
+        """Format the bottom-bar suffix for a hovered via row. Empty
+        string if neither current nor voltage is usable."""
+        cur = row.get("current")
+        v_top = row.get("v_top")
+        parts: list[str] = []
+        if cur is not None and np.isfinite(cur):
+            parts.append(f"I = {cur:.4g} A")
+        if v_top is not None and np.isfinite(v_top):
+            parts.append(f"V = {v_top:.5g} V")
+        if not parts:
+            return ""
+        return "   Via: " + "   ".join(parts)
+
+    def _pick_hovered_via(self, world_x: float, world_y: float) -> dict | None:
+        """Dispatch the via-hover probe by view mode. Returns the row
+        dict for the picked via (the same shape :meth:`_compute_via_report`
+        produces), or ``None`` when the cursor isn't over any via."""
+        if self.view_3d_box.isChecked():
+            return self._pick_hovered_via_3d()
+        return self._pick_hovered_via_2d(world_x, world_y)
+
+    def _via_hover_info(self, world_x: float, world_y: float) -> str:
+        """Bottom-bar suffix for the picked via, or empty string."""
+        row = self._pick_hovered_via(world_x, world_y)
+        if row is None:
+            return ""
+        return self._format_via_hover_text(row)
+
+    def _pick_hovered_via_2d(self, world_x: float,
+                              world_y: float) -> dict | None:
+        """2D-mode probe: simple disk-containment test. The cursor's
+        world (x, y) maps 1:1 to a board point, so any via whose pad
+        circle covers it is a hit; the closest center wins."""
+        idx = self._get_or_build_via_hover_index()
+        if idx is None:
+            return None
+        xs = idx["xs"]; ys = idx["ys"]; r2 = idx["r2"]; rows = idx["rows"]
+        dx = xs - world_x
+        dy = ys - world_y
+        d2 = dx * dx + dy * dy
+        inside = d2 <= r2
+        if not inside.any():
+            return None
+        candidates = np.where(inside)[0]
+        best = int(candidates[np.argmin(d2[candidates])])
+        return rows[best]
+
+    def _pick_hovered_via_3d(self) -> dict | None:
+        """3D-mode probe: ray-pick each via cylinder in screen space.
+
+        Why this is needed: a vertical via barrel viewed from an oblique
+        camera lands well off the (x, y) you get by unprojecting the
+        cursor at any single z — the cursor on the side of the barrel
+        sits at one z while the via's footprint is at another. The
+        2D-style ``(wx - vx)² + (wy - vy)² < r²`` check therefore misses.
+        Instead we project each via's top and bottom endpoints to
+        screen pixels and measure the cursor's distance to the
+        resulting screen-space line segment, comparing against the
+        via's projected radius.
+
+        Vectorised over all vias with one MVP build + a handful of
+        batched matrix multiplies per hover — cheap enough at 30 Hz
+        even on a 3 000-via board."""
+        idx = self._get_or_build_via_hover_index()
+        if idx is None:
+            return None
+        xs = idx["xs"]; ys = idx["ys"]
+        radii = idx["radii"]; rows = idx["rows"]
+        z_tops = idx["z_tops"]; z_bots = idx["z_bots"]
+        n = xs.size
+        if n == 0:
+            return None
+
+        px, py = self._gl_viewer.last_hover_pixel()
+        mvp = self._gl_viewer._current_mvp()
+        # MVP rows → numpy 4×4 for batch multiplication.
+        rows_v = [mvp.row(i) for i in range(4)]
+        M = np.array([
+            [r.x(), r.y(), r.z(), r.w()] for r in rows_v
+        ], dtype=np.float64)
+        w_px = max(1, self._gl_viewer.width())
+        h_px = max(1, self._gl_viewer.height())
+
+        def _project(x: np.ndarray, y: np.ndarray,
+                     z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            """Batch world→screen-pixel projection. Behind-camera points
+            (clip-w ≤ 0) become NaN so the distance tests fail naturally."""
+            ones = np.ones_like(x)
+            pts = np.column_stack([x, y, z, ones])
+            clip = pts @ M.T
+            cw = clip[:, 3]
+            bad = cw <= 1e-6
+            cw_safe = np.where(bad, 1.0, cw)
+            ndc_x = clip[:, 0] / cw_safe
+            ndc_y = clip[:, 1] / cw_safe
+            sx = (ndc_x + 1.0) * 0.5 * w_px
+            sy = (1.0 - ndc_y) * 0.5 * h_px
+            sx = np.where(bad, np.nan, sx)
+            sy = np.where(bad, np.nan, sy)
+            return sx, sy
+
+        z_mid = 0.5 * (z_tops + z_bots)
+        sx_t, sy_t = _project(xs, ys, z_tops)
+        sx_b, sy_b = _project(xs, ys, z_bots)
+        # Two perpendicular offsets at mid-z give us a conservative
+        # estimate of the cylinder's apparent screen radius (max of
+        # x-axis and y-axis projections). Exact would be a perpendicular
+        # to the camera-axis projection, but for hover-tolerance the
+        # max-of-two is plenty close.
+        sx_c, sy_c = _project(xs, ys, z_mid)
+        sx_rx, sy_rx = _project(xs + radii, ys, z_mid)
+        sx_ry, sy_ry = _project(xs, ys + radii, z_mid)
+        screen_r = np.maximum(
+            np.hypot(sx_rx - sx_c, sy_rx - sy_c),
+            np.hypot(sx_ry - sx_c, sy_ry - sy_c),
+        )
+
+        # Cursor-to-segment distance for each via cylinder.
+        dx_seg = sx_b - sx_t
+        dy_seg = sy_b - sy_t
+        seg_len2 = dx_seg * dx_seg + dy_seg * dy_seg
+        valid_seg = seg_len2 > 1e-6
+        seg_len2_safe = np.where(valid_seg, seg_len2, 1.0)
+        t = ((px - sx_t) * dx_seg + (py - sy_t) * dy_seg) / seg_len2_safe
+        t = np.clip(t, 0.0, 1.0)
+        cx = np.where(valid_seg, sx_t + t * dx_seg, sx_t)
+        cy = np.where(valid_seg, sy_t + t * dy_seg, sy_t)
+        d2 = (cx - px) ** 2 + (cy - py) ** 2
+
+        inside = (d2 <= screen_r * screen_r) \
+            & np.isfinite(d2) & np.isfinite(screen_r)
+        if not inside.any():
+            return None
+        candidates = np.where(inside)[0]
+        best = int(candidates[np.argmin(d2[candidates])])
+        return rows[best]
+
+    # --- SOURCE / SINK marker hover ---------------------------------------
+    #
+    # When the cursor is over a SOURCE or SINK marker the bottom probe label
+    # gets a suffix naming the directive and the current it sources/sinks.
+    # SINK current = the prescribed load (directive value). SOURCE current
+    # has no prescribed value — derive it from steady-state KCL on the rail
+    # group as the sum of all SINK loads on the same rail.
+
+    def _directive_current_for_hover(self, d: dict) -> float | None:
+        """Current to report for a directive marker, or None if unknown.
+        SINK: the prescribed load. SOURCE: sum of SINK loads on its rail
+        group (KCL — what the source must deliver under DC steady state)."""
+        role = d.get("role")
+        if role == "SINK":
+            try:
+                return float(d.get("value", 0.0))
+            except (TypeError, ValueError):
+                return None
+        if role == "SOURCE":
+            return self._source_rail_load_current(d)
+        return None
+
+    def _source_rail_load_current(self, d: dict) -> float | None:
+        """Sum of SINK currents on the same rail group as ``d``'s pins."""
+        if self.metadata is None:
+            return None
+        source_nets: set[str] = set()
+        for term in (d.get("terminals") or {}).values():
+            for pin in term.get("pins", []):
+                net = pin.get("net")
+                if net:
+                    source_nets.add(net)
+        if not source_nets:
+            return None
+        net_to_rail: dict[str, str] = {}
+        for rail, members in self._rail_to_members.items():
+            for n in members:
+                net_to_rail[n] = rail
+        rails = {net_to_rail[n] for n in source_nets if n in net_to_rail}
+        if not rails:
+            return None
+        rail_members: set[str] = set()
+        for rail in rails:
+            rail_members.update(self._rail_to_members.get(rail, [rail]))
+        total = 0.0
+        any_found = False
+        for other in self.metadata.get("directives", []):
+            if other.get("role") != "SINK":
+                continue
+            for term in (other.get("terminals") or {}).values():
+                if any(p.get("net") in rail_members
+                       for p in term.get("pins", [])):
+                    try:
+                        total += float(other.get("value", 0.0))
+                    except (TypeError, ValueError):
+                        pass
+                    any_found = True
+                    break
+        return total if any_found else None
+
+    def _set_marker_hover_rows(self, rows: list[dict]) -> None:
+        """Stash the SOURCE/SINK marker rows that the hover probe should
+        hit-test against. Called from :meth:`_update_markers_and_legend`
+        with the same pin-walk results that go into the marker batch."""
+        if not rows:
+            self._marker_hover_index_cache = None
+            return
+        xs = np.fromiter((r["x_mm"] for r in rows), dtype=np.float64,
+                          count=len(rows))
+        ys = np.fromiter((r["y_mm"] for r in rows), dtype=np.float64,
+                          count=len(rows))
+        size_px = np.fromiter((r["size_px"] for r in rows), dtype=np.float64,
+                               count=len(rows))
+        self._marker_hover_index_cache = {
+            "xs": xs,
+            "ys": ys,
+            "size_px": size_px,
+            "rows": rows,
+        }
+
+    def _pick_hovered_marker(self, world_x: float, world_y: float
+                              ) -> dict | None:
+        """Return the SOURCE/SINK marker row closest to (world_x, world_y)
+        if the cursor is inside its hit radius, else ``None``.
+
+        Hit radius scales with the marker's pixel size at the current
+        zoom — a generous +2 px slack so the click target matches what
+        the eye sees and isn't a needle in the centre of the glyph."""
+        idx = getattr(self, "_marker_hover_index_cache", None)
+        if idx is None:
+            return None
+        if not self.show_markers_box.isChecked():
+            return None
+        mpp = self._mm_per_pixel
+        if mpp <= 0.0:
+            return None
+        xs = idx["xs"]; ys = idx["ys"]
+        size_px = idx["size_px"]
+        rows = idx["rows"]
+        radii_mm = (size_px * 0.5 + 2.0) * mpp
+        dx = xs - world_x
+        dy = ys - world_y
+        d2 = dx * dx + dy * dy
+        r2 = radii_mm * radii_mm
+        inside = d2 <= r2
+        if not inside.any():
+            return None
+        candidates = np.where(inside)[0]
+        best = int(candidates[np.argmin(d2[candidates])])
+        return rows[best]
+
+    def _marker_hover_info(self, world_x: float, world_y: float) -> str:
+        """Bottom-bar suffix for the SOURCE/SINK marker under the cursor,
+        or ``""``. Thin wrapper over :meth:`_pick_hovered_marker` + the
+        text formatter, kept so callers don't have to know about both."""
+        row = self._pick_hovered_marker(world_x, world_y)
+        if row is None:
+            return ""
+        return self._format_marker_hover_text(row)
+
+    def _format_marker_tooltip_lines(self, row: dict) -> list[str]:
+        """Multi-line cursor-tooltip rendering of a SOURCE/SINK marker.
+        Splits what the bottom-bar suffix packs onto one line: a header
+        with the role + designator, then "I = X A" for the hovered pin,
+        and a "total: X A (N pins)" line for multi-pin terminals so the
+        user sees both numbers at once."""
+        role = row.get("role", "")
+        label = row.get("label", "") or "?"
+        per_pin = row.get("current_a")
+        total = row.get("directive_current_a")
+        n_pins = int(row.get("terminal_pin_count") or 1)
+        lines: list[str] = [f"{role} {label}"]
+        if per_pin is None or not np.isfinite(per_pin):
+            lines.append("I: (n/a)")
+            return lines
+        prefix = "I ≈" if role == "SOURCE" else "I ="
+        lines.append(f"{prefix} {per_pin:.4g} A")
+        if n_pins > 1 and total is not None and np.isfinite(total):
+            pin_word = "pins" if n_pins != 1 else "pin"
+            lines.append(f"Total: {total:.4g} A ({n_pins} {pin_word})")
+        if role == "SOURCE":
+            lines.append("(rail load)")
+        return lines
+
+    def _format_marker_hover_text(self, row: dict) -> str:
+        """One-line suffix for the hovered SOURCE/SINK marker. Shows the
+        per-pin current (directive total / pins on this terminal) AND
+        the terminal total so a multi-pin sink doesn't misleadingly
+        report the whole load on each marker. SOURCE values are tagged
+        ``≈ … (rail load)`` to flag they're derived from KCL rather than
+        prescribed by the user."""
+        role = row.get("role", "")
+        label = row.get("label", "") or "?"
+        per_pin = row.get("current_a")
+        total = row.get("directive_current_a")
+        n_pins = int(row.get("terminal_pin_count") or 1)
+        if per_pin is None or not np.isfinite(per_pin):
+            return f"   {role} {label}: I = (n/a)"
+        prefix = "I ≈" if role == "SOURCE" else "I ="
+        suffix = " (rail load)" if role == "SOURCE" else ""
+        if n_pins > 1 and total is not None and np.isfinite(total):
+            total_part = f" ({total:.4g} A total){suffix}"
+        else:
+            total_part = suffix
+        return f"   {role} {label}: {prefix} {per_pin:.4g} A{total_part}"
+
+    def _stub_prepared_shape(self, stub: dict):
+        """Return (and cache) a shapely PreparedGeometry for a stub polygon."""
+        cached = stub.get("_prepared_shape_cache")
+        if cached is not None:
+            return cached
+        ext = stub.get("exterior")
+        if ext is None or (hasattr(ext, "size") and ext.size == 0):
+            return None
+        holes = stub.get("holes") or []
+        try:
+            poly = _sg.Polygon(ext, holes)
+        except Exception:
+            return None
+        if poly.is_empty:
+            return None
+        prepped = _sp.prep(poly)
+        stub["_prepared_shape_cache"] = prepped
+        return prepped
+
+    def _probe_at_stub(self, x: float, y: float
+                       ) -> tuple[float | None, dict] | None:
+        """Check whether (x, y) falls inside any visible stub (no-current
+        copper).  Returns ``(voltage, info)`` — voltage may be None if
+        un-estimable — or ``None`` if no stub covers the point.
+        ``info`` has keys ``physical``, ``net``, ``is_stub=True``."""
+        if self.metadata is None:
+            return None
+        stubs = self.metadata.get("stubs") or []
+        if not stubs:
+            return None
+        phys_list, rails, _ = self._current_selection()
+        if not rails:
+            return None
+        visible_layer_ids: dict[int, str] = {}
+        for phys in phys_list:
+            lid = self._phys_name_to_layer_id.get(phys)
+            if lid is not None:
+                visible_layer_ids[lid] = phys
+        if not visible_layer_ids:
+            return None
+        rail_members = set(self._effective_rail_members(rails))
+        pt = _sg.Point(x, y)
+        for stub in stubs:
+            lid = stub.get("layer_id")
+            phys = visible_layer_ids.get(lid)
+            if phys is None:
+                continue
+            net = stub.get("net")
+            if rail_members and net not in rail_members:
+                continue
+            prepped = self._stub_prepared_shape(stub)
+            if prepped is None:
+                continue
+            try:
+                if not prepped.contains(pt):
+                    continue
+            except Exception:
+                continue
+            voltage = self._sample_stub_voltage(stub, net)
+            return voltage, {"physical": phys, "net": net, "is_stub": True}
+        return None
+
+    def _probe_at_stub_3d(self, x_px: float, y_px: float
+                          ) -> tuple[float | None, dict] | None:
+        """3D-mode stub probe: unproject to each visible stub's layer z
+        and check whether the intersection point falls inside the stub."""
+        if self.metadata is None:
+            return None
+        stubs = self.metadata.get("stubs") or []
+        if not stubs:
+            return None
+        phys_list, rails, _ = self._current_selection()
+        if not rails:
+            return None
+        visible_layer_ids: dict[int, str] = {}
+        for phys in phys_list:
+            lid = self._phys_name_to_layer_id.get(phys)
+            if lid is not None:
+                visible_layer_ids[lid] = phys
+        if not visible_layer_ids:
+            return None
+        rail_members = set(self._effective_rail_members(rails))
+        for stub in stubs:
+            lid = stub.get("layer_id")
+            phys = visible_layer_ids.get(lid)
+            if phys is None:
+                continue
+            net = stub.get("net")
+            if rail_members and net not in rail_members:
+                continue
+            prepped = self._stub_prepared_shape(stub)
+            if prepped is None:
+                continue
+            z = self._layer_z_for(phys)
+            wx, wy = self._gl_viewer.screen_to_world_at_z(x_px, y_px, z)
+            try:
+                if not prepped.contains(_sg.Point(wx, wy)):
+                    continue
+            except Exception:
+                continue
+            voltage = self._sample_stub_voltage(stub, net)
+            return voltage, {"physical": phys, "net": net, "is_stub": True}
+        return None
+
+    # --- Settings tab --------------------------------------------------------
+
+    # Form-field schema: each entry is
+    #   (attr_name, label, unit, getter_from_settings, default_text, tooltip)
+    # The attr_name doubles as the QLineEdit's instance-attribute name on
+    # the viewer (``self.settings_edit_<attr_name>``) and as a key in the
+    # SolveSettings dataclass. ``getter_from_settings`` extracts the
+    # current value from a SolveSettings instance, formatted for display.
+    # ``default_text`` is the static "(default: …)" hint shown beside the
+    # field so users always know the unmodified value.
+    _SETTINGS_FIELDS: tuple[tuple[str, str, str, str], ...] = (
+        # (key, label, unit, tooltip)
+        ("temperature_c",
+         "Board temperature",
+         "°C",
+         "Operating temperature of the copper. Drives the temperature-"
+         "corrected sheet conductivity used by every layer in the FEM."),
+        ("copper_resistivity_20c_microohm_cm",
+         "Copper resistivity (at 20 °C)",
+         "µΩ·cm",
+         "Bulk copper resistivity at the 20 °C reference. Default 1.68 "
+         "µΩ·cm matches annealed (IACS 100 %) copper. Lower for rolled / "
+         "ED copper, higher for thin plated foil."),
+        ("copper_temp_coefficient_per_c",
+         "Copper temperature coefficient α",
+         "1/°C",
+         "Linear temperature coefficient of resistivity. Default 0.00393 "
+         "/°C is the standard value for annealed copper."),
+        ("plating_thickness_mm",
+         "Via plating thickness",
+         "mm",
+         "Plated-through-hole copper wall thickness. Default 0.025 mm "
+         "(~1 mil) matches IPC-A-600 Class 2; bump to 0.030–0.050 mm for "
+         "Class 3 / heavy-copper builds."),
+        ("coupling_resistance_ohm",
+         "Multi-pin coupling resistance",
+         "Ω",
+         "Small star-topology resistor used to tie each pin of a multi-pin "
+         "terminal back to its main NodeID. Should stay << any real trace "
+         "resistance — change only if you know why."),
+        ("fallback_via_resistance_ohm",
+         "Fallback via resistance",
+         "Ω",
+         "Per-hop resistance assigned to vias whose drill geometry is "
+         "missing or degenerate. Most boards never hit this fallback."),
+        ("mesh_min_angle_deg",
+         "Mesh minimum angle",
+         "°",
+         "Triangle quality constraint passed to the Triangle mesher (0–34 "
+         "is safe; higher values can stall on tight features). Smaller "
+         "values mesh faster but yield poorer-conditioned FEM matrices."),
+        ("mesh_max_size_mm",
+         "Mesh maximum edge size",
+         "mm",
+         "Cap on triangle edge length (and area). Smaller = denser mesh, "
+         "slower solve, finer-resolution voltage maps. 0 disables the cap."),
+    )
+
+    # Display-only knobs (no re-solve needed; applied immediately).
+    _SETTINGS_DISPLAY_FIELDS: tuple[tuple[str, str, str, str], ...] = (
+        ("via_current_warn_a",
+         "Via current warning level |I|",
+         "A",
+         "Vias whose worst-segment current exceeds this threshold are "
+         "highlighted red in the Vias tab and contribute to the tab-title "
+         "warning count."),
+        ("display_percentile_high",
+         "Heatmap colour-scale clip percentile",
+         "%",
+         "Default upper clamp for Current Density / Power Density modes. "
+         "Set to e.g. 99 to suppress single-vertex FEM singularity spikes "
+         "and let the rest of the board use the full colour scale."),
+    )
+
+    def _build_settings_tab(self) -> QWidget:
+        """Build the Settings tab — tunable physics + mesh + display knobs
+        and a Re-run Solver button.
+
+        Editing a field does NOT immediately re-solve; the user must press
+        "Re-run Solver" to spawn a fresh solve with the new parameters.
+        Display-only fields (warning threshold, percentile) are also
+        applied by the same button, but those are cheap and never trigger
+        an FEM rebuild on their own."""
+        widget = QWidget(self.tabs)
+        scroll = QScrollArea(widget)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        t = _T()
+        scroll.setStyleSheet(
+            f"QScrollArea {{ background-color: {t['bg']}; }}"
+        )
+
+        inner = QWidget()
+        outer = QVBoxLayout(inner)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(12)
+
+        # ----- Intro -----
+        intro = QLabel(
+            "Adjust the physics and meshing parameters below, then click "
+            "<b>Re-run Solver</b> to re-solve the current project with the "
+            "new values. The viewer will reload with the fresh result."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(f"QLabel {{ color: {t['fg_label']}; }}")
+        outer.addWidget(intro)
+
+        prjpcb = ""
+        pcbdoc = ""
+        if self.metadata:
+            prjpcb = str(self.metadata.get("prjpcb_path") or "")
+            pcbdoc = str(self.metadata.get("pcbdoc_path") or "")
+        project_lbl = QLabel(
+            f"<span style='color:{t['fg_dim']};'>Project:</span> "
+            f"<code style='color:{t['code']};'>{_esc(prjpcb) or '(not in metadata)'}</code>"
+        )
+        project_lbl.setStyleSheet(f"QLabel {{ color: {t['fg']}; }}")
+        project_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        project_lbl.setWordWrap(True)
+        outer.addWidget(project_lbl)
+
+        pcbdoc_lbl = QLabel(
+            f"<span style='color:{t['fg_dim']};'>PcbDoc:</span> "
+            f"<code style='color:{t['code']};'>{_esc(pcbdoc) or '(not in metadata)'}</code>"
+        )
+        pcbdoc_lbl.setStyleSheet(f"QLabel {{ color: {t['fg']}; }}")
+        pcbdoc_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        pcbdoc_lbl.setWordWrap(True)
+        outer.addWidget(pcbdoc_lbl)
+
+        # ----- Appearance group -----
+        outer.addWidget(self._build_appearance_settings_box())
+
+        # ----- Solve parameters group -----
+        solve_box = self._make_settings_group(
+            "Solve parameters (require re-solve)",
+            self._SETTINGS_FIELDS,
+            source=self._solve_settings,
+            attr_prefix="settings_edit_",
+        )
+        # Adaptive-mesh toggle — a boolean, so not part of the QLineEdit-
+        # based _SETTINGS_FIELDS schema; add it into the same group box.
+        self._settings_adaptive_check = QCheckBox(
+            "Adaptive (variable-density) mesh")
+        self._settings_adaptive_check.setChecked(
+            bool(getattr(self._solve_settings, "adaptive_mesh", False)))
+        self._settings_adaptive_check.setToolTip(
+            "Variable-density meshing — a faster approximation. Fine near "
+            "pins, vias and copper edges; coarser elsewhere, which slightly "
+            "reduces accuracy on current-carrying copper away from "
+            "terminals. Best for boards with large low-current pours; "
+            "little benefit on densely via-stitched planes. "
+            "Off = uniform mesh (most accurate — the default)."
+        )
+        _solve_layout = solve_box.layout()
+        if _solve_layout is not None:
+            _solve_layout.addRow(self._settings_adaptive_check)
+        outer.addWidget(solve_box)
+
+        # ----- Sink load currents group -----
+        outer.addWidget(self._build_sinks_settings_box())
+
+        # ----- Stackup copper-thickness group -----
+        outer.addWidget(self._build_stackup_settings_box())
+
+        # ----- Display parameters group -----
+        # Build a tiny ad-hoc object exposing the same attribute names as
+        # the field schema so the same _make_settings_group helper works.
+        class _DisplayValues:
+            pass
+        display_src = _DisplayValues()
+        display_src.via_current_warn_a = self._via_current_warn_a
+        display_src.display_percentile_high = self._display_percentile_high
+        display_box = self._make_settings_group(
+            "Display options (applied immediately on Re-run)",
+            self._SETTINGS_DISPLAY_FIELDS,
+            source=display_src,
+            attr_prefix="settings_edit_",
+        )
+        outer.addWidget(display_box)
+
+        # ----- Status line + buttons -----
+        self._settings_status_label = QLabel("")
+        self._settings_status_label.setWordWrap(True)
+        self._settings_status_label.setStyleSheet(
+            f"QLabel {{ color: {t['accent']}; padding: 4px 0; }}"
+        )
+        outer.addWidget(self._settings_status_label)
+
+        button_row = QHBoxLayout()
+        self._settings_rerun_btn = QPushButton("Re-run Solver")
+        self._settings_rerun_btn.setToolTip(
+            "Re-solve the current project with the parameters above. "
+            "Opens a fresh viewer window with the new result."
+        )
+        self._settings_rerun_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {t['accent_btn']}; color: {t['fg_strong']};"
+            f"              border: 1px solid {t['accent_btn_hov']}; padding: 6px 14px;"
+            f"              font-weight: 600; }}"
+            f"QPushButton:hover {{ background-color: {t['accent_btn_hov']}; }}"
+            f"QPushButton:disabled {{ background-color: {t['bg_hover']}; color: {t['fg_hint']}; }}"
+        )
+        self._settings_rerun_btn.clicked.connect(self._on_rerun_solver)
+        button_row.addWidget(self._settings_rerun_btn)
+
+        self._settings_reload_design_btn = QPushButton("Reload Design Info")
+        self._settings_reload_design_btn.setToolTip(
+            "Re-extract the design (geometry + annotations) from the on-disk "
+            "Altium project, ignoring the design-info cache. Then re-solve "
+            "with the current settings. Use this when you've edited the "
+            ".PrjPcb / .PcbDoc and want to be sure FYPA picks up the change."
+        )
+        self._settings_reload_design_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {t['bg_hover']}; color: {t['fg']};"
+            f"              border: 1px solid {t['border']}; padding: 6px 14px; }}"
+            f"QPushButton:hover {{ background-color: {t['bg_hover_strong']}; }}"
+            f"QPushButton:disabled {{ background-color: {t['bg_hover']}; color: {t['fg_hint']}; }}"
+        )
+        self._settings_reload_design_btn.clicked.connect(self._on_reload_design_info)
+        button_row.addWidget(self._settings_reload_design_btn)
+
+        reset_btn = QPushButton("Reset to defaults")
+        reset_btn.setToolTip(
+            "Restore every field above to its built-in default value "
+            "(does NOT re-solve — press Re-run Solver to commit)."
+        )
+        reset_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {t['bg_hover']}; color: {t['fg']};"
+            f"              border: 1px solid {t['border']}; padding: 6px 14px; }}"
+            f"QPushButton:hover {{ background-color: {t['bg_hover_strong']}; }}"
+        )
+        reset_btn.clicked.connect(self._on_settings_reset)
+        button_row.addWidget(reset_btn)
+        button_row.addStretch(1)
+        outer.addLayout(button_row)
+
+        outer.addStretch(1)
+
+        scroll.setWidget(inner)
+        # Wrap the scroll area in the returned widget so addTab gets a
+        # plain QWidget with the same background as the others.
+        wrap_layout = QVBoxLayout(widget)
+        wrap_layout.setContentsMargins(0, 0, 0, 0)
+        wrap_layout.addWidget(scroll)
+        widget.setStyleSheet(
+            f"QWidget {{ background-color: {t['bg']}; color: {t['fg']}; }}"
+            f"QGroupBox {{ border: 1px solid {t['border']}; border-radius: 4px;"
+            f"            margin-top: 14px; padding: 12px;"
+            f"            background-color: {t['bg']}; }}"
+            f"QGroupBox::title {{ subcontrol-origin: margin; left: 12px;"
+            f"                   padding: 0 6px; color: {t['fg_strong']};"
+            f"                   font-weight: 600; }}"
+            f"QLineEdit {{ background-color: {t['bg_input']}; color: {t['fg']};"
+            f"            border: 1px solid {t['border']}; padding: 3px 6px;"
+            f"            selection-background-color: {t['bg_selection']}; }}"
+            f"QLineEdit:focus {{ border: 1px solid {t['accent']}; }}"
+        )
+        return widget
+
+    def _make_settings_group(
+        self, title: str,
+        fields: tuple[tuple[str, str, str, str], ...],
+        source: object,
+        attr_prefix: str,
+    ) -> QGroupBox:
+        """Build a QGroupBox containing one labelled QLineEdit per field
+        in ``fields``. The current value is pulled from ``source`` via
+        ``getattr``; default-value hints come from a fresh SolveSettings."""
+        from altium_loader import SolveSettings as _SolveSettings
+        from dataclasses import fields as _dc_fields
+        defaults = _SolveSettings()
+        # The display-only fields aren't in SolveSettings — fall back to
+        # the module-level constants for their default-value hint.
+        display_defaults = {
+            "via_current_warn_a": _VIA_CURRENT_WARN_A,
+            "display_percentile_high": _DISPLAY_PERCENTILE_HIGH,
+        }
+        defaults_attrs = {f.name for f in _dc_fields(defaults)}
+
+        box = QGroupBox(title)
+        form = QFormLayout(box)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+
+        for key, label, unit, tooltip in fields:
+            current = getattr(source, key, None)
+            if current is None:
+                continue
+            default_val = (
+                getattr(defaults, key) if key in defaults_attrs
+                else display_defaults.get(key)
+            )
+
+            edit = QLineEdit(self._fmt_settings_value(current))
+            validator = QDoubleValidator(self)
+            validator.setNotation(QDoubleValidator.StandardNotation)
+            validator.setBottom(0.0)
+            edit.setValidator(validator)
+            edit.setMinimumWidth(110)
+            edit.setMaximumWidth(160)
+            edit.setToolTip(tooltip)
+            setattr(self, f"{attr_prefix}{key}", edit)
+
+            _t = _T()
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            row.addWidget(edit)
+            unit_lbl = QLabel(unit)
+            unit_lbl.setStyleSheet(f"QLabel {{ color: {_t['fg_muted']}; }}")
+            row.addWidget(unit_lbl)
+            row.addSpacing(8)
+            hint = QLabel(f"<span style='color:{_t['fg_hint']};'>"
+                          f"(default: {self._fmt_settings_value(default_val)})</span>"
+                          if default_val is not None else "")
+            row.addWidget(hint)
+            row.addStretch(1)
+            row_widget = QWidget()
+            row_widget.setLayout(row)
+
+            label_widget = QLabel(label)
+            label_widget.setToolTip(tooltip)
+            label_widget.setStyleSheet(f"QLabel {{ color: {_t['fg']}; }}")
+            form.addRow(label_widget, row_widget)
+
+        return box
+
+    def _make_collapsible_section(
+        self, title: str, body_widget: QWidget, *,
+        expanded: bool = False,
+    ) -> tuple[QWidget, QToolButton]:
+        """Wrap ``body_widget`` in a click-to-expand QFrame with a header
+        button matching the dark-theme styling of the other Settings
+        groups. Returns ``(wrapper, header)`` — keep a reference to the
+        header if you want to update its title later."""
+        wrap = QFrame()
+        wrap.setObjectName("collapsibleSection")
+        t = _T()
+        wrap.setStyleSheet(
+            f"QFrame#collapsibleSection {{ border: 1px solid {t['border']};"
+            f"                            border-radius: 4px;"
+            f"                            background-color: {t['bg']};"
+            f"                            margin-top: 6px; }}"
+        )
+        wrap_layout = QVBoxLayout(wrap)
+        wrap_layout.setContentsMargins(8, 6, 8, 8)
+        wrap_layout.setSpacing(6)
+
+        header = QToolButton(wrap)
+        header.setCheckable(True)
+        header.setChecked(expanded)
+        header.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        header.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        header.setAutoRaise(True)
+        header.setCursor(Qt.PointingHandCursor)
+        tail = "click to collapse" if expanded else "click to expand"
+        header.setText(f"{title} — {tail}")
+        header.setStyleSheet(
+            f"QToolButton {{ border: none; padding: 2px 4px;"
+            f"              color: {t['fg_strong']}; font-weight: 600;"
+            f"              text-align: left; background: transparent; }}"
+            f"QToolButton:hover {{ color: {t['accent']}; }}"
+        )
+        wrap_layout.addWidget(header)
+
+        body_widget.setParent(wrap)
+        body_widget.setVisible(expanded)
+        wrap_layout.addWidget(body_widget)
+
+        def _on_toggled(exp: bool) -> None:
+            body_widget.setVisible(exp)
+            header.setArrowType(Qt.DownArrow if exp else Qt.RightArrow)
+            # Replace just the "click to …" tail, keep the count prefix.
+            head = header.text().rsplit(" — ", 1)[0]
+            new_tail = "click to collapse" if exp else "click to expand"
+            header.setText(f"{head} — {new_tail}")
+        header.toggled.connect(_on_toggled)
+        return wrap, header
+
+    def _build_appearance_settings_box(self) -> QWidget:
+        """Theme picker (Dark / Light). The choice is persisted via
+        :func:`save_theme_mode` and applied to the running QApplication
+        immediately — the viewer window is rebuilt so the inline-styled
+        widgets (layer list, tables, side panel) pick up the new colours.
+        """
+        t = _T()
+        box = QGroupBox("Appearance")
+        box.setStyleSheet(
+            f"QGroupBox {{ border: 1px solid {t['border']}; border-radius: 4px;"
+            f"            margin-top: 14px; padding: 12px;"
+            f"            background-color: {t['bg']}; }}"
+            f"QGroupBox::title {{ subcontrol-origin: margin; left: 12px;"
+            f"                   padding: 0 6px; color: {t['fg_strong']};"
+            f"                   font-weight: 600; }}"
+        )
+
+        form = QFormLayout(box)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+
+        self._theme_combo = QComboBox()
+        self._theme_combo.addItem("Dark", "dark")
+        self._theme_combo.addItem("Light", "light")
+        current_mode = current_theme_mode()
+        for i in range(self._theme_combo.count()):
+            if self._theme_combo.itemData(i) == current_mode:
+                self._theme_combo.setCurrentIndex(i)
+                break
+        self._theme_combo.setToolTip(
+            "Switch the viewer colour theme. Dark is the default and "
+            "matches the rest of the tooling; Light is friendlier in "
+            "bright rooms. The choice is remembered for the next launch."
+        )
+        self._theme_combo.setMinimumWidth(140)
+        self._theme_combo.setMaximumWidth(180)
+        self._theme_combo.currentIndexChanged.connect(self._on_theme_combo_changed)
+
+        label_widget = QLabel("Colour theme")
+        label_widget.setStyleSheet(f"QLabel {{ color: {t['fg']}; }}")
+        form.addRow(label_widget, self._theme_combo)
+
+        # Status / hint line. Starts with the static usage hint and is
+        # overwritten by :meth:`_on_theme_combo_changed` to confirm a
+        # toggle took effect and prompt the user to restart.
+        self._theme_status_label = QLabel(
+            f"<span style='color:{t['fg_hint']};'>"
+            "Dark by default. Switching here saves the choice and updates "
+            "the menubar and dialogs immediately; restart FYPA for the "
+            "side panel and tables to repaint."
+            "</span>"
+        )
+        self._theme_status_label.setWordWrap(True)
+        form.addRow(QLabel(""), self._theme_status_label)
+        return box
+
+    def _on_theme_combo_changed(self, _idx: int) -> None:
+        """Handle the user picking a different theme from the combobox.
+
+        Persists the choice and updates the QApplication-level palette
+        and base stylesheet immediately. The heavy widget refresh (re-
+        styling the side panel + rebuilding the non-heatmap tabs) is
+        deferred to the next event-loop tick so we're not destroying
+        our own QComboBox in the middle of its currentIndexChanged
+        emission. The Heatmap tab's OpenGL viewer can't be rebuilt
+        safely — its context tear-down kills the process — so we re-
+        style the side-panel widgets in place instead and leave the
+        canvas alone.
+        """
+        mode = self._theme_combo.currentData()
+        if not isinstance(mode, str) or mode not in _THEME_PRESETS:
+            return
+        if mode == current_theme_mode():
+            return
+        save_theme_mode(mode)
+        app = QApplication.instance()
+        if app is not None:
+            apply_app_theme(app, mode)
+        label = getattr(self, "_theme_status_label", None)
+        if label is not None:
+            t = _T()
+            label.setText(
+                f"<span style='color:{t['accent']};'>"
+                f"Theme set to <b>{_esc(mode.capitalize())}</b>. "
+                "Refreshing widgets…</span>"
+            )
+        QTimer.singleShot(0, self._refresh_inline_theme)
+
+    def _refresh_inline_theme(self) -> None:
+        """Re-apply the active theme to every widget that pinned its
+        colours inline at construction time.
+
+        Re-styles the Heatmap-tab side panel in place (we can't rebuild
+        it because the OpenGL canvas can't be torn down without crashing
+        the process). The other tabs (Setup, Nodes, Vias, Settings,
+        Help) are removed and rebuilt via their builders — that's how
+        the dozens of internal labels / tables / buttons inside them
+        track the theme without needing individual references.
+
+        Transient state inside the rebuilt tabs (filter selections,
+        unsaved Settings form edits, scroll positions) is lost on
+        toggle. The tradeoff is the only one I see — chasing every
+        nested QLabel by hand would be unmaintainable.
+        """
+        t = _T()
+
+        # --- Heatmap tab: re-style side panel widgets in place ---
+        def _restyle_eye_list(lw) -> None:
+            lw.setStyleSheet(
+                f"QListWidget {{ background-color: {t['bg']}; color: {t['fg']};"
+                f"              border: 1px solid {t['border']}; padding: 2px;"
+                f"              alternate-background-color: {t['bg_alt']}; }}"
+                f"QListWidget::item:hover {{ background-color: {t['bg_hover']}; }}"
+            )
+            # Each row carries its name-label colour inline; iterate.
+            for i in range(lw.count()):
+                row = lw.itemWidget(lw.item(i))
+                if row is None:
+                    continue
+                for lbl in row.findChildren(QLabel):
+                    ss = (lbl.styleSheet() or "").lower()
+                    if not ss:
+                        continue
+                    if "bold" in ss:
+                        lbl.setStyleSheet(
+                            f"QLabel {{ color: {t['fg']}; font-weight: bold; }}"
+                        )
+                    else:
+                        lbl.setStyleSheet(f"QLabel {{ color: {t['fg']}; }}")
+                # Eye icons are cached by theme mode → reapply forces a
+                # cache miss and a fresh draw in the new colour.
+                for btn in row.findChildren(EyeButton):
+                    btn._apply_icon()
+
+        if hasattr(self, "layer_list") and self.layer_list is not None:
+            _restyle_eye_list(self.layer_list)
+        if hasattr(self, "rail_list") and self.rail_list is not None:
+            _restyle_eye_list(self.rail_list)
+
+        if (getattr(self, "probe_label_widget", None) is not None):
+            self.probe_label_widget.setStyleSheet(
+                f"QLabel {{ font-family: Consolas, monospace; padding: 6px 10px;"
+                f" color: {t['fg']}; background-color: {t['bg']};"
+                f" border-top: 1px solid {t['border']}; }}"
+            )
+        if getattr(self, "layer_spacing_label", None) is not None:
+            self.layer_spacing_label.setStyleSheet(
+                f"QLabel {{ color: {t['fg_muted']}; font-size: 8pt; }}"
+            )
+        if getattr(self, "arrow_spacing_label", None) is not None:
+            self.arrow_spacing_label.setStyleSheet(
+                f"QLabel {{ color: {t['fg_muted']}; font-size: 8pt; }}"
+            )
+        if getattr(self, "_cursor_tooltip_label", None) is not None:
+            self._cursor_tooltip_label.setStyleSheet(
+                "QLabel {"
+                f" background-color: {t['bg']};"
+                f" color: {t['fg']};"
+                f" border: 1px solid {t['border']};"
+                " padding: 4px 8px;"
+                " font-family: Consolas, monospace;"
+                " font-size: 9pt;"
+                "}"
+            )
+        if getattr(self, "scale_controller", None) is not None:
+            self.scale_controller.apply_theme()
+        if getattr(self, "_sidebar_toggle_btn", None) is not None:
+            self._sidebar_toggle_btn.update()
+
+        # --- Non-heatmap tabs: remove and rebuild ---
+        heatmap_idx = self._heatmap_tab_index
+        current_tab_text = self.tabs.tabText(self.tabs.currentIndex())
+        # Remove from highest index downwards so removeTab doesn't shift
+        # the index of tabs we still need to remove. Skip the heatmap.
+        for i in range(self.tabs.count() - 1, -1, -1):
+            if i == heatmap_idx:
+                continue
+            w = self.tabs.widget(i)
+            self.tabs.removeTab(i)
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        # Re-add in the original order. _vias_tab_index needs refreshing
+        # because Vias is re-inserted after the others.
+        self.tabs.addTab(self._build_setup_tab(), "Setup")
+        self.tabs.addTab(self._build_pins_tab(), "Nodes")
+        self._vias_tab_index = self.tabs.addTab(
+            self._build_vias_tab(), "Vias",
+        )
+        self._update_vias_tab_title(getattr(self, "_vias_warn_count", 0))
+        self.tabs.addTab(self._build_settings_tab(), "Settings")
+        self.tabs.addTab(self._build_help_tab(), "Help")
+        # Restore tab selection. "Vias" gets the warning suffix appended
+        # so match by prefix.
+        for i in range(self.tabs.count()):
+            label = self.tabs.tabText(i)
+            if label == current_tab_text or (
+                current_tab_text.startswith("Vias")
+                and label.startswith("Vias")
+            ):
+                self.tabs.setCurrentIndex(i)
+                break
+
+        status = getattr(self, "_theme_status_label", None)
+        if status is not None:
+            status.setText(
+                f"<span style='color:{t['ok']};'>"
+                f"Theme set to <b>{_esc(current_theme_mode().capitalize())}</b>."
+                "</span>"
+            )
+
+    def _build_stackup_settings_box(self) -> QWidget:
+        """List every enabled copper layer with an editable thickness
+        field (µm). Edits apply on the next press of Re-run Solver and
+        feed the per-layer sheet conductance (G = thickness × σ) as well
+        as the via-barrel z-distances used to compute hop resistance.
+
+        Override map is keyed by layer_id (int) since enabled copper
+        layer ids are unique within a project. Plane layers are listed
+        but greyed-out — plane geometry isn't supported in v1, so their
+        thickness has no effect on the FEM today.
+        """
+        # ``self._stackup_thickness_edits`` maps layer_id →
+        # (QLineEdit, original_thickness_mm).
+        self._stackup_thickness_edits: dict[int,
+                                             tuple[QLineEdit, float]] = {}
+
+        rows: list[dict] = []
+        if self.metadata:
+            rows = list(self.metadata.get("stackup") or [])
+
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 4, 0, 0)
+        body_layout.setSpacing(6)
+
+        layer_count = len(rows)
+        count_text = ("no copper layers" if layer_count == 0
+                       else f"{layer_count} copper layer"
+                            + ("s" if layer_count != 1 else ""))
+        title = f"Stackup — copper thicknesses ({count_text})"
+
+        if not rows:
+            info = QLabel(
+                f"<i style='color:{_T()['fg_dim']};'>No copper layers in this "
+                "project's stackup.</i>"
+            )
+            info.setWordWrap(True)
+            body_layout.addWidget(info)
+            wrap, _header = self._make_collapsible_section(
+                title, body, expanded=True,
+            )
+            return wrap
+
+        intro = QLabel(
+            "Type a new value in <b>µm</b> to override a copper layer's "
+            "thickness. Empty (or unchanged) fields keep the existing "
+            "value. Thickness drives sheet conductance "
+            "(G = thickness × σ) and via-barrel hop length. The "
+            "<i>dielectric</i> rows interleaved below show the core / "
+            "prepreg thickness between adjacent copper layers (read-only)."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(f"QLabel {{ color: {_T()['fg_label']}; }}")
+        body_layout.addWidget(intro)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(6)
+
+        for row_index, row in enumerate(rows):
+            lid = int(row.get("layer_id", -1))
+            name = str(row.get("name", "?"))
+            thk_mm = float(row.get("copper_thickness_mm", 0.0) or 0.0)
+            thk_um = thk_mm * 1000.0
+            thk_mil = thk_mm / 0.0254 if thk_mm else 0.0
+            thk_oz = thk_mm / 0.0348 if thk_mm else 0.0
+            is_plane = bool(row.get("is_plane"))
+
+            edit = QLineEdit(self._fmt_settings_value(thk_um))
+            validator = QDoubleValidator(self)
+            validator.setNotation(QDoubleValidator.StandardNotation)
+            validator.setBottom(0.0)
+            edit.setValidator(validator)
+            edit.setMinimumWidth(110)
+            edit.setMaximumWidth(160)
+            tooltip = (
+                f"Override copper thickness of layer {lid} ({name}). "
+                f"Originally {thk_um:g} µm ≈ {thk_mil:.3f} mil ≈ "
+                f"{thk_oz:.3f} oz. Press Re-run Solver to commit."
+            )
+            if is_plane:
+                tooltip += ("\n\nNote: this layer is a plane; plane "
+                             "geometry isn't supported in v1, so the "
+                             "thickness override has no effect on the "
+                             "FEM until plane support lands.")
+            edit.setToolTip(tooltip)
+
+            self._stackup_thickness_edits[lid] = (edit, thk_mm)
+
+            _t = _T()
+            row_layout = QHBoxLayout()
+            row_layout.setSpacing(6)
+            row_layout.addWidget(edit)
+            unit_lbl = QLabel("µm")
+            unit_lbl.setStyleSheet(f"QLabel {{ color: {_t['fg_muted']}; }}")
+            row_layout.addWidget(unit_lbl)
+            row_layout.addSpacing(8)
+            hint_bits = [f"was {thk_um:g} µm",
+                         f"{thk_mil:.3f} mil",
+                         f"{thk_oz:.3f} oz"]
+            if is_plane:
+                hint_bits.append(
+                    f"<span style='color:{_t['warn']};'>PLANE (not yet "
+                    "modelled — override is informational)</span>"
+                )
+            hint = QLabel(
+                f"<span style='color:{_t['fg_hint']};'>({' · '.join(hint_bits)})</span>"
+            )
+            row_layout.addWidget(hint)
+            row_layout.addStretch(1)
+            row_widget = QWidget()
+            row_widget.setLayout(row_layout)
+
+            label_widget = QLabel(f"L{lid}  {name}")
+            label_widget.setStyleSheet(
+                f"QLabel {{ color: {_t['fg']}; font-weight: 600; }}"
+            )
+            label_widget.setToolTip(tooltip)
+            form.addRow(label_widget, row_widget)
+
+            # Dielectric below this copper layer (between this layer and
+            # the next one in the stack). Read-only — purely informational
+            # so the user can see how far apart the copper layers sit and
+            # judge expected via-cylinder lengths in the 3D view.
+            if row_index + 1 < len(rows):
+                d_mm = float(row.get("dielectric_thickness_mm", 0.0) or 0.0)
+                d_um = d_mm * 1000.0
+                d_mil = d_mm / 0.0254 if d_mm else 0.0
+                if d_mm > 0.0:
+                    d_text = (f"<span style='color:{_t['dielectric']};'>"
+                              f"{d_um:g} µm &nbsp;·&nbsp; "
+                              f"{d_mil:.3f} mil &nbsp;·&nbsp; "
+                              f"{d_mm:.4f} mm</span>")
+                else:
+                    d_text = (f"<span style='color:{_t['fg_hint']};'>"
+                              "<i>no thickness in stackup</i></span>")
+                diel_value = QLabel(
+                    f"<span style='color:{_t['dielectric_dim']};'>"
+                    f"<i>dielectric</i></span> &nbsp; {d_text}"
+                )
+                diel_value.setToolTip(
+                    "Dielectric (core or prepreg) between this copper "
+                    "layer and the one below. Drives via-barrel hop "
+                    "length in the 3D view. Read-only — edit the .PcbDoc "
+                    "stackup to change."
+                )
+                diel_label = QLabel(
+                    f"<span style='color:{_t['separator']};'>┊</span>"
+                )
+                diel_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                form.addRow(diel_label, diel_value)
+
+        form_wrap = QWidget()
+        form_wrap.setLayout(form)
+        body_layout.addWidget(form_wrap)
+
+        wrap, header = self._make_collapsible_section(
+            title, body, expanded=False,
+        )
+        self._stackup_collapse_btn = header
+        return wrap
+
+    def _build_sinks_settings_box(self) -> QWidget:
+        """List every SINK directive parsed from the project with an
+        editable load-current field (mA). Edits apply on the next press
+        of Re-run Solver — empty fields keep the existing value.
+
+        Sink overrides are keyed by ``(designator, schdoc, channel_index)``
+        so a board with two ``U1`` references across different schematics
+        — or one part with multiple indexed SINK channels (PDN_I, PDN1_I,
+        …) — still round-trips cleanly. The current value comes from the
+        metadata bundle so it reflects exactly what the FEM used for this
+        solve.
+
+        Wrapped in a click-to-expand collapsible section because boards
+        can have dozens of sinks and the user usually only needs to tweak
+        one or two.
+        """
+        # ``self._sink_current_edits`` maps
+        # (designator, schdoc, channel_index) → (QLineEdit, original_current_A).
+        # Used by _gather_settings_from_form to collect overrides and by
+        # _on_settings_reset to restore them.
+        self._sink_current_edits: dict[tuple[str, str, int | None],
+                                        tuple[QLineEdit, float]] = {}
+
+        sinks: list[dict] = []
+        if self.metadata:
+            for d in (self.metadata.get("directives") or []):
+                if d.get("role") == "SINK":
+                    sinks.append(d)
+
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 4, 0, 0)
+        body_layout.setSpacing(6)
+
+        count_text = ("no sinks" if not sinks
+                       else f"{len(sinks)} sink"
+                            + ("s" if len(sinks) != 1 else ""))
+        title = f"Sink load currents ({count_text})"
+
+        # ----- Empty-state ------------------------------------------------
+        if not sinks:
+            info = QLabel(
+                f"<i style='color:{_T()['fg_dim']};'>No SINK directives in this "
+                "project — nothing to override.</i>"
+            )
+            info.setWordWrap(True)
+            body_layout.addWidget(info)
+            # An empty section can't be edited, so don't bother making
+            # the user click — show it pre-expanded so they immediately
+            # see the explanation.
+            wrap, header = self._make_collapsible_section(
+                title, body, expanded=True,
+            )
+            self._sinks_collapse_btn = header
+            self._sinks_collapse_body = body
+            return wrap
+
+        # ----- Populated body --------------------------------------------
+        intro = QLabel(
+            "Type a new value in <b>mA</b> to override a sink's load "
+            "current. Empty (or unchanged) fields keep the existing "
+            "value. Set 0 mA to remove a load entirely."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(f"QLabel {{ color: {_T()['fg_label']}; }}")
+        body_layout.addWidget(intro)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(6)
+
+        for d in sinks:
+            desig = str(d.get("designator", "?"))
+            schdoc = str(d.get("schdoc", ""))
+            ch_idx = d.get("channel_index")
+            label_text = str(d.get("label") or desig)
+            current_a = float(d.get("value", 0.0) or 0.0)
+            current_ma = current_a * 1000.0
+            # Net context — the first pin's net on the P terminal is a
+            # short label for "which rail does this sink load?". Falls
+            # back to the N terminal if P has no resolved pins.
+            terms = d.get("terminals") or {}
+            net_name = ""
+            for tname in ("P", "N"):
+                pins = (terms.get(tname) or {}).get("pins") or []
+                if pins:
+                    net_name = pins[0].get("net", "") or ""
+                    if net_name:
+                        break
+
+            edit = QLineEdit(self._fmt_settings_value(current_ma))
+            validator = QDoubleValidator(self)
+            validator.setNotation(QDoubleValidator.StandardNotation)
+            validator.setBottom(0.0)
+            edit.setValidator(validator)
+            edit.setMinimumWidth(110)
+            edit.setMaximumWidth(160)
+            edit.setToolTip(
+                f"Override the load current of {label_text} (originally "
+                f"{current_ma:g} mA). Press Re-run Solver to commit."
+            )
+
+            self._sink_current_edits[(desig, schdoc, ch_idx)] = (edit, current_a)
+
+            _t = _T()
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            row.addWidget(edit)
+            unit_lbl = QLabel("mA")
+            unit_lbl.setStyleSheet(f"QLabel {{ color: {_t['fg_muted']}; }}")
+            row.addWidget(unit_lbl)
+            row.addSpacing(8)
+            hint_bits = [f"was {self._fmt_settings_value(current_ma)} mA"]
+            if net_name:
+                hint_bits.append(
+                    f"on <code style='color:{_t['code']};'>{_esc(net_name)}</code>"
+                )
+            if schdoc:
+                hint_bits.append(_esc(schdoc))
+            hint = QLabel(
+                f"<span style='color:{_t['fg_hint']};'>({' · '.join(hint_bits)})</span>"
+            )
+            row.addWidget(hint)
+            row.addStretch(1)
+            row_widget = QWidget()
+            row_widget.setLayout(row)
+
+            label_widget = QLabel(label_text)
+            label_widget.setStyleSheet(
+                f"QLabel {{ color: {_t['fg']}; font-weight: 600; }}"
+            )
+            label_widget.setToolTip(
+                f"SINK directive {label_text}"
+                + (f" ({schdoc})" if schdoc else "")
+            )
+            form.addRow(label_widget, row_widget)
+
+        form_wrap = QWidget()
+        form_wrap.setLayout(form)
+        body_layout.addWidget(form_wrap)
+
+        wrap, header = self._make_collapsible_section(
+            title, body, expanded=False,
+        )
+        self._sinks_collapse_btn = header
+        self._sinks_collapse_body = body
+        return wrap
+
+    @staticmethod
+    def _fmt_settings_value(v) -> str:
+        """Format a numeric setting for display in a QLineEdit. Uses %g
+        to drop trailing zeros without losing precision for the long-
+        tail values (1e-3, 0.00393, etc.)."""
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return ""
+        if f == 0.0:
+            return "0"
+        # %g picks fixed or scientific automatically; clamp to 6 sig figs.
+        return f"{f:.6g}"
+
+    def _on_settings_reset(self) -> None:
+        """Restore every Settings-tab field to its built-in default. The
+        user still has to press Re-run Solver to commit."""
+        from altium_loader import SolveSettings as _SolveSettings
+        defaults = _SolveSettings()
+        for key, *_ in self._SETTINGS_FIELDS:
+            edit = getattr(self, f"settings_edit_{key}", None)
+            if edit is not None:
+                edit.setText(self._fmt_settings_value(getattr(defaults, key)))
+        chk = getattr(self, "_settings_adaptive_check", None)
+        if chk is not None:
+            chk.setChecked(bool(defaults.adaptive_mesh))
+        display_defaults = {
+            "via_current_warn_a": _VIA_CURRENT_WARN_A,
+            "display_percentile_high": _DISPLAY_PERCENTILE_HIGH,
+        }
+        for key, *_ in self._SETTINGS_DISPLAY_FIELDS:
+            edit = getattr(self, f"settings_edit_{key}", None)
+            if edit is not None:
+                edit.setText(self._fmt_settings_value(display_defaults[key]))
+        # Restore sink-current fields to the values bundled with this
+        # solve's metadata (i.e. the project's annotated load currents).
+        for (edit, original_a) in getattr(
+                self, "_sink_current_edits", {}).values():
+            edit.setText(self._fmt_settings_value(original_a * 1000.0))
+        # Restore stackup copper-thickness fields to metadata defaults.
+        for (edit, original_mm) in getattr(
+                self, "_stackup_thickness_edits", {}).values():
+            edit.setText(self._fmt_settings_value(original_mm * 1000.0))
+        self._settings_status_label.setText(
+            f"<span style='color:{_T()['accent']};'>Fields reset — press "
+            "<b>Re-run Solver</b> to commit.</span>"
+        )
+
+    def _gather_stackup_overrides(self) -> dict[int, float]:
+        """Collect non-no-op copper-thickness overrides from the form.
+
+        Returns ``{layer_id: thickness_mm}`` for fields whose value
+        differs from the original by more than 1 nm. Blank fields and
+        unchanged fields are skipped. Raises ``ValueError`` on
+        un-parseable input.
+        """
+        overrides: dict[int, float] = {}
+        for lid, (edit, original_mm) in getattr(
+                self, "_stackup_thickness_edits", {}).items():
+            text = edit.text().strip()
+            if not text:
+                continue
+            try:
+                new_um = float(text)
+            except ValueError:
+                raise ValueError(
+                    f"layer {lid} thickness: not a number ({text!r})"
+                )
+            if new_um < 0:
+                raise ValueError(
+                    f"layer {lid} thickness must be ≥ 0 µm"
+                )
+            new_mm = new_um / 1000.0
+            if abs(new_mm - original_mm) > 1.0e-6:
+                overrides[lid] = new_mm
+        return overrides
+
+    def _gather_sink_overrides(self) -> dict[tuple[str, str, int | None], float]:
+        """Collect non-no-op sink-current overrides from the form.
+
+        Returns ``{(designator, schdoc, channel_index): current_amperes}``
+        for sinks whose field value differs from the original by more than
+        1 µA (the threshold filters out cosmetic re-format jitter like
+        ``25`` vs ``25.0``). Blank fields are treated as "no override".
+        Raises ``ValueError`` on un-parseable input.
+        """
+        overrides: dict[tuple[str, str, int | None], float] = {}
+        for key, (edit, original_a) in getattr(
+                self, "_sink_current_edits", {}).items():
+            text = edit.text().strip()
+            if not text:
+                continue
+            try:
+                new_ma = float(text)
+            except ValueError:
+                desig, _schdoc, ch_idx = key
+                label = desig if ch_idx is None else f"{desig}#{ch_idx}"
+                raise ValueError(
+                    f"sink {label}: not a number ({text!r})"
+                )
+            new_a = new_ma / 1000.0
+            if abs(new_a - original_a) > 1.0e-6:
+                overrides[key] = new_a
+        return overrides
+
+    def _gather_settings_from_form(self) -> tuple[object, float, float,
+                                                   dict[tuple[str, str, int | None], float],
+                                                   dict[int, float]]:
+        """Read the current text in every Settings-tab QLineEdit and return
+        ``(SolveSettings, via_current_warn_a, display_percentile,
+        sink_overrides, stackup_overrides)``. Raises ``ValueError``
+        (caught by the Re-run handler) on bad input."""
+        from altium_loader import SolveSettings as _SolveSettings
+        kwargs: dict[str, float] = {}
+        for key, label, *_rest in self._SETTINGS_FIELDS:
+            edit = getattr(self, f"settings_edit_{key}", None)
+            if edit is None:
+                continue
+            text = edit.text().strip()
+            try:
+                kwargs[key] = float(text)
+            except ValueError:
+                raise ValueError(f"{label!r}: not a number ({text!r})")
+        chk = getattr(self, "_settings_adaptive_check", None)
+        if chk is not None:
+            kwargs["adaptive_mesh"] = chk.isChecked()
+        new_settings = _SolveSettings(**kwargs)
+
+        def _read_display(key: str, label: str) -> float:
+            edit = getattr(self, f"settings_edit_{key}", None)
+            if edit is None:
+                # Should not happen — field is always built. Be safe.
+                return getattr(self, f"_{key}")
+            text = edit.text().strip()
+            try:
+                return float(text)
+            except ValueError:
+                raise ValueError(f"{label!r}: not a number ({text!r})")
+
+        warn_a = _read_display("via_current_warn_a",
+                                "Via current warning level")
+        pct = _read_display("display_percentile_high",
+                             "Heatmap colour-scale clip percentile")
+        if not (0.0 < pct <= 100.0):
+            raise ValueError("Heatmap colour-scale clip percentile must "
+                              "be in (0, 100]")
+        sink_overrides = self._gather_sink_overrides()
+        stackup_overrides = self._gather_stackup_overrides()
+        return new_settings, warn_a, pct, sink_overrides, stackup_overrides
+
+    # --- File menu ----------------------------------------------------------
+
+    def _build_menubar(self) -> None:
+        """File menu so the viewer can be used standalone — pick a .PrjPcb
+        to solve and view, save the current solution, or open a
+        previously-pickled solution."""
+        mb = self.menuBar()
+        file_menu = mb.addMenu("&File")
+
+        open_proj = QAction("&Load from Project…", self)
+        open_proj.setShortcut(QKeySequence.Open)         # Ctrl+O
+        open_proj.setStatusTip(
+            "Pick a .PrjPcb; reuse the cached solution if the project is "
+            "unchanged, otherwise extract + solve."
+        )
+        open_proj.triggered.connect(
+            lambda: self._on_menu_open_project(clean=False)
+        )
+        file_menu.addAction(open_proj)
+
+        open_proj_clean = QAction("Load from Project (&Clean)…", self)
+        open_proj_clean.setShortcut("Ctrl+Shift+L")
+        open_proj_clean.setStatusTip(
+            "Pick a .PrjPcb; ignore any cached design info or solution and "
+            "re-extract + re-solve from scratch."
+        )
+        open_proj_clean.triggered.connect(
+            lambda: self._on_menu_open_project(clean=True)
+        )
+        file_menu.addAction(open_proj_clean)
+
+        file_menu.addSeparator()
+
+        save_sol = QAction("&Save Solution…", self)
+        save_sol.setShortcut("Ctrl+S")
+        save_sol.setStatusTip(
+            "Save the current solution to a .pkl file (remembers the .PrjPcb "
+            "directory and selected .PcbDoc so it can be re-solved later)."
+        )
+        save_sol.triggered.connect(self._on_menu_save_solution)
+        file_menu.addAction(save_sol)
+
+        open_sol = QAction("&Load Solution…", self)
+        open_sol.setShortcut("Ctrl+Shift+O")
+        open_sol.setStatusTip(
+            "Open a previously-saved solution pickle (no re-solve)."
+        )
+        open_sol.triggered.connect(self._on_menu_open_solution)
+        file_menu.addAction(open_sol)
+
+        file_menu.addSeparator()
+        close_proj = QAction("&Close Project", self)
+        close_proj.setShortcut("Ctrl+W")
+        close_proj.setStatusTip(
+            "Close the current project and return to the launcher window"
+        )
+        close_proj.triggered.connect(self._on_menu_close_project)
+        file_menu.addAction(close_proj)
+
+        file_menu.addSeparator()
+        quit_act = QAction("E&xit", self)
+        quit_act.setShortcut(QKeySequence.Quit)          # Ctrl+Q
+        quit_act.triggered.connect(self.close)
+        file_menu.addAction(quit_act)
+
+        _build_help_menu(self)
+
+    def _menu_start_dir(self) -> str:
+        """Best-effort starting directory for the file dialogs: the folder
+        of the currently-loaded project if we have one, else CWD."""
+        if self.metadata:
+            current = self.metadata.get("prjpcb_path")
+            if current:
+                parent = Path(current).parent
+                if parent.exists():
+                    return str(parent)
+        return ""
+
+    def _project_cache_dir_str(self) -> str:
+        """Best-effort cache subfolder for the currently-loaded project,
+        as a string suitable for QFileDialog. Empty string if we don't
+        know enough to compute one — the dialog will then default to the
+        user's CWD."""
+        if not self.metadata:
+            return ""
+        prjpcb = self.metadata.get("prjpcb_path")
+        pcbdoc = self.metadata.get("pcbdoc_path")
+        if not prjpcb:
+            return ""
+        try:
+            from FYPA import _project_cache_dir
+            cache_dir = _project_cache_dir(
+                Path(prjpcb), Path(pcbdoc) if pcbdoc else None,
+            )
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            return str(cache_dir)
+        except Exception:
+            return ""
+
+    def _on_menu_open_project(self, *, clean: bool = False) -> None:
+        """File > Load from Project[ (Clean)]  →  pick a .PrjPcb and open
+        it in a fresh viewer. Non-clean tries the solve cache first; clean
+        always re-extracts + re-solves. Uses the current viewer's
+        SolveSettings + display knobs as defaults for the new viewer."""
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Open Altium project",
+            self._menu_start_dir(),
+            "Altium project (*.PrjPcb);;All files (*)",
+        )
+        if not path_str:
+            return
+        prjpcb_path = Path(path_str)
+        proceed, pcbdoc_path = _choose_pcbdoc(self, prjpcb_path)
+        if not proceed:
+            return
+        # Apply the current physics settings to module globals before the
+        # worker starts, mirroring the Re-run path's main-thread ordering.
+        self._solve_settings.apply_to_modules()
+        # The solve-cache check now runs INSIDE the worker so the dialog
+        # below stays responsive during the (potentially 5–10 s)
+        # pickle.load on large boards. On hit, the worker emits
+        # finished_ok with the cached (sol, meta) and we skip extract +
+        # solve. On miss, it falls through to the normal flow.
+        initial_text = (
+            f"Checking solve cache for {prjpcb_path.name}…\n"
+            "On a cache miss this falls through to a full extract + solve "
+            "(10–60 s depending on board size)."
+            if not clean else None
+        )
+        self._start_solve_worker(
+            prjpcb_path, self._solve_settings,
+            self._via_current_warn_a, self._display_percentile_high,
+            pcbdoc_selector=str(pcbdoc_path) if pcbdoc_path else None,
+            use_design_cache=not clean,
+            try_solve_cache_first=not clean,
+            dialog_title="Loading project (clean)" if clean else "Loading project",
+            dialog_text=initial_text,
+        )
+
+    def _on_menu_save_solution(self) -> None:
+        """File > Save Solution…  →  prompt for a path (defaulting to this
+        project's cache folder) and write the current solution there. The
+        embedded metadata still carries ``prjpcb_path`` + ``pcbdoc_path``
+        so the saved file can drive a later Re-run / Reload Design Info."""
+        if self.solution is None:
+            QMessageBox.information(
+                self, "Nothing to save",
+                "There's no solution loaded in this window to save.",
+            )
+            return
+        start_dir = self._project_cache_dir_str() or self._menu_start_dir()
+        project_name = "solution"
+        if self.metadata:
+            prjpcb = self.metadata.get("prjpcb_path")
+            if prjpcb:
+                project_name = Path(prjpcb).stem
+        default_name = f"{project_name}.pkl"
+        default_path = str(Path(start_dir) / default_name) if start_dir else default_name
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, "Save solution",
+            default_path,
+            "Solution pickle (*.pkl);;All files (*)",
+        )
+        if not path_str:
+            return
+        try:
+            from FYPA import save_solution_file
+            save_solution_file(Path(path_str), self.solution, self.metadata)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Couldn't save solution",
+                f"Failed to write {path_str}:\n\n{type(e).__name__}: {e}",
+            )
+            return
+        label = getattr(self, "_settings_status_label", None)
+        if label is not None:
+            label.setText(
+                f"<span style='color:{_T()['ok']};'>Saved solution to "
+                f"{_esc(path_str)}</span>"
+            )
+
+    def _on_menu_open_solution(self) -> None:
+        """File > Load Solution…  →  load a pickled LeanSolution + metadata
+        and open a fresh viewer bound to it. No solve runs."""
+        start_dir = self._project_cache_dir_str() or self._menu_start_dir()
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Open solution pickle",
+            start_dir,
+            "Solution pickle (*.pkl);;All files (*)",
+        )
+        if not path_str:
+            return
+        try:
+            from FYPA import _load_solution_pickle
+            solution, metadata = _load_solution_pickle(Path(path_str))
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Couldn't open solution",
+                f"Failed to load {path_str}:\n\n{type(e).__name__}: {e}",
+            )
+            return
+        try:
+            new_win = PdnViewer(solution, metadata=metadata)
+            _register_viewer(new_win)
+            new_win.show()
+            _force_native_window_icon(new_win)
+            _set_window_aumid(new_win)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Couldn't open viewer",
+                f"Solution loaded but the viewer failed to open:\n\n"
+                f"{type(e).__name__}: {e}",
+            )
+
+    def _on_menu_close_project(self) -> None:
+        """File > Close Project  →  open a fresh launcher window and close
+        this viewer. Uses the same quitOnLastWindowClosed dance as the
+        launcher's _open_viewer_and_close: there's a one-tick window where
+        no window is visible, which would otherwise trip the auto-quit and
+        kill the whole process."""
+        app = QApplication.instance()
+        launcher = LauncherWindow()
+        _register_viewer(launcher)
+        prev_quit = app.quitOnLastWindowClosed()
+        app.setQuitOnLastWindowClosed(False)
+        launcher.show()
+        _force_native_window_icon(launcher)
+        _set_window_aumid(launcher)
+        self.close()
+        QTimer.singleShot(
+            0, lambda: app.setQuitOnLastWindowClosed(prev_quit)
+        )
+
+
+    def _on_rerun_solver(self) -> None:
+        """Re-solve the current project with the values in the Settings
+        tab. The actual solve runs on a :class:`_SolveWorker` QThread so
+        the UI stays responsive and the progress dialog can spin; the
+        viewer swap happens in :meth:`_on_solve_finished` once the worker
+        emits its result."""
+        # 1. Validate the project path is still in metadata + on disk.
+        prjpcb_str = ""
+        if self.metadata:
+            prjpcb_str = str(self.metadata.get("prjpcb_path") or "")
+        prjpcb_path = Path(prjpcb_str) if prjpcb_str else None
+        if prjpcb_path is None or not prjpcb_path.exists():
+            self._settings_status_label.setText(
+                f"<span style='color:{_T()['err']};'>Can't re-solve: this pickle has "
+                "no project path, or the .PrjPcb is no longer on disk. Open "
+                "the project via <code>FYPA.py gui &lt;.PrjPcb&gt;</code> "
+                "to enable Re-run.</span>"
+            )
+            return
+
+        # 2. Read the form fields into a SolveSettings + display values
+        # + sink-current overrides + stackup overrides.
+        try:
+            (new_settings, warn_a, pct,
+             sink_overrides,
+             stackup_overrides) = self._gather_settings_from_form()
+        except ValueError as e:
+            self._settings_status_label.setText(
+                f"<span style='color:{_T()['err']};'>Invalid input — {_esc(str(e))}</span>"
+            )
+            return
+
+        # 3. Apply the new physics constants on the MAIN thread before
+        # the worker starts — keeps the monkey-patch ordering unambiguous
+        # (any later main-thread code looking at module constants sees
+        # the new values immediately).
+        new_settings.apply_to_modules()
+
+        # 4. Lock the button so a double-click can't kick off two solves.
+        self._settings_rerun_btn.setEnabled(False)
+        self._settings_status_label.setText(
+            f"<span style='color:{_T()['accent']};'>Re-solving with new parameters…</span>"
+        )
+
+        # 5-6. Spawn the progress dialog + worker. Both the Re-run button
+        # and the File > Open Project menu share this plumbing.
+        # Pin the PcbDoc to whichever one this pickle was solved with so
+        # re-runs of a multi-PCB project don't silently switch boards or
+        # re-prompt the user.
+        pcbdoc_selector = None
+        if self.metadata:
+            pinned = self.metadata.get("pcbdoc_path")
+            if pinned:
+                pcbdoc_selector = str(pinned)
+        self._start_solve_worker(
+            prjpcb_path, new_settings, warn_a, pct,
+            sink_overrides=sink_overrides,
+            stackup_overrides=stackup_overrides,
+            pcbdoc_selector=pcbdoc_selector,
+            dialog_title="Re-running solver",
+            dialog_text=("Re-solving with new parameters…\n"
+                         "This can take 10–60 s depending on board size "
+                         "and mesh density."),
+        )
+
+    def _on_reload_design_info(self) -> None:
+        """Re-extract the design (geometry + annotations) from the on-disk
+        project ignoring the design-info cache, then re-solve with whatever
+        is currently in the Settings tab. Used when the user has edited the
+        .PrjPcb / .PcbDoc in Altium and wants FYPA to pick up the change
+        without going via File > Load from Project (Clean).
+
+        Pinned to the same PcbDoc this pickle was solved with, so multi-PCB
+        projects don't silently switch boards or re-prompt the user."""
+        prjpcb_str = ""
+        if self.metadata:
+            prjpcb_str = str(self.metadata.get("prjpcb_path") or "")
+        prjpcb_path = Path(prjpcb_str) if prjpcb_str else None
+        if prjpcb_path is None or not prjpcb_path.exists():
+            self._settings_status_label.setText(
+                f"<span style='color:{_T()['err']};'>Can't reload: this pickle has "
+                "no project path, or the .PrjPcb is no longer on disk.</span>"
+            )
+            return
+
+        try:
+            (new_settings, warn_a, pct,
+             sink_overrides,
+             stackup_overrides) = self._gather_settings_from_form()
+        except ValueError as e:
+            self._settings_status_label.setText(
+                f"<span style='color:{_T()['err']};'>Invalid input — {_esc(str(e))}</span>"
+            )
+            return
+
+        new_settings.apply_to_modules()
+
+        self._settings_rerun_btn.setEnabled(False)
+        self._settings_reload_design_btn.setEnabled(False)
+        self._settings_status_label.setText(
+            f"<span style='color:{_T()['accent']};'>Re-extracting design info and re-solving…</span>"
+        )
+
+        pcbdoc_selector = None
+        if self.metadata:
+            pinned = self.metadata.get("pcbdoc_path")
+            if pinned:
+                pcbdoc_selector = str(pinned)
+        self._start_solve_worker(
+            prjpcb_path, new_settings, warn_a, pct,
+            sink_overrides=sink_overrides,
+            stackup_overrides=stackup_overrides,
+            pcbdoc_selector=pcbdoc_selector,
+            use_design_cache=False,
+            dialog_title="Reloading design info",
+            dialog_text=("Re-extracting design info from the .PrjPcb and "
+                         "re-solving…\nThis can take 10–60 s depending on "
+                         "board size and mesh density."),
+        )
+
+    def _start_solve_worker(
+        self, prjpcb_path: Path, settings, warn_a: float, pct: float,
+        *,
+        sink_overrides: dict | None = None,
+        stackup_overrides: dict | None = None,
+        pcbdoc_selector: str | None = None,
+        use_design_cache: bool = True,
+        try_solve_cache_first: bool = False,
+        dialog_title: str = "Running solver",
+        dialog_text: str | None = None,
+    ) -> None:
+        """Show an indeterminate progress dialog and run :class:`_SolveWorker`
+        off-thread; on success, open a fresh viewer via
+        :meth:`_on_solve_finished`. Called by the Re-run button (with the
+        Settings-tab form values) and by File > Load from Project (with
+        defaults from the current viewer). Set ``use_design_cache=False`` for
+        the "Clean" / Reload Design Info flows that must re-extract."""
+        if dialog_text is None:
+            dialog_text = (f"Loading {prjpcb_path.name} and solving…\n"
+                           "This can take 10–60 s depending on board size "
+                           "and mesh density.")
+        # Indeterminate (min == max == 0) — the C++ Triangle mesher doesn't
+        # expose a progress hook, so we show a spinning barber-pole.
+        dlg = QProgressDialog(dialog_text, "Cancel", 0, 0, self)
+        dlg.setWindowTitle(dialog_title)
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        dlg.canceled.connect(self._on_solve_cancelled)
+        dlg.show()
+        QApplication.processEvents()
+        # 44% wider than Qt's auto-sized width so the longer per-stage
+        # status messages ("Packaging solution: building metadata…",
+        # "Opening viewer…", etc.) aren't truncated.
+        _sz = dlg.size()
+        dlg.setFixedSize(int(_sz.width() * 1.44), _sz.height())
+
+        # Stash refs on ``self`` so the QThread + dialog survive past this
+        # handler returning — Qt + Python both need them alive until the
+        # signals fire.
+        worker = _SolveWorker(
+            prjpcb_path, settings,
+            sink_overrides=sink_overrides,
+            stackup_overrides=stackup_overrides,
+            pcbdoc_selector=pcbdoc_selector,
+            use_design_cache=use_design_cache,
+            try_solve_cache_first=try_solve_cache_first,
+            parent=self,
+        )
+        self._solve_worker = worker
+        self._solve_progress_dlg = dlg
+        # Wires stage_changed / substage_changed to the dialog, with a
+        # live elapsed-time counter for the current stage so the user can
+        # see the opaque "Meshing + solving" step is still progressing.
+        self._solve_progress_updater = _SolveProgressUpdater(dlg, worker, self)
+
+        worker.finished_ok.connect(
+            lambda sol, meta: self._on_solve_finished(
+                sol, meta, warn_a, pct, settings,
+            )
+        )
+        worker.failed.connect(self._on_solve_failed)
+        worker.finished.connect(self._cleanup_solve_worker)
+        worker.start()
+
+    def _cleanup_solve_worker(self) -> None:
+        """Close the progress dialog and drop worker references.
+
+        Fires from ``QThread.finished``, which is guaranteed regardless of
+        success/failure, so this is the safe place to free both."""
+        updater = getattr(self, "_solve_progress_updater", None)
+        if updater is not None:
+            updater.stop()
+            updater.deleteLater()
+            self._solve_progress_updater = None
+        dlg = getattr(self, "_solve_progress_dlg", None)
+        if dlg is not None:
+            # QProgressDialog.close() routes through reject() → cancel(),
+            # which emits canceled — and our canceled handler spawns a
+            # launcher window. Drop the connection first so closing a
+            # dialog whose worker finished naturally doesn't pop the
+            # launcher on top of the new viewer.
+            try:
+                dlg.canceled.disconnect(self._on_solve_cancelled)
+            except (RuntimeError, TypeError):
+                pass
+            dlg.close()
+            self._solve_progress_dlg = None
+        worker = getattr(self, "_solve_worker", None)
+        if worker is not None:
+            # Detach later — deleteLater is safer than direct del while
+            # Qt is still emitting the finished() chain.
+            worker.deleteLater()
+            self._solve_worker = None
+
+    def _on_solve_cancelled(self) -> None:
+        """User clicked Cancel on the solve progress dialog. Kill the
+        worker, then return to a fresh launcher window (same dance as
+        File > Close Project)."""
+        _abort_solve_worker(self)
+        app = QApplication.instance()
+        launcher = LauncherWindow()
+        _register_viewer(launcher)
+        prev_quit = app.quitOnLastWindowClosed()
+        app.setQuitOnLastWindowClosed(False)
+        launcher.show()
+        _force_native_window_icon(launcher)
+        _set_window_aumid(launcher)
+        self.close()
+        QTimer.singleShot(
+            0, lambda: app.setQuitOnLastWindowClosed(prev_quit)
+        )
+
+    def _on_solve_failed(self, message: str) -> None:
+        """Worker emitted ``failed``. Show the error inline in the Settings
+        tab + as a modal dialog so the user can't miss it."""
+        logging.getLogger(__name__).error("Solve failed: %s", message)
+        # Compact one-line version for the status label; full traceback
+        # in the dialog for copy-pasting.
+        first_line = message.splitlines()[0] if message else "Solve failed"
+        self._settings_status_label.setText(
+            f"<span style='color:{_T()['err']};'>Solve failed: {_esc(first_line)}</span>"
+        )
+        self._settings_rerun_btn.setEnabled(True)
+        reload_btn = getattr(self, "_settings_reload_design_btn", None)
+        if reload_btn is not None:
+            reload_btn.setEnabled(True)
+        QMessageBox.critical(self, "Solve failed", message)
+
+    def _on_solve_finished(
+        self, new_solution, metadata: dict,
+        warn_a: float, pct: float, new_settings,
+    ) -> None:
+        """Worker emitted ``finished_ok``. Open a fresh viewer bound to
+        the new solution and close this one once Qt has fully shown the
+        replacement (so the QApplication doesn't quit on the transition)."""
+        log = logging.getLogger(__name__)
+        # Inherit the current window's placement so loading a different
+        # project doesn't snap the viewer back to the default size +
+        # position.
+        prev_geometry = self.geometry()
+        prev_maximized = self.isMaximized()
+        prev_fullscreen = self.isFullScreen()
+        try:
+            new_win = PdnViewer(
+                new_solution,
+                metadata=metadata,
+                initial_settings=new_settings,
+                via_current_warn_a=warn_a,
+                display_percentile_high=pct,
+            )
+            # GC-pin the new window in a module-level list — PySide6's
+            # QApplication property bag doesn't reliably hold Python refs
+            # across signal boundaries, so the window would otherwise be
+            # garbage-collected the moment this slot returns.
+            _register_viewer(new_win)
+            new_win.setGeometry(prev_geometry)
+            if prev_fullscreen:
+                new_win.showFullScreen()
+            elif prev_maximized:
+                new_win.showMaximized()
+            else:
+                # PdnViewer.__init__ sets _pending_maximize=True so the
+                # first showEvent maximises the window. Inheriting the
+                # previous size means we want to keep that size, so cancel
+                # the deferred maximise before showing.
+                new_win._pending_maximize = False
+                new_win.show()
+            _force_native_window_icon(new_win)
+            _set_window_aumid(new_win)
+            # Land on the Heatmap tab so the user immediately sees the
+            # new result — they were on Settings to click Re-run, but
+            # the point of re-running is to inspect the updated heatmap.
+            heatmap_idx = getattr(new_win, "_heatmap_tab_index", 0)
+            new_win.tabs.setCurrentIndex(heatmap_idx)
+        except Exception as e:
+            log.exception("Failed to open new viewer after re-solve")
+            _t = _T()
+            self._settings_status_label.setText(
+                f"<span style='color:{_t['err']};'>Re-solve succeeded but the "
+                f"new viewer failed to open: {_esc(str(e))}</span>"
+            )
+            self._settings_rerun_btn.setEnabled(True)
+            reload_btn = getattr(self, "_settings_reload_design_btn", None)
+            if reload_btn is not None:
+                reload_btn.setEnabled(True)
+            return
+
+        # Brief success flash on the old window before it goes away.
+        self._settings_status_label.setText(
+            f"<span style='color:{_T()['ok']};'>Solve complete — reloading viewer…</span>"
+        )
+        # Defer one tick so Qt has fully shown the new window before this
+        # one disappears. _retire_viewer (not a plain close) destroys the
+        # old window and drops its Solution — a plain close() only hides it,
+        # leaking a full solution into RAM on every reload.
+        QTimer.singleShot(0, lambda: _retire_viewer(self))
+
+
+    # --- Setup tab ----------------------------------------------------------
+
+    def _build_help_tab(self) -> QWidget:
+        """Static HTML reference for keyboard shortcuts + mouse controls."""
+        widget = QWidget(self.tabs)
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(False)
+        _t = _T()
+        browser.setStyleSheet(
+            f"QTextBrowser {{ background-color: {_t['bg']}; color: {_t['fg']}; }}"
+        )
+        browser.setHtml(_help_tab_html())
+        layout.addWidget(browser)
+        return widget
+
+    def _build_setup_tab(self) -> QWidget:
+        """Build the Setup tab — a scrollable HTML view of everything the
+        FEM was given. Helps users verify that copper thickness, conductivity,
+        directive values, etc. match what they entered in Altium.
+
+        Directive blocks render as collapsible sections; clicking the
+        heading re-renders the HTML with that designator toggled into / out
+        of :attr:`_expanded_directives`.
+        """
+        widget = QWidget(self.tabs)
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        self.setup_browser = QTextBrowser()
+        self.setup_browser.setOpenExternalLinks(False)
+        # `setOpenLinks(False)` lets `anchorClicked` fire without QTextBrowser
+        # trying to navigate to a (nonexistent) URL.
+        self.setup_browser.setOpenLinks(False)
+        self.setup_browser.anchorClicked.connect(self._on_setup_anchor_clicked)
+        # Pin the widget palette to the active theme so scrollbar gutter
+        # etc. don't clash with the HTML body's background.
+        _t = _T()
+        self.setup_browser.setStyleSheet(
+            f"QTextBrowser {{ background-color: {_t['bg']}; color: {_t['fg']}; }}"
+        )
+        self._refresh_setup_html()
+        layout.addWidget(self.setup_browser)
+        return widget
+
+    def _refresh_setup_html(self) -> None:
+        """Re-render the Setup tab HTML, preserving the scroll position so
+        toggling a directive doesn't jump the view."""
+        scroll_bar = self.setup_browser.verticalScrollBar()
+        scroll_pos = scroll_bar.value()
+        self.setup_browser.setHtml(_format_setup_html(
+            self.solution, self.metadata, self._expanded_directives,
+            phys_color_fn=self._layer_color_for,
+        ))
+        scroll_bar.setValue(scroll_pos)
+
+    def _on_setup_anchor_clicked(self, url) -> None:
+        """Handle clicks on toggle-anchors in the Setup tab."""
+        href = url.toString()
+        prefix = "toggle:"
+        if not href.startswith(prefix):
+            return
+        # Key is the channel-aware label ("U5" or "U5#1") so each indexed
+        # SOURCE/SINK channel toggles independently.
+        toggle_key = href[len(prefix):]
+        if toggle_key in self._expanded_directives:
+            self._expanded_directives.discard(toggle_key)
+        else:
+            self._expanded_directives.add(toggle_key)
+        self._refresh_setup_html()
+
+
+    # --- Pins tab ------------------------------------------------------------
+
+    # Columns of the Pins-tab table. (display label, numeric? — used for
+    # tab-stop alignment and sort key.)
+    # Column 0 is the per-row "Go" jump cell (a clickable text cell, same
+    # as the Vias tab); the rest are normal text/numeric cells.
+    _PINS_TABLE_COLUMNS: tuple[tuple[str, bool], ...] = (
+        ("",           False),
+        ("Role",       False),
+        ("Designator", False),
+        ("Pad",        False),
+        ("Net",        False),
+        ("Layer",      True),
+        ("X (mm)",     True),
+        ("Y (mm)",     True),
+        ("Voltage (V)",        True),
+        ("Drop (V)",           True),
+        ("|J| (A/mm)",         True),
+        ("Power (W/mm^2)",     True),
+    )
+
+    def _build_pins_tab(self) -> QWidget:
+        """Build the Pins tab — a sortable table of every directive pin
+        and its computed metrics. The filter combo lets users narrow down
+        to a single role (e.g. just SINKs) when there are hundreds of pins."""
+        widget = QWidget(self.tabs)
+        outer = QVBoxLayout(widget)
+        outer.setContentsMargins(8, 8, 8, 8)
+
+        # Filter bar — role + rail combos. Both filters apply; rows must
+        # satisfy BOTH selections to be visible.
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Role:"))
+        self.pins_filter_combo = QComboBox()
+        self.pins_filter_combo.addItem("All roles")
+        for role in ("SOURCE", "SINK", "RESISTOR", "REGULATOR"):
+            self.pins_filter_combo.addItem(role)
+        self.pins_filter_combo.currentTextChanged.connect(self._apply_pins_filter)
+        filter_row.addWidget(self.pins_filter_combo)
+
+        filter_row.addSpacing(12)
+        filter_row.addWidget(QLabel("Rail:"))
+        self.pins_rail_combo = QComboBox()
+        self.pins_rail_combo.addItem("All rails")
+        for r in self._rails:
+            self.pins_rail_combo.addItem(r)
+        self.pins_rail_combo.setToolTip(
+            "Filter rows to pins on the selected rail group (a primary net "
+            "plus any nets bridged to it via a SERIES directive)."
+        )
+        self.pins_rail_combo.currentTextChanged.connect(self._apply_pins_filter)
+        filter_row.addWidget(self.pins_rail_combo)
+
+        filter_row.addStretch(1)
+        self.pins_summary_label = QLabel("")
+        self.pins_summary_label.setStyleSheet(
+            f"QLabel {{ color: {_T()['fg_muted']}; }}"
+        )
+        filter_row.addWidget(self.pins_summary_label)
+        outer.addLayout(filter_row)
+
+        # Table.
+        self.pins_table = QTableWidget()
+        cols = self._PINS_TABLE_COLUMNS
+        self.pins_table.setColumnCount(len(cols))
+        self.pins_table.setHorizontalHeaderLabels([c[0] for c in cols])
+        self.pins_table.setSortingEnabled(True)
+        self.pins_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.pins_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.pins_table.setAlternatingRowColors(True)
+        self.pins_table.verticalHeader().setVisible(False)
+        self.pins_table.horizontalHeader().setStretchLastSection(True)
+        # Interactive (user-draggable). See _build_vias_tab for why
+        # ResizeToContents during populate is a perf disaster — the same
+        # one-shot ``resizeColumnsToContents`` after populate applies here.
+        self.pins_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.Interactive)
+        # Theme-driven styling to match the rest of the viewer.
+        _t = _T()
+        self.pins_table.setStyleSheet(
+            f"QTableWidget {{ background-color: {_t['bg']}; color: {_t['fg']};"
+            f"               gridline-color: {_t['gridline']};"
+            f"               alternate-background-color: {_t['bg_alt']}; }}"
+            f"QHeaderView::section {{ background-color: {_t['bg_header']}; color: {_t['fg_strong']};"
+            f"                       padding: 4px; border: 1px solid {_t['border']}; }}"
+            f"QTableWidget::item:selected {{ background-color: {_t['bg_selection']}; }}"
+        )
+        outer.addWidget(self.pins_table, 1)
+        # Deliberately NOT calling _populate_pins_table() here — the row build
+        # is deferred to first tab activation (see __init__ + _on_tabs_current_changed).
+        return widget
+
+    def _on_tabs_current_changed(self, index: int) -> None:
+        """Lazy-populate the Nodes / Vias tables the first time the user
+        opens them. On a 7 000-via board the Vias populate alone takes
+        ~35 s of blocked GUI thread; doing it on initial viewer open was
+        the freeze users were seeing under the "saving cache" label.
+        Done once per tab — the populated flags guard against re-runs."""
+        if (index == getattr(self, "_pins_tab_index", -1)
+                and not getattr(self, "_pins_table_populated", True)):
+            self._pins_table_populated = True
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                self._populate_pins_table()
+            finally:
+                QApplication.restoreOverrideCursor()
+        elif (index == getattr(self, "_vias_tab_index", -1)
+                and not getattr(self, "_vias_table_populated", True)):
+            self._vias_table_populated = True
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                self._populate_vias_table()
+            finally:
+                QApplication.restoreOverrideCursor()
+
+    def _populate_pins_table(self) -> None:
+        """Fill the Pins table from the cached pin report."""
+        log = logging.getLogger(__name__)
+        _t0 = time.monotonic()
+        rows = self._compute_pin_report()
+        log.info("Pins populate: _compute_pin_report %.2fs (%d rows)",
+                 time.monotonic() - _t0, len(rows))
+        _t1 = time.monotonic()
+        # Sidecar in original row order so the cellClicked handler can
+        # find the pin dict even after the user sorts the table.
+        self._pins_rows = rows
+        cols = self._PINS_TABLE_COLUMNS
+        # Action-column styling, fetched once. Mirrors the Vias tab.
+        action_fg = QBrush(QColor(_T()["accent"]))
+
+        # Column 0 is the action ("Go") cell; everything else is data in
+        # columns 1..N. Stays aligned with _PINS_TABLE_COLUMNS and the
+        # ROLE_COL / NET_COL constants in _apply_pins_filter.
+        ACTION_COL = 0
+
+        self.pins_table.setSortingEnabled(False)  # disable while loading
+        self.pins_table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            # Clickable action cell. The original row index is stashed on
+            # UserRole so the cellClicked handler can recover the row dict
+            # even after the user re-sorts the table.
+            action_item = QTableWidgetItem("Go ▶")
+            action_item.setData(Qt.EditRole, float(r))
+            action_item.setData(Qt.UserRole, r)
+            action_item.setForeground(action_fg)
+            action_item.setTextAlignment(Qt.AlignCenter)
+            action_item.setToolTip(
+                "Click to jump to this node in the Heatmap tab — zooms "
+                "in, enables the node's layer if needed, and drops a "
+                "yellow highlight ring."
+            )
+            self.pins_table.setItem(r, ACTION_COL, action_item)
+
+            cells = (
+                None,  # action column placeholder; we skip it below
+                row.get("role", ""),
+                row.get("designator", ""),
+                row.get("pad", ""),
+                row.get("net", ""),
+                row.get("layer_id", ""),
+                row.get("x_mm"),
+                row.get("y_mm"),
+                row.get("voltage"),
+                row.get("drop"),
+                row.get("current_density"),
+                row.get("power_density"),
+            )
+            for c, (col_label, is_numeric) in enumerate(cols):
+                if c == ACTION_COL:
+                    continue
+                value = cells[c]
+                if value is None:
+                    item = QTableWidgetItem("—")
+                elif is_numeric and isinstance(value, (int, float)):
+                    if isinstance(value, int):
+                        text = f"{value:d}"
+                    else:
+                        text = f"{value:.4g}"
+                    item = QTableWidgetItem(text)
+                    item.setData(Qt.EditRole, float(value))  # numeric sort
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                else:
+                    item = QTableWidgetItem(str(value))
+                self.pins_table.setItem(r, c, item)
+        log.info("Pins populate: items %.2fs", time.monotonic() - _t1)
+        _t2 = time.monotonic()
+        self.pins_table.setSortingEnabled(True)
+        # Default sort: Role ascending (column 1 — column 0 is the "Go"
+        # action cell).
+        self.pins_table.sortByColumn(1, Qt.AscendingOrder)
+        log.info("Pins populate: sort %.2fs", time.monotonic() - _t2)
+        _t3 = time.monotonic()
+        self.pins_table.resizeColumnsToContents()
+        log.info("Pins populate: resizeColumnsToContents %.2fs",
+                 time.monotonic() - _t3)
+        # Wire the table-level click dispatcher once. See the matching
+        # guard in _populate_vias_table for why disconnect() isn't used.
+        if not getattr(self, "_pins_click_handler_wired", False):
+            self.pins_table.cellClicked.connect(self._on_pins_cell_clicked)
+            self._pins_click_handler_wired = True
+        self._apply_pins_filter()  # respect current filter
+        log.info("Pins populate: TOTAL %.2fs", time.monotonic() - _t0)
+
+    def _on_pins_cell_clicked(self, row: int, col: int) -> None:
+        """Single-click on the action column (col 0) → jump to that node
+        in the Heatmap tab. Mirrors :meth:`_on_vias_cell_clicked`."""
+        if col != 0:
+            return
+        item = self.pins_table.item(row, 0)
+        if item is None:
+            return
+        orig_idx = item.data(Qt.UserRole)
+        if (isinstance(orig_idx, int)
+                and 0 <= orig_idx < len(getattr(self, "_pins_rows", []))):
+            self._jump_to_node(self._pins_rows[orig_idx])
+
+    def _apply_pins_filter(self, *_args) -> None:
+        """Hide rows that fail either the Role filter or the Rail filter.
+        Both must pass for a row to remain visible."""
+        role_choice = (self.pins_filter_combo.currentText()
+                       if hasattr(self, "pins_filter_combo") else "All roles")
+        rail_choice = (self.pins_rail_combo.currentText()
+                       if hasattr(self, "pins_rail_combo") else "All rails")
+        # Resolve the rail choice into the set of member net names. "All
+        # rails" → no filtering; an explicit rail → the rail group's nets.
+        if rail_choice == "All rails":
+            allowed_nets: set[str] | None = None
+        else:
+            allowed_nets = set(self._rail_to_members.get(rail_choice, [rail_choice]))
+
+        # Column indexes (must stay aligned with _PINS_TABLE_COLUMNS).
+        # Column 0 is the "Go" action cell, so Role + Net shift up by one.
+        ROLE_COL, NET_COL = 1, 4
+
+        visible = 0
+        for r in range(self.pins_table.rowCount()):
+            role = self.pins_table.item(r, ROLE_COL).text() if self.pins_table.item(r, ROLE_COL) else ""
+            net = self.pins_table.item(r, NET_COL).text() if self.pins_table.item(r, NET_COL) else ""
+            role_ok = role_choice == "All roles" or role == role_choice
+            rail_ok = allowed_nets is None or net in allowed_nets
+            hide = not (role_ok and rail_ok)
+            self.pins_table.setRowHidden(r, hide)
+            if not hide:
+                visible += 1
+        self.pins_summary_label.setText(
+            f"{visible} pin(s) shown out of {self.pins_table.rowCount()} total"
+        )
+
+    def _compute_pin_report(self) -> list[dict]:
+        """Build one row per directive-terminal pin with V / drop / |J| / P.
+
+        Voltage and power-density are sampled from the per-
+        (physical_layer, net) padne Layer's mesh using a
+        ``scipy.spatial.cKDTree`` nearest-vertex lookup, batched across
+        every pin. Padne adds directive-pin coupling sites as Steiner
+        points to the Triangle mesher — so each pin's ``(x, y)`` IS a mesh
+        vertex and the nearest-vertex value is the exact mesh-side
+        potential at the pin. This replaces the original per-pin
+        ``LinearTriInterpolator`` sampling, whose lazy
+        ``TrapezoidMapTriFinder`` build dominated the runtime: ~3 s for
+        175 pins → < 0.1 s after the refactor. ``drop`` is voltage minus
+        the rail group's source voltage (max V at any directive pin on
+        the same rail). Current density |J| = sqrt(power_density × sheet
+        conductance).
+        """
+        if self.metadata is None:
+            return []
+        from scipy.spatial import cKDTree
+
+        layer_index_by_pair = self._index_by_pair  # already keyed (phys, net)
+        id_to_phys = {v: k for k, v in self._phys_name_to_layer_id.items()}
+
+        # Per-(physical, net) cache of (cKDTree, potentials_1d,
+        # pd_per_vertex_1d, sheet_conductance). Built lazily — only built
+        # for (phys, net) combinations that actually have a pin sample.
+        kdtree_cache: dict[tuple[str, str], tuple] = {}
+        # Tolerance for "this pin xy matches a mesh vertex". Same value as
+        # the Vias report — 0.01 mm is well below any Altium grid and
+        # comfortably above float noise.
+        _MATCH_TOL_MM = 0.01
+
+        def _get_v_pd_kdtree(phys_name: str, net_name: str):
+            """Return ``(tree, vs_arr, pds_arr, conductance)``, or
+            ``(None, None, None, 0.0)`` if no mesh exists for this pair."""
+            key = (phys_name, net_name)
+            if key in kdtree_cache:
+                return kdtree_cache[key]
+            li = layer_index_by_pair.get(key)
+            if li is None:
+                kdtree_cache[key] = (None, None, None, 0.0)
+                return kdtree_cache[key]
+            ls = self.solution.layer_solutions[li]
+            layer = self.solution.problem.layers[li]
+            xs_parts, ys_parts, vs_parts, pd_parts = [], [], [], []
+            for xys, tris_local, pot, pd in zip(
+                ls.vertex_xys, ls.triangles,
+                ls.potentials, ls.power_densities,
+            ):
+                n = xys.shape[0]
+                if n == 0 or tris_local.size == 0:
+                    continue
+                # Power density is stored per-face; convert to per-vertex
+                # for nearest-vertex lookup. Mirrors the original logic
+                # used inside the LinearTriInterpolator path.
+                if pd is not None:
+                    pd_per_v = _power_density_per_vertex(
+                        tris_local, pot, pd, layer.conductance, n,
+                    )
+                else:
+                    pd_per_v = np.zeros(n, dtype=np.float64)
+                # Drop orphan vertices — those not referenced by any
+                # triangle. Padne pins them to V=0 to keep the linear
+                # system non-singular; including them in the kdtree
+                # would let a pin sample V=0 instead of the real
+                # voltage when its (x,y) sits within the match
+                # tolerance of an orphan.
+                used = np.unique(tris_local.ravel())
+                xs_parts.append(xys[used, 0])
+                ys_parts.append(xys[used, 1])
+                vs_parts.append(pot[used])
+                pd_parts.append(pd_per_v[used])
+            if not xs_parts:
+                kdtree_cache[key] = (None, None, None, layer.conductance)
+                return kdtree_cache[key]
+            pts = np.column_stack([
+                np.concatenate(xs_parts), np.concatenate(ys_parts),
+            ])
+            vs = np.concatenate(vs_parts)
+            pds = np.concatenate(pd_parts)
+            kdtree_cache[key] = (cKDTree(pts), vs, pds, layer.conductance)
+            return kdtree_cache[key]
+
+        # --- Pass 1: prep each pin + bucket sample requests by (phys, net) ---
+        # preps[i] holds everything needed to assemble row i once voltages
+        # and power densities for that pin are known.
+        preps: list[dict] = []
+        sample_requests: dict[tuple[str, str],
+                              list[tuple[int, float, float]]] = {}
+        for d in self.metadata.get("directives", []):
+            role = d.get("role", "")
+            desig = d.get("designator", "?")
+            # ``label`` disambiguates multi-channel SOURCE/SINK pins
+            # ("U5" vs "U5#1") in the Pins-tab table.
+            display_desig = str(d.get("label") or desig)
+            schdoc = d.get("schdoc", "")
+            for term_name, term in (d.get("terminals") or {}).items():
+                for pin in term.get("pins", []):
+                    layer_id = pin.get("layer_id")
+                    net = pin.get("net", "")
+                    x = pin.get("x_mm")
+                    y = pin.get("y_mm")
+                    phys = id_to_phys.get(layer_id)
+                    prep_idx = len(preps)
+                    preps.append({
+                        "role": role,
+                        "designator": display_desig,
+                        "schdoc": schdoc,
+                        "terminal": term_name,
+                        "pad": pin.get("pad", ""),
+                        "net": net,
+                        "layer_id": layer_id,
+                        "x_mm": x,
+                        "y_mm": y,
+                        "phys": phys,
+                    })
+                    if (phys is not None and x is not None and y is not None):
+                        sample_requests.setdefault((phys, net), []).append(
+                            (prep_idx, float(x), float(y))
+                        )
+
+        # --- Pass 2: batched nearest-vertex lookup per (phys, net) -------
+        # samples[(prep_idx)] = (voltage_or_None, pd_or_None, conductance)
+        samples: dict[int, tuple[float | None, float | None, float]] = {}
+        for key, reqs in sample_requests.items():
+            tree, vs_arr, pds_arr, cond = _get_v_pd_kdtree(*key)
+            if tree is None:
+                for (p, _x, _y) in reqs:
+                    samples[p] = (None, None, cond)
+                continue
+            pts = np.empty((len(reqs), 2), dtype=np.float64)
+            for i, r in enumerate(reqs):
+                pts[i, 0] = r[1]
+                pts[i, 1] = r[2]
+            distances, indices = tree.query(pts)
+            for i, (p, _x, _y) in enumerate(reqs):
+                if distances[i] > _MATCH_TOL_MM:
+                    samples[p] = (None, None, cond)
+                else:
+                    idx = indices[i]
+                    v = float(vs_arr[idx])
+                    pd_v = float(pds_arr[idx])
+                    samples[p] = (
+                        v if np.isfinite(v) else None,
+                        pd_v if np.isfinite(pd_v) else None,
+                        cond,
+                    )
+
+        # --- Pass 3: assemble rows from preps + samples ------------------
+        rows: list[dict] = []
+        for prep_idx, prep in enumerate(preps):
+            voltage, pd_val, conductance = samples.get(
+                prep_idx, (None, None, 0.0)
+            )
+            cd_val = (math.sqrt(max(pd_val * conductance, 0.0))
+                      if pd_val is not None else None)
+            rows.append({
+                "role": prep["role"],
+                "designator": prep["designator"],
+                "schdoc": prep["schdoc"],
+                "terminal": prep["terminal"],
+                "pad": prep["pad"],
+                "net": prep["net"],
+                "layer_id": prep["layer_id"],
+                "x_mm": prep["x_mm"],
+                "y_mm": prep["y_mm"],
+                "voltage": voltage,
+                "power_density": pd_val,
+                "current_density": cd_val,
+            })
+
+        # Now compute Drop per row: V - max(V on the same rail group).
+        # We use the rail-group lookup the heatmap already builds at init.
+        net_to_rail: dict[str, str] = {}
+        for rail, members in self._rail_to_members.items():
+            for n in members:
+                net_to_rail[n] = rail
+        rail_max_v: dict[str, float] = {}
+        for r in rows:
+            rail = net_to_rail.get(r["net"])
+            if rail is None or r["voltage"] is None:
+                continue
+            cur = rail_max_v.get(rail)
+            if cur is None or r["voltage"] > cur:
+                rail_max_v[rail] = r["voltage"]
+        for r in rows:
+            rail = net_to_rail.get(r["net"])
+            if rail is None or r["voltage"] is None or rail not in rail_max_v:
+                r["drop"] = None
+            else:
+                r["drop"] = r["voltage"] - rail_max_v[rail]
+
+        return rows
+
+
+    # --- Vias tab ------------------------------------------------------------
+
+    # Columns of the Vias-tab table. (display label, numeric?)
+    # Column 0 is the per-row "Go" jump button (populated via
+    # ``setCellWidget``); the rest are normal text/numeric cells.
+    _VIAS_TABLE_COLUMNS: tuple[tuple[str, bool], ...] = (
+        ("",                 False),
+        ("Net",              False),
+        ("Layer span",       False),
+        ("X (mm)",           True),
+        ("Y (mm)",           True),
+        ("Diameter (mm)",    True),
+        ("V top (V)",        True),
+        ("V bottom (V)",     True),
+        ("|ΔV| (mV)",        True),
+        ("|I| max (A)",      True),
+        ("Power (mW)",       True),
+    )
+
+    def _build_vias_tab(self) -> QWidget:
+        """Build the Vias tab — a sortable table of every via's worst-segment
+        current + power dissipation. Rows over the warning threshold get a
+        red highlight on the current and power columns so high-current vias
+        jump out even on a 100+ row table."""
+        widget = QWidget(self.tabs)
+        outer = QVBoxLayout(widget)
+        outer.setContentsMargins(8, 8, 8, 8)
+
+        # Filter bar — rail combo + "warnings only" toggle + summary.
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Rail:"))
+        self.vias_rail_combo = QComboBox()
+        self.vias_rail_combo.addItem("All rails")
+        for r in self._rails:
+            self.vias_rail_combo.addItem(r)
+        self.vias_rail_combo.setToolTip(
+            "Filter rows to vias on the selected rail group (a primary net "
+            "plus any nets bridged to it via a SERIES directive)."
+        )
+        self.vias_rail_combo.currentTextChanged.connect(self._apply_vias_filter)
+        filter_row.addWidget(self.vias_rail_combo)
+
+        filter_row.addSpacing(12)
+        self.vias_warn_only_box = QCheckBox(
+            f"Show only warnings (|I| > {self._via_current_warn_a:g} A)"
+        )
+        self.vias_warn_only_box.toggled.connect(self._apply_vias_filter)
+        filter_row.addWidget(self.vias_warn_only_box)
+
+        filter_row.addStretch(1)
+        self.vias_summary_label = QLabel("")
+        self.vias_summary_label.setStyleSheet(
+            f"QLabel {{ color: {_T()['fg_muted']}; }}"
+        )
+        filter_row.addWidget(self.vias_summary_label)
+        outer.addLayout(filter_row)
+
+        # Table.
+        self.vias_table = QTableWidget()
+        cols = self._VIAS_TABLE_COLUMNS
+        self.vias_table.setColumnCount(len(cols))
+        self.vias_table.setHorizontalHeaderLabels([c[0] for c in cols])
+        self.vias_table.setSortingEnabled(True)
+        self.vias_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.vias_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.vias_table.setAlternatingRowColors(True)
+        self.vias_table.verticalHeader().setVisible(False)
+        self.vias_table.horizontalHeader().setStretchLastSection(True)
+        # Interactive (user-draggable) resize. ``ResizeToContents`` triggers
+        # a column re-measurement on every setItem call during populate,
+        # which on a 3 000-row × 11-column table runs to tens of millions
+        # of font-metric calls and dominates the populate time. We do ONE
+        # measurement pass at the end of _populate_vias_table instead via
+        # ``resizeColumnsToContents``.
+        self.vias_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.Interactive)
+        # Theme-driven styling — matches the Pins table.
+        _t = _T()
+        self.vias_table.setStyleSheet(
+            f"QTableWidget {{ background-color: {_t['bg']}; color: {_t['fg']};"
+            f"               gridline-color: {_t['gridline']};"
+            f"               alternate-background-color: {_t['bg_alt']}; }}"
+            f"QHeaderView::section {{ background-color: {_t['bg_header']}; color: {_t['fg_strong']};"
+            f"                       padding: 4px; border: 1px solid {_t['border']}; }}"
+            f"QTableWidget::item:selected {{ background-color: {_t['bg_selection']}; }}"
+        )
+        outer.addWidget(self.vias_table, 1)
+        # Deliberately NOT calling _populate_vias_table() here — the row build
+        # is deferred to first tab activation (see __init__ + _on_tabs_current_changed).
+        # _compute_via_report + the ~7 000 QTableWidgetItem creations took 35 s
+        # on a big board, blocking the whole viewer open. Tab title's warning
+        # count will appear once the user first opens the tab.
+        return widget
+
+    def _get_or_compute_via_rows(self) -> list[dict]:
+        """Run :meth:`_compute_via_report` at most once per viewer and
+        cache the result. Used both by the deferred warning-count
+        initialiser (so the tab title shows "Vias ⚠ N" before the user
+        ever opens the tab) and by :meth:`_populate_vias_table` (so the
+        first table populate skips the compute cost — it's already done).
+        """
+        cached = getattr(self, "_vias_rows_cache", None)
+        if cached is None:
+            cached = self._compute_via_report()
+            self._vias_rows_cache = cached
+        return cached
+
+    def _init_vias_warn_count(self) -> None:
+        """Compute the Vias warning count once the viewer is visible, so
+        the tab title shows the alert badge before the user navigates to
+        the tab. The row dicts are cached for the eventual table populate
+        so we never pay the compute cost twice."""
+        rows = self._get_or_compute_via_rows()
+        warn_count = sum(
+            1 for r in rows
+            if r.get("current") is not None
+            and abs(r["current"]) > self._via_current_warn_a
+        )
+        self._vias_warn_count = warn_count
+        self._update_vias_tab_title(warn_count)
+
+    def _populate_vias_table(self) -> None:
+        """Fill the Vias table from the cached via report.
+
+        The action column is a plain clickable text cell ("Go ▶"), not an
+        embedded QPushButton — embedded widgets via ``setCellWidget`` cost
+        ~5-10 ms each in Qt due to event-loop wiring, hover handling, and
+        layout participation, and on a 3 000-row table that alone was ~25 s
+        of the original 35 s tab-build freeze. Clicks are dispatched
+        through a single table-level ``cellClicked`` signal instead."""
+        log = logging.getLogger(__name__)
+        _t0 = time.monotonic()
+        rows = self._get_or_compute_via_rows()
+        log.info("Vias populate: _compute_via_report %.2fs (%d rows)",
+                 time.monotonic() - _t0, len(rows))
+        _t1 = time.monotonic()
+        # Sidecar in original row order so the cellClicked handler can
+        # find the via dict even after the user sorts the table.
+        self._vias_rows = rows
+        cols = self._VIAS_TABLE_COLUMNS
+        _t = _T()
+        warn_bg = QBrush(QColor(_t["warn_bg"]))
+        warn_fg = QBrush(QColor(_t["warn_fg"]))
+        # Action-column styling colours, fetched once.
+        action_fg = QBrush(QColor(_t["accent"]))
+        action_align = Qt.AlignCenter
+
+        # Column 0 is the action ("Go") cell; everything else is data in
+        # columns 1..N. Stays aligned with _VIAS_TABLE_COLUMNS and the
+        # NET_COL / CURRENT_COL constants in _apply_vias_filter.
+        ACTION_COL = 0
+
+        self.vias_table.setSortingEnabled(False)
+        self.vias_table.setRowCount(len(rows))
+        warn_count = 0
+        for r, row in enumerate(rows):
+            is_warn = (row.get("current") is not None
+                       and abs(row["current"]) > self._via_current_warn_a)
+            if is_warn:
+                warn_count += 1
+            # Clickable action cell. We stash the original row index on
+            # UserRole so the cellClicked handler can recover the row dict
+            # even after the user re-sorts the table.
+            action_item = QTableWidgetItem("Go ▶")
+            action_item.setData(Qt.EditRole, float(r))
+            action_item.setData(Qt.UserRole, r)
+            action_item.setForeground(action_fg)
+            action_item.setTextAlignment(action_align)
+            action_item.setToolTip(
+                "Click to jump to this via in the Heatmap tab — zooms "
+                "in, enables the via's physical layer if needed, and "
+                "drops a yellow highlight ring."
+            )
+            self.vias_table.setItem(r, ACTION_COL, action_item)
+
+            cells = (
+                None,  # action column placeholder; we skip it below
+                row.get("net", ""),
+                row.get("layer_span", ""),
+                row.get("x_mm"),
+                row.get("y_mm"),
+                row.get("diameter_mm"),
+                row.get("v_top"),
+                row.get("v_bottom"),
+                # delta_v is V → display in mV for readability
+                None if row.get("delta_v") is None else row["delta_v"] * 1000.0,
+                row.get("current"),
+                # power is W → display in mW
+                None if row.get("power") is None else row["power"] * 1000.0,
+            )
+            for c, (col_label, is_numeric) in enumerate(cols):
+                if c == ACTION_COL:
+                    continue
+                value = cells[c]
+                if value is None:
+                    item = QTableWidgetItem("—")
+                elif is_numeric and isinstance(value, (int, float)):
+                    if isinstance(value, int):
+                        text = f"{value:d}"
+                    else:
+                        text = f"{value:.4g}"
+                    item = QTableWidgetItem(text)
+                    item.setData(Qt.EditRole, float(value))
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                else:
+                    item = QTableWidgetItem(str(value))
+                # Red-highlight the current + power cells when above
+                # the warning threshold so the user can scan a long list
+                # and spot trouble at a glance.
+                if is_warn and col_label in ("|I| max (A)", "Power (mW)"):
+                    item.setBackground(warn_bg)
+                    item.setForeground(warn_fg)
+                self.vias_table.setItem(r, c, item)
+        log.info("Vias populate: items+styling %.2fs", time.monotonic() - _t1)
+        _t2 = time.monotonic()
+        self.vias_table.setSortingEnabled(True)
+        # Default sort: |I| descending so the worst vias surface at the top.
+        current_col = next((i for i, (n, _) in enumerate(cols)
+                            if n == "|I| max (A)"), 0)
+        self.vias_table.sortByColumn(current_col, Qt.DescendingOrder)
+        log.info("Vias populate: sort %.2fs", time.monotonic() - _t2)
+        _t3 = time.monotonic()
+        # One-shot column sizing now that every cell is set. See the
+        # Interactive-mode rationale in _build_vias_tab.
+        self.vias_table.resizeColumnsToContents()
+        log.info("Vias populate: resizeColumnsToContents %.2fs",
+                 time.monotonic() - _t3)
+        _t4 = time.monotonic()
+        # Wire the table-level click dispatcher once on first populate.
+        # _vias_click_handler_wired guards against re-wiring (which would
+        # cause the handler to fire N times per click after N populates);
+        # disconnect() can't be used because PySide6 emits a noisy
+        # RuntimeWarning when there's nothing to disconnect.
+        if not getattr(self, "_vias_click_handler_wired", False):
+            self.vias_table.cellClicked.connect(self._on_vias_cell_clicked)
+            self._vias_click_handler_wired = True
+        self._vias_warn_count = warn_count
+        self._update_vias_tab_title(warn_count)
+        self._apply_vias_filter()
+        log.info("Vias populate: tail (filter etc) %.2fs",
+                 time.monotonic() - _t4)
+        log.info("Vias populate: TOTAL %.2fs", time.monotonic() - _t0)
+
+    def _on_vias_cell_clicked(self, row: int, col: int) -> None:
+        """Single-click on the action column (col 0) → jump to that via in
+        the Heatmap tab. Replaces the old per-row QPushButton — see
+        :meth:`_populate_vias_table` for the perf motivation."""
+        if col != 0:
+            return
+        item = self.vias_table.item(row, 0)
+        if item is None:
+            return
+        orig_idx = item.data(Qt.UserRole)
+        if (isinstance(orig_idx, int)
+                and 0 <= orig_idx < len(getattr(self, "_vias_rows", []))):
+            self._jump_to_via(self._vias_rows[orig_idx])
+
+    def _update_vias_tab_title(self, warn_count: int) -> None:
+        """Append the warning count to the Vias tab label so users see it
+        without having to open the tab."""
+        idx = getattr(self, "_vias_tab_index", -1)
+        if idx < 0:
+            return
+        title = "Vias" if warn_count == 0 else f"Vias ⚠ {warn_count}"
+        self.tabs.setTabText(idx, title)
+
+    def _apply_vias_filter(self, *_args) -> None:
+        """Hide rows that fail the Rail filter or the warnings-only toggle."""
+        rail_choice = (self.vias_rail_combo.currentText()
+                       if hasattr(self, "vias_rail_combo") else "All rails")
+        warn_only = (self.vias_warn_only_box.isChecked()
+                     if hasattr(self, "vias_warn_only_box") else False)
+        if rail_choice == "All rails":
+            allowed_nets: set[str] | None = None
+        else:
+            allowed_nets = set(self._rail_to_members.get(rail_choice, [rail_choice]))
+
+        # Column indexes (must stay aligned with _VIAS_TABLE_COLUMNS).
+        # Column 0 is the "Go" action button, so Net + Current shift up.
+        NET_COL, CURRENT_COL = 1, 9
+
+        visible = 0
+        warn_visible = 0
+        for r in range(self.vias_table.rowCount()):
+            net_item = self.vias_table.item(r, NET_COL)
+            cur_item = self.vias_table.item(r, CURRENT_COL)
+            net = net_item.text() if net_item else ""
+            try:
+                cur = float(cur_item.text())
+            except (ValueError, AttributeError):
+                cur = 0.0
+            rail_ok = allowed_nets is None or net in allowed_nets
+            warn_ok = (not warn_only) or abs(cur) > self._via_current_warn_a
+            hide = not (rail_ok and warn_ok)
+            self.vias_table.setRowHidden(r, hide)
+            if not hide:
+                visible += 1
+                if abs(cur) > self._via_current_warn_a:
+                    warn_visible += 1
+        self.vias_summary_label.setText(
+            f"{visible} via(s) shown of {self.vias_table.rowCount()} total — "
+            f"{warn_visible} above {self._via_current_warn_a:g} A"
+        )
+
+    def _compute_via_report(self) -> list[dict]:
+        """One row per via with per-segment current + total power dissipation.
+
+        For each via the worst |I| across its inter-layer segments is
+        reported. The voltage at the via's (x, y) is sampled on every layer
+        the via touches that has copper for the via's net — those are the
+        same Layer instances :func:`altium_loader._coupling_networks` built
+        the via resistors between, so the segment list matches the model.
+        Per-segment resistance comes from the via's own ``segments`` list in
+        metadata, so a hop that crosses a thicker dielectric uses the actual
+        R the FEM solved with (not a fixed value).
+
+        Sampling uses a ``scipy.spatial.cKDTree`` of mesh vertices per
+        (physical layer, net), batched across every via. This is correct
+        because padne adds via coupling sites as Steiner points to the
+        Triangle mesher — so the via's ``(x, y)`` IS a mesh vertex and the
+        nearest-vertex potential is the exact voltage at the via. A
+        cKDTree build is pure C and ~100× faster than matplotlib's
+        ``TrapezoidMapTriFinder`` (which we used to build implicitly inside
+        ``LinearTriInterpolator``): 24 s → ~0.3 s on a 21-layer board with
+        2 800 vias.
+        """
+        if self.metadata is None:
+            return []
+        from scipy.spatial import cKDTree
+
+        # Stackup layer ids in physical order (top → bottom). Vias span a
+        # contiguous slice of this list.
+        stackup_ids = [row["layer_id"]
+                       for row in self.metadata.get("stackup", [])]
+        # O(1) lookups beat repeated list.index() per via.
+        stackup_idx: dict[int, int] = {lid: i for i, lid in enumerate(stackup_ids)}
+        id_to_phys = {v: k for k, v in self._phys_name_to_layer_id.items()}
+
+        # Per-(physical, net) cache of (cKDTree, concatenated_potentials).
+        # Built lazily — we only build trees for (phys, net) combinations
+        # that actually have via samples to take.
+        kdtree_cache: dict[tuple[str, str], tuple] = {}
+        # Threshold for "this via xy matches a mesh vertex". 0.01 mm is
+        # well below any sane Altium grid + comfortably above float noise.
+        # Anything farther is treated as off-mesh (returns None).
+        _MATCH_TOL_MM = 0.01
+
+        def _get_v_kdtree(phys_name: str, net_name: str):
+            """Return ``(cKDTree, potentials_1d)`` for this (phys, net), or
+            ``(None, None)`` if no mesh exists for the pair.
+
+            Orphan vertices — vertices not referenced by any triangle —
+            are excluded. Padne pins those to V=0 to keep the linear
+            system non-singular, but they sit in the same vertex array
+            as the real ones. Without filtering, a via whose
+            coupling-network site was skipped (e.g. a microvia whose
+            destination layer's copper doesn't quite cover the via xy)
+            ends up sampling an orphan within the 0.01 mm match
+            tolerance and reports V=0 instead of the rail voltage —
+            which combined with the ~1 mΩ fallback hop resistance
+            yields a multi-thousand-amp ghost current.
+            """
+            key = (phys_name, net_name)
+            if key in kdtree_cache:
+                return kdtree_cache[key]
+            li = self._index_by_pair.get(key)
+            if li is None:
+                kdtree_cache[key] = (None, None)
+                return (None, None)
+            ls = self.solution.layer_solutions[li]
+            xs_parts, ys_parts, vs_parts = [], [], []
+            for xys, tris_local, pot in zip(
+                ls.vertex_xys, ls.triangles, ls.potentials,
+            ):
+                if xys.shape[0] == 0 or tris_local.size == 0:
+                    continue
+                used = np.unique(tris_local.ravel())
+                xs_parts.append(xys[used, 0])
+                ys_parts.append(xys[used, 1])
+                vs_parts.append(pot[used])
+            if not xs_parts:
+                kdtree_cache[key] = (None, None)
+                return (None, None)
+            pts = np.column_stack([
+                np.concatenate(xs_parts), np.concatenate(ys_parts),
+            ])
+            vs = np.concatenate(vs_parts)
+            kdtree_cache[key] = (cKDTree(pts), vs)
+            return kdtree_cache[key]
+
+        # --- Pass 1: pre-process every via and collect sample requests --
+        # Each accepted via gets a "prep" record. For each (phys, net)
+        # interpolator we'll need to hit, we record (prep_idx, lid, x, y).
+        # ``preps[i]`` keeps everything we need to assemble row ``i`` once
+        # the voltages are known.
+        preps: list[dict] = []
+        # sample_requests[(phys, net)] = list of (prep_idx, lid, x, y)
+        sample_requests: dict[tuple[str, str],
+                              list[tuple[int, int, float, float]]] = {}
+
+        for via in self.metadata.get("vias", []):
+            net = via.get("net", "")
+            if not net or net in ("?", "NO_NET", ""):
+                continue
+            x = via.get("x_mm", 0.0)
+            y = via.get("y_mm", 0.0)
+            ls_id = via.get("layer_start")
+            le_id = via.get("layer_end")
+            if ls_id is None or le_id is None:
+                continue
+            lo, hi = (ls_id, le_id) if ls_id <= le_id else (le_id, ls_id)
+            i_start = stackup_idx.get(lo)
+            i_end = stackup_idx.get(hi)
+            if i_start is None or i_end is None:
+                continue
+            span_ids = stackup_ids[i_start:i_end + 1]
+            if len(span_ids) < 2:
+                continue
+            # Per-hop R lookup from the via's own segments list (frozenset
+            # key so order-independent). Each via carries its own list
+            # because R varies with drill diameter + hop length.
+            # An EMPTY segments list means
+            # :func:`altium_loader._coupling_networks` skipped this via
+            # (no copper on >=2 layers in its span, so no resistor was
+            # inserted in the FEM). Reporting a "current" for such a via
+            # is meaningless — every per-hop R would come from the
+            # fallback constant, while the sampled voltages would come
+            # from neighbouring coupling sites, giving ghost currents
+            # of thousands of amps. Skip these vias entirely.
+            site_segments = via.get("segments") or []
+            if not site_segments:
+                continue
+            # Only request voltage samples for layers that actually
+            # appear as an endpoint of a real FEM segment. Sampling
+            # the via's full stackup span (then computing
+            # adjacent-pair currents) would invent non-physical
+            # hops: e.g. a microvia at bottom↔L15 whose net also
+            # has stub copper on L20 would produce a fake
+            # (L15, L20, fallback_R) pair and a tiny FEM voltage
+            # gradient would become a fictitious amp.
+            seg_layer_ids: set[int] = set()
+            for seg in site_segments:
+                seg_layer_ids.add(int(seg["layer_a"]))
+                seg_layer_ids.add(int(seg["layer_b"]))
+            prep_idx = len(preps)
+            preps.append({
+                "via": via,
+                "net": net,
+                "x": x,
+                "y": y,
+                "segments": site_segments,
+                "seg_layer_ids": seg_layer_ids,
+            })
+            for lid in seg_layer_ids:
+                phys = id_to_phys.get(lid)
+                if phys is None:
+                    continue
+                sample_requests.setdefault((phys, net), []).append(
+                    (prep_idx, lid, x, y)
+                )
+
+        # --- Pass 2: batched nearest-vertex lookup per interpolator ----
+        # voltages[(prep_idx, lid)] = float or None (None == off-mesh).
+        voltages: dict[tuple[int, int], float | None] = {}
+        for key, reqs in sample_requests.items():
+            tree, vs_arr = _get_v_kdtree(*key)
+            if tree is None:
+                for (p, lid, _x, _y) in reqs:
+                    voltages[(p, lid)] = None
+                continue
+            pts = np.empty((len(reqs), 2), dtype=np.float64)
+            for i, r in enumerate(reqs):
+                pts[i, 0] = r[2]
+                pts[i, 1] = r[3]
+            # Vectorised: one C call returns the nearest vertex index and
+            # distance for the whole batch.
+            distances, indices = tree.query(pts)
+            for i, (p, lid, _x, _y) in enumerate(reqs):
+                if distances[i] > _MATCH_TOL_MM:
+                    voltages[(p, lid)] = None
+                else:
+                    v = float(vs_arr[indices[i]])
+                    voltages[(p, lid)] = v if np.isfinite(v) else None
+
+        # --- Pass 3: assemble rows --------------------------------------
+        # Currents come strictly from the via's FEM-defined segments —
+        # each segment is a real Resistor padne inserted, with the same
+        # ``resistance_ohm`` the FEM solved with. We deliberately do NOT
+        # synthesise extra hops from adjacent layers in the via's
+        # stackup span: that produced phantom-amp readings on vias
+        # whose net happened to have unrelated stub copper on a
+        # layer between the two real endpoints (no FEM resistor at
+        # that pair → fallback_r_seg → tiny ΔV / 1 mΩ → kilo-amp).
+        rows: list[dict] = []
+        for prep_idx, prep in enumerate(preps):
+            seg_currents: list[float] = []
+            total_power_W = 0.0
+            sampled_v: dict[int, float] = {}
+            for seg in prep["segments"]:
+                lid_a = int(seg["layer_a"])
+                lid_b = int(seg["layer_b"])
+                r_hop = float(seg["resistance_ohm"])
+                if r_hop <= 0.0:
+                    continue
+                v_a = voltages.get((prep_idx, lid_a))
+                v_b = voltages.get((prep_idx, lid_b))
+                if v_a is None or v_b is None:
+                    # One end's coupling site has no usable mesh
+                    # sample. Skip this hop rather than fall back to
+                    # a fictitious resistance — without both real
+                    # voltages the computed current is meaningless.
+                    continue
+                i_seg = (v_a - v_b) / r_hop
+                seg_currents.append(i_seg)
+                total_power_W += i_seg * i_seg * r_hop
+                sampled_v[lid_a] = v_a
+                sampled_v[lid_b] = v_b
+            if not seg_currents:
+                continue
+            max_abs_I = max(abs(I) for I in seg_currents)
+            # Order the sampled-voltage layers by physical stackup
+            # position (top→bottom) so v_top / v_bottom and the
+            # "layer_span" label name them in the natural order.
+            sampled_sorted = sorted(
+                sampled_v.items(),
+                key=lambda kv: stackup_idx.get(kv[0], 1 << 30),
+            )
+            top_lid, v_top = sampled_sorted[0]
+            bot_lid, v_bottom = sampled_sorted[-1]
+            top_name = self._layer_id_to_name(top_lid)
+            bottom_name = self._layer_id_to_name(bot_lid)
+            rows.append({
+                "net": prep["net"],
+                "layer_span": f"{top_name} → {bottom_name}",
+                # Sampled-and-coupled layer ids in stackup order (top
+                # first). Used by the Vias-tab "Go" jump to pick which
+                # physical layer to make visible in the Heatmap tab.
+                "layer_ids": [lid for lid, _v in sampled_sorted],
+                "x_mm": prep["x"],
+                "y_mm": prep["y"],
+                "diameter_mm": prep["via"].get("diameter_mm"),
+                "v_top": v_top,
+                "v_bottom": v_bottom,
+                "delta_v": v_top - v_bottom,
+                "current": max_abs_I,
+                "power": total_power_W,
+            })
+        return rows
+
+    def _layer_id_to_name(self, layer_id: int) -> str:
+        """Look up a stackup layer's human-readable name (e.g. 'Top') by id.
+        Falls back to ``"L<id>"`` for unknown ids."""
+        for row in (self.metadata.get("stackup", []) if self.metadata else []):
+            if row.get("layer_id") == layer_id:
+                return row.get("name") or f"L{layer_id}"
+        return f"L{layer_id}"
+
+    # --- Vias-tab "Go" jump action -----------------------------------------
+
+    # Default world half-width of the zoom-in view when the user jumps to
+    # a via, in mm. Picked to comfortably show the via + its immediate
+    # surroundings on a typical-density board.
+    _JUMP_HALF_WIDTH_MM: float = 5.0
+
+    def _jump_to_via(self, row: dict) -> None:
+        """Switch to the Heatmap tab, ensure at least one of the via's
+        spanning physical layers is visible, zoom in on the via, and
+        drop a yellow highlight ring at its location."""
+        self._jump_to_xy(row.get("x_mm"), row.get("y_mm"),
+                         row.get("layer_ids"))
+
+    def _jump_to_node(self, row: dict) -> None:
+        """Nodes-tab "Go" action — same as :meth:`_jump_to_via` but for a
+        directive pin, which sits on a single physical layer."""
+        lid = row.get("layer_id")
+        self._jump_to_xy(row.get("x_mm"), row.get("y_mm"),
+                         [lid] if lid is not None else [])
+
+    def _jump_to_xy(self, x, y, layer_ids) -> None:
+        """Switch to the Heatmap tab, ensure at least one of the given
+        physical layers is visible, zoom in on ``(x, y)``, and drop a
+        yellow highlight ring at that location. Shared by the Vias-tab
+        and Nodes-tab "Go" actions."""
+        if x is None or y is None:
+            return
+
+        # Make sure at least one of the location's physical layers is
+        # checked in the layer list. If none are, tick the topmost in
+        # the span (typically the user wants to see the layer the trace
+        # enters from).
+        layer_ids = layer_ids or []
+        if layer_ids:
+            id_to_phys = {v: k for k, v in self._phys_name_to_layer_id.items()}
+            phys_in_span = [id_to_phys[lid] for lid in layer_ids
+                            if lid in id_to_phys]
+            if phys_in_span:
+                visible = set(self._visible_layers())
+                if not (visible & set(phys_in_span)):
+                    # Topmost in stackup wins (lowest rank). emit=False to
+                    # suppress the eye's signal — we render explicitly below.
+                    choice = min(phys_in_span,
+                                  key=lambda p: self._phys_stackup_rank.get(p, 0))
+                    self._set_layer_visible(choice, True, emit=False)
+
+        # Compute zoom: pick mm/pixel so the highlighted region spans
+        # the smaller widget dimension comfortably.
+        widget_w = max(1, self._gl_viewer.width() if self._gl_viewer else 800)
+        widget_h = max(1, self._gl_viewer.height() if self._gl_viewer else 600)
+        half = self._JUMP_HALF_WIDTH_MM
+        mm_per_pixel = (2.0 * half) / min(widget_w, widget_h)
+
+        # Stash the highlight, switch tabs, re-render, then set view.
+        # Re-render first so the layer change + markers are applied,
+        # THEN move the view so the GL viewer is sized correctly.
+        self._highlight_via_xy = (float(x), float(y))
+        self.tabs.setCurrentIndex(self._heatmap_tab_index)
+        self._render()
+        self._gl_viewer.set_view_center_scale(float(x), float(y), mm_per_pixel)
+
+
+def _help_tab_style() -> str:
+    """Build the Help-tab inline <style> block using the active theme."""
+    t = current_theme()
+    return (
+        "<style>"
+        f"  body {{ font-family: Segoe UI, sans-serif; font-size: 11pt;"
+        f"         color: {t['fg']}; background-color: {t['bg']}; }}"
+        f"  h2 {{ margin-top: 18px; color: {t['fg_strong']};"
+        f"       border-bottom: 1px solid {t['border']}; padding-bottom: 2px; }}"
+        f"  h3 {{ margin-top: 14px; color: {t['accent']}; }}"
+        f"  p, li {{ color: {t['fg']}; }}"
+        f"  table {{ border-collapse: collapse; margin: 6px 0;"
+        f"          color: {t['fg']}; background-color: {t['bg']}; }}"
+        f"  th, td {{ border: 1px solid {t['border']}; padding: 4px 10px;"
+        f"           text-align: left; vertical-align: top; }}"
+        f"  th {{ background-color: {t['bg_header']}; color: {t['fg_strong']}; font-weight: 600; }}"
+        f"  kbd {{ background-color: {t['bg_input']}; color: {t['code']};"
+        f"        border: 1px solid {t['border']}; border-radius: 3px;"
+        f"        padding: 1px 6px; font-family: Consolas, monospace; font-size: 10pt; }}"
+        f"  .muted {{ color: {t['fg_dim']}; }}"
+        "</style>"
+    )
+
+
+_HELP_TAB_BODY = """
+
+<h2>Keyboard shortcuts</h2>
+<table>
+  <tr><th>Key</th><th>Action</th></tr>
+  <tr><td><kbd>2</kbd></td><td>Switch to 2D mode <span class='muted'>(re-fits to data)</span></td></tr>
+  <tr><td><kbd>3</kbd></td><td>Switch to 3D mode <span class='muted'>(re-fits to data)</span></td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>2</kbd></td><td>Switch to 2D <i>keeping the current view</i></td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>3</kbd></td><td>Switch to 3D <i>keeping the current view</i> (top-down entry)</td></tr>
+  <tr><td><kbd>0</kbd></td><td>Reset the 3D view (top-down, refit to data) <span class='muted'>— 3D mode only</span></td></tr>
+  <tr><td><kbd>O</kbd></td><td>Toggle <i>Show layer outlines</i></td></tr>
+  <tr><td><kbd>P</kbd></td><td>Toggle <i>Show pads</i></td></tr>
+  <tr><td><kbd>C</kbd></td><td>Toggle <i>Show all copper</i></td></tr>
+  <tr><td><kbd>I</kbd></td><td>Toggle <i>Show pin markers</i></td></tr>
+  <tr><td><kbd>R</kbd></td><td>Toggle <i>Show only rail net</i></td></tr>
+  <tr><td><kbd>T</kbd></td><td>Toggle <i>Show cursor tooltip</i></td></tr>
+  <tr><td><kbd>A</kbd></td><td>Toggle <i>Show current arrows</i></td></tr>
+  <tr><td><kbd>V</kbd></td><td>Toggle <i>Heatmap vias/PTH</i> <span class='muted'>— 3D mode only</span></td></tr>
+  <tr><td><kbd>M</kbd></td><td>Cycle <i>Mode</i> forward (Voltage &rarr; Voltage Drop &rarr; &hellip;)</td></tr>
+  <tr><td><kbd>Shift</kbd>+<kbd>M</kbd></td><td>Cycle <i>Mode</i> backward</td></tr>
+  <tr><td><kbd>H</kbd></td><td>Cycle <i>colour scheme</i> forward (Viridis &rarr; Blue&nbsp;&rarr;&nbsp;Red &rarr; &hellip;)</td></tr>
+  <tr><td><kbd>Shift</kbd>+<kbd>H</kbd></td><td>Cycle <i>colour scheme</i> backward</td></tr>
+  <tr><td><kbd>B</kbd></td><td>Collapse / expand the side panel</td></tr>
+</table>
+<p class='muted'>Shortcuts are window-scoped — they fire when the viewer
+window has focus but defer to text inputs (e.g. the Min/Max boxes)
+when one of those has focus.</p>
+
+<h2>Mouse controls</h2>
+
+<h3>Both modes</h3>
+<table>
+  <tr><th>Gesture</th><th>Action</th></tr>
+  <tr><td>Right-button drag</td><td>Pan the view</td></tr>
+  <tr><td>Mouse wheel</td><td>Zoom in / out (around cursor in 2D, dolly camera in 3D)</td></tr>
+  <tr><td>Middle-button drag &uarr;/&darr;</td><td>Exponential zoom — drag up = zoom in, down = zoom out</td></tr>
+  <tr><td>Left click</td><td>Clear the yellow jump highlight (from a Vias/Nodes-tab Go)</td></tr>
+</table>
+
+<h3>3D mode only</h3>
+<table>
+  <tr><th>Gesture</th><th>Action</th></tr>
+  <tr><td><kbd>Shift</kbd> + right-button drag</td><td>Rotate (orbit the camera around the board centre)</td></tr>
+</table>
+
+<h3>Voltage / Voltage Drop mode only <span class='muted'>(2D only)</span></h3>
+<table>
+  <tr><th>Gesture</th><th>Action</th></tr>
+  <tr><td>Hold <kbd>Shift</kbd></td><td>Anchor a voltage probe at the cursor and draw a thin white
+    line from there to the live mouse position. The probe bar gains a
+    <code>Difference = X V</code> readout — the live cursor's voltage
+    minus the anchor's. Press only takes effect when the cursor is
+    over copper that has a voltage value; release <kbd>Shift</kbd> to
+    clear the line.</td></tr>
+</table>
+
+<h2>Side-panel controls</h2>
+<ul>
+  <li><b>Physical layers</b> &mdash; tick checkboxes to stack multiple
+    copper layers in the view. Each layer has its own swatch colour
+    used by the outline overlay.</li>
+  <li><b>Rails</b> &mdash; tick one or more bridged rail groups to
+    show their copper (e.g. <code>+3V3</code> bundles <code>+3V3</code>
+    + <code>3V3_SW</code> if a series resistor / inductor links them).
+    Use the <i>All Rails</i> row to toggle every rail at once.</li>
+  <li><b>Mode</b> &mdash; Voltage / Voltage Drop / Current Density /
+    Power Density.</li>
+  <li><b>Show only rail net</b> &mdash; hide bridged sibling nets so
+    you see just each selected rail's primary net.</li>
+  <li><b>Show pin markers</b> &mdash; SOURCE / SINK / SERIES /
+    REGULATOR / VIA overlays.</li>
+  <li><b>Show layer outlines</b> &mdash; trace each copper polygon's
+    border in the layer's swatch colour.</li>
+  <li><b>Show pads</b> &mdash; trace each SMT / through-hole pad on
+    the visible copper layers with a thin black outline. SMT pads
+    appear only on their assigned layer; through-hole pads appear on
+    every enabled copper layer.</li>
+  <li><b>Show all copper</b> &mdash; trace every copper polygon on a
+    visible layer that does NOT belong to any currently selected rail,
+    in that layer's swatch colour. Helps spot where other rails and
+    signal nets sit on the same board.</li>
+  <li><b>Show cursor tooltip</b> &mdash; a small tooltip follows the
+    mouse, showing the value of the current mode at that point along
+    with the net and layer. Same info as the probe bar under the plot.</li>
+  <li><b>3D view</b> &mdash; perspective view of the stacked layers
+    with via cylinders.</li>
+  <li><b>Heatmap vias/PTH</b> &mdash; colour via and plated-through-hole
+    cylinders by the active mode instead of solid orange / light grey.
+    Voltage / Voltage Drop interpolate along the barrel's length; Current
+    Density and Power Density are constant per inter-layer segment. 3D
+    mode only.</li>
+  <li><b>Layer spacing slider</b> &mdash; 3D only. Scales both the
+    inter-layer separation and the via cylinder length.</li>
+  <li><b>Show current arrows</b> &mdash; white arrows on a regular
+    pixel-spaced grid showing the direction of current flow; shaft
+    length scales with &radic;|J| so weak and strong currents are
+    both visible. Re-sampled on zoom / rotate. Works in 2D and 3D
+    (in 3D each arrow rides the top face of its layer).</li>
+  <li><b>Arrow spacing (px)</b> &mdash; pixels between adjacent
+    arrows on screen. Smaller = denser arrows.</li>
+  <li><b>Color scale</b> &mdash; the gradient strip is overlaid on the
+    viewer's bottom-left corner (with value ticks); drag its Min / Max
+    handles, type exact values in the side-panel boxes, or click the
+    <b>&#8634;</b> reset button to restore the data range.</li>
+</ul>
+
+<h2>Tabs</h2>
+<ul>
+  <li><b>Heatmap</b> &mdash; the interactive viewport.</li>
+  <li><b>Setup</b> &mdash; HTML report of the solved problem: stackup,
+    physics constants, parsed PDN_* directives (collapsible), solver
+    diagnostics, warnings / errors.</li>
+  <li><b>Nodes</b> &mdash; sortable table of every directive pin with
+    its voltage, drop, current density, and power density. Filter by
+    role or rail. The <b>Go &#9654;</b> button jumps to that node in
+    the Heatmap tab (enables its layer, zooms in, drops a yellow
+    highlight ring &mdash; left-click anywhere to clear).</li>
+  <li><b>Vias</b> &mdash; sortable table of every via with worst-segment
+    current + power dissipation. The <b>Go &#9654;</b> button jumps to
+    that via in the Heatmap tab (enables its layer, zooms in, drops a
+    yellow highlight ring &mdash; left-click anywhere to clear).
+    The tab title also shows a warning count if any via current
+    exceeds the threshold.</li>
+  <li><b>Settings</b> &mdash; tunable physics, meshing, and display
+    options, plus per-layer copper thicknesses. Edits apply on the next
+    solve: <b>Re-run Solver</b> re-solves with the new settings and
+    opens a fresh viewer.</li>
+</ul>
+"""
+
+
+def _help_tab_html() -> str:
+    """Render the Help tab — theme-aware <style> block + static body."""
+    return _help_tab_style() + _HELP_TAB_BODY
+
+
+_AUMID: str = "cutreedesigns.fypa.viewer"
+
+
+def _set_windows_app_user_model_id() -> None:
+    """Tell Windows we are our own app (not python.exe).
+
+    Without an explicit AppUserModelID, Windows groups the taskbar
+    entry under the host interpreter (``python.exe``) and shows its
+    icon there. Must be called BEFORE the first window appears.
+
+    Silent no-op on non-Windows platforms. Logs to stderr on failure
+    so the icon-not-changing case is debuggable instead of mysterious.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_AUMID)
+    except Exception as e:
+        sys.stderr.write(
+            f"[altium_viewer] AppUserModelID setup failed ({e}); "
+            "taskbar may show python.exe's icon.\n"
+        )
+
+
+def _force_native_window_icon(window) -> None:
+    """Push the ``assets/icon.ico`` file straight into the window via
+    Win32 ``WM_SETICON`` — bypasses Qt's ``setWindowIcon`` path entirely.
+
+    Qt's setWindowIcon does the equivalent on most setups, but in some
+    Python-host configurations it ends up sending an empty/wrong icon
+    handle and the taskbar falls back to python.exe's snake. Calling
+    ``LoadImageW(.ico)`` + ``WM_SETICON`` ourselves is the documented
+    Win32 way and is bulletproof.
+
+    Sizing strategy: load *larger* frames than the bare system metrics
+    suggest (256×256 for ICON_BIG, 64×64 for ICON_SMALL by default).
+    The taskbar in Windows 10/11 paints icons in slots that are bigger
+    than the legacy ICON_SMALL metric (~16px) — pulling a 256/64 frame
+    from our multi-res .ico lets Windows scale **down** (sharp) instead
+    of scaling our 32/16 frame up (blurry). Override with the env var
+    ``FYPA_ICON_BIG`` / ``FYPA_ICON_SMALL`` if needed.
+
+    Must be called AFTER ``window.show()`` so ``winId()`` returns a
+    valid HWND.
+    """
+    if sys.platform != "win32" or not _ICON_PATH_ICO.is_file():
+        return
+    debug = bool(os.environ.get("FYPA_ICON_DEBUG"))
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.LoadImageW.restype = wintypes.HANDLE
+        user32.LoadImageW.argtypes = [
+            wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT,
+        ]
+        user32.SendMessageW.restype = ctypes.c_ssize_t
+        user32.SendMessageW.argtypes = [
+            wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t,
+        ]
+        LR_LOADFROMFILE = 0x0010
+        IMAGE_ICON = 1
+        WM_SETICON = 0x0080
+        ICON_SMALL = 0
+        ICON_BIG = 1
+        ICON_SMALL2 = 2
+
+        # Default to the largest frame in the .ico for ICON_BIG and a
+        # comfortable mid-size for ICON_SMALL. Windows scales down
+        # smoothly; scaling up from 32×32 is what produced the blocky
+        # taskbar icon users were seeing.
+        try:
+            big_size = int(os.environ.get("FYPA_ICON_BIG", "256"))
+        except ValueError:
+            big_size = 256
+        try:
+            small_size = int(os.environ.get("FYPA_ICON_SMALL", "64"))
+        except ValueError:
+            small_size = 64
+
+        hwnd = int(window.winId())
+        ico_big = str(_ICON_PATH_ICO)
+        # ICON_SMALL drives the title bar bitmap; use the text-only
+        # wordmark when available so the title bar reads "FYPA" while
+        # the taskbar (ICON_BIG) still gets the fang logo.
+        ico_small = (str(_ICON_PATH_ICO_TITLE)
+                     if _ICON_PATH_ICO_TITLE.is_file() else ico_big)
+        hicon_big = user32.LoadImageW(
+            None, ico_big, IMAGE_ICON, big_size, big_size, LR_LOADFROMFILE,
+        )
+        hicon_small = user32.LoadImageW(
+            None, ico_small, IMAGE_ICON, small_size, small_size, LR_LOADFROMFILE,
+        )
+        if debug:
+            sys.stderr.write(
+                f"[altium_viewer] icon: hwnd=0x{hwnd:x} "
+                f"big={big_size}px (hicon={hicon_big!r}) "
+                f"small={small_size}px (hicon={hicon_small!r})\n"
+            )
+        if hicon_big:
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big)
+        if hicon_small:
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL2, hicon_small)
+    except Exception as e:
+        sys.stderr.write(
+            f"[altium_viewer] native WM_SETICON failed ({e}); "
+            "taskbar icon may not update.\n"
+        )
+
+
+def _set_window_aumid(window) -> None:
+    """Bind the window's :data:`_AUMID` via ``SHGetPropertyStoreForWindow``
+    + ``PKEY_AppUserModel_ID``. Per-window AUMID overrides the process
+    AUMID for taskbar grouping; some Windows versions need this for the
+    icon override to take effect for non-pinned launches.
+
+    Must run AFTER ``window.show()`` — needs a valid HWND.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes, POINTER, byref, c_void_p
+
+        # COM constants and types ---------------------------------------
+        # IPropertyStore IID  886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99
+        IID_IPropertyStore = (ctypes.c_ubyte * 16)(
+            0xEB, 0x8E, 0x6D, 0x88,
+            0xF2, 0x8C, 0x46, 0x44,
+            0x8D, 0x02, 0xCD, 0xBA,
+            0x1D, 0xBD, 0xCF, 0x99,
+        )
+        # PROPERTYKEY: fmtid (GUID) + pid (DWORD). For
+        # System.AppUserModel.ID the fmtid is
+        # 9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3, pid = 5
+        class PROPERTYKEY(ctypes.Structure):
+            _fields_ = [
+                ("fmtid", ctypes.c_ubyte * 16),
+                ("pid", wintypes.DWORD),
+            ]
+        pkey = PROPERTYKEY()
+        pkey.fmtid[:] = (
+            0x55, 0x28, 0x4C, 0x9F,
+            0x79, 0x9F, 0x39, 0x4B,
+            0xA8, 0xD0, 0xE1, 0xD4,
+            0x2D, 0xE1, 0xD5, 0xF3,
+        )
+        pkey.pid = 5
+
+        # PROPVARIANT for VT_LPWSTR. The struct is 16 bytes total; we
+        # just need the first 8 to encode the discriminator and pad,
+        # then a pointer to the wide-string.
+        VT_LPWSTR = 31
+        class PROPVARIANT(ctypes.Structure):
+            _fields_ = [
+                ("vt", wintypes.USHORT),
+                ("wReserved1", wintypes.USHORT),
+                ("wReserved2", wintypes.USHORT),
+                ("wReserved3", wintypes.USHORT),
+                ("pwszVal", wintypes.LPWSTR),
+                ("padding", wintypes.LARGE_INTEGER),
+            ]
+
+        SHGetPropertyStoreForWindow = ctypes.windll.shell32.SHGetPropertyStoreForWindow
+        SHGetPropertyStoreForWindow.argtypes = [
+            wintypes.HWND, c_void_p, POINTER(c_void_p),
+        ]
+        SHGetPropertyStoreForWindow.restype = ctypes.HRESULT
+
+        store_ptr = c_void_p()
+        hwnd = int(window.winId())
+        hr = SHGetPropertyStoreForWindow(
+            hwnd, ctypes.cast(IID_IPropertyStore, c_void_p), byref(store_ptr),
+        )
+        if hr != 0 or not store_ptr:
+            return
+        # IPropertyStore vtable layout:
+        #   0: QueryInterface  1: AddRef  2: Release
+        #   3: GetCount  4: GetAt  5: GetValue
+        #   6: SetValue(REFPROPERTYKEY, REFPROPVARIANT)  7: Commit
+        try:
+            vtable = ctypes.cast(
+                store_ptr.value, POINTER(POINTER(c_void_p)),
+            )[0]
+            SetValue = ctypes.WINFUNCTYPE(
+                ctypes.HRESULT, c_void_p,
+                POINTER(PROPERTYKEY), POINTER(PROPVARIANT),
+            )(vtable[6])
+            Commit = ctypes.WINFUNCTYPE(ctypes.HRESULT, c_void_p)(vtable[7])
+            Release = ctypes.WINFUNCTYPE(ctypes.c_ulong, c_void_p)(vtable[2])
+            pv = PROPVARIANT()
+            pv.vt = VT_LPWSTR
+            pv.pwszVal = _AUMID
+            SetValue(store_ptr, byref(pkey), byref(pv))
+            Commit(store_ptr)
+            Release(store_ptr)
+        except Exception as e:
+            sys.stderr.write(
+                f"[altium_viewer] per-window AUMID setup failed ({e}); "
+                "ignoring.\n"
+            )
+    except Exception as e:
+        sys.stderr.write(
+            f"[altium_viewer] SHGetPropertyStoreForWindow lookup failed "
+            f"({e}); ignoring.\n"
+        )
+
+
+def main(solution, warnings_list=None, metadata=None) -> int:
+    """CLI entry — show the viewer for the given Solution and run the Qt
+    event loop. Returns the QApplication exit code.
+
+    If ``solution is None``, opens an empty :class:`LauncherWindow` instead
+    so the user can pick a project / pickle from the File menu.
+    """
+    # Windows taskbar grouping — must happen BEFORE any window is shown.
+    _set_windows_app_user_model_id()
+    app = QApplication.instance()
+    owns_app = app is None
+    if owns_app:
+        app = QApplication(sys.argv)
+    # Theme — load the persisted choice (default: dark) and apply the
+    # matching palette + base stylesheet to the QApplication BEFORE any
+    # window is constructed, so the side panel, menubar and dialogs
+    # follow the theme on every machine regardless of system palette.
+    apply_app_theme(app, load_saved_theme_mode())
+    # Application-wide icon (covers Qt's WM_SETICON path).
+    icon = _load_app_icon()
+    if icon is not None:
+        app.setWindowIcon(icon)
+    if solution is None:
+        win = LauncherWindow()
+    else:
+        win = PdnViewer(solution, metadata=metadata)
+    win.show()
+    # Belt and braces: also push the .ico directly via WM_SETICON in
+    # case Qt's icon path doesn't reach the taskbar, and bind our AUMID
+    # to the window so Windows uses our icon for the taskbar grouping.
+    _force_native_window_icon(win)
+    _set_window_aumid(win)
+    if owns_app:
+        return app.exec()
+    return 0
+
+
+# --- Setup-tab HTML formatter (module-level, no Qt deps) ---------------------
+
+def _format_setup_html(solution, metadata: dict | None,
+                       expanded_directives: set[str] | frozenset[str] = frozenset(),
+                       *,
+                       phys_color_fn=None,
+                       ) -> str:
+    """Render the metadata bundle as a single HTML document for QTextBrowser.
+
+    ``expanded_directives`` is the set of channel-aware directive labels
+    ("U5" for legacy single-channel, "U5#1" for indexed multi-channel)
+    whose terminal-pin tables should be shown. Any directive NOT in this
+    set is rendered collapsed (heading only, click to expand).
+
+    Falls back to a "metadata not available — re-solve with the current
+    version" notice when ``metadata is None`` (legacy pickle).
+    """
+    if metadata is None:
+        return (
+            "<h2>Setup metadata not available</h2>"
+            "<p>This solution pickle was saved with an older version of the "
+            "tool that did not bundle setup metadata. To populate this tab, "
+            "re-run the solver:</p>"
+            "<pre>python FYPA.py solve YOUR.PrjPcb output.pkl</pre>"
+            "<p>and then re-open the result with <code>show</code>.</p>"
+        )
+
+    parts: list[str] = []
+    # Self-contained styling — colours come from the active theme dict so
+    # the Setup tab tracks dark / light mode the same as the rest of the UI.
+    _t = current_theme()
+    parts.append(
+        "<style>"
+        f"body {{ font-family: Segoe UI, sans-serif; font-size: 11pt;"
+        f"       color: {_t['fg']}; background-color: {_t['bg']}; }}"
+        f"h2 {{ margin-top: 18px; color: {_t['fg_strong']};"
+        f"     border-bottom: 1px solid {_t['border']}; padding-bottom: 2px; }}"
+        f"h3 {{ margin-top: 14px; color: {_t['accent']}; }}"
+        f"p  {{ color: {_t['fg']}; }}"
+        f"table {{ border-collapse: collapse; margin: 6px 0;"
+        f"        color: {_t['fg']}; background-color: {_t['bg']}; }}"
+        f"th, td {{ border: 1px solid {_t['border']}; padding: 4px 8px;"
+        f"         text-align: left; color: {_t['fg']}; }}"
+        f"th {{ background-color: {_t['bg_header']}; color: {_t['fg_strong']};"
+        f"     font-weight: 600; }}"
+        f"td.num {{ text-align: right;"
+        f"         font-family: Consolas, monospace; color: {_t['fg']}; }}"
+        f"code {{ background-color: {_t['bg_input']}; color: {_t['code']};"
+        f"       padding: 1px 4px; border-radius: 3px; }}"
+        f".muted {{ color: {_t['fg_dim']}; }}"
+        f".warn  {{ color: {_t['warn']}; }}"
+        f".err   {{ color: {_t['err']}; }}"
+        f"li {{ color: {_t['fg']}; }}"
+        "</style>"
+    )
+
+    parts.append("<h2>Project</h2>")
+    parts.append(f"<p><b>{_esc(metadata.get('project_name', '?'))}</b><br>"
+                 f"<span class='muted'>{_esc(metadata.get('prjpcb_path', ''))}</span></p>")
+
+    ex = metadata.get("extraction_summary", {})
+    if ex:
+        parts.append("<h3>Extracted records</h3>")
+        parts.append("<table>"
+                     f"<tr><th>tracks</th><td class='num'>{ex.get('tracks', 0):,}</td>"
+                     f"<th>arcs</th><td class='num'>{ex.get('arcs', 0):,}</td>"
+                     f"<th>vias</th><td class='num'>{ex.get('vias', 0):,}</td></tr>"
+                     f"<tr><th>pads</th><td class='num'>{ex.get('pads', 0):,}</td>"
+                     f"<th>regions</th><td class='num'>{ex.get('regions', 0):,}</td>"
+                     f"<th>nets</th><td class='num'>{ex.get('nets', 0):,}</td></tr>"
+                     f"<tr><th>pcb components</th><td class='num'>{ex.get('pcb_components', 0):,}</td>"
+                     f"<th>sch components</th><td class='num'>{ex.get('sch_components', 0):,}</td>"
+                     f"<th>enabled cu layers</th><td class='num'>{len(metadata.get('enabled_copper_layer_ids', []))}</td></tr>"
+                     "</table>")
+
+    # Stackup
+    stackup = metadata.get("stackup", [])
+    if stackup:
+        parts.append("<h2>Copper stackup</h2>")
+        parts.append("<p class='muted'>Conductance is computed per layer as "
+                     "<code>copper_thickness_mm &times; conductivity_S_per_mm</code>.</p>")
+        parts.append("<table>"
+                     "<tr><th>id</th><th>Name</th>"
+                     "<th>Cu thickness</th><th>(mil)</th><th>(oz)</th>"
+                     "<th>Dielectric below</th>"
+                     "<th>Sheet conductance</th><th>Sheet resistance</th>"
+                     "<th>Notes</th></tr>")
+        for row in stackup:
+            notes = []
+            if row.get("is_plane"):
+                notes.append(f"PLANE on net {row.get('plane_net_name') or '?'}")
+            diel_mm = row.get("dielectric_thickness_mm", 0.0) or 0.0
+            diel_cell = (f"{diel_mm*1000:.1f} µm" if diel_mm > 0
+                         else "<span class='muted'>—</span>")
+            # Tint the id cell with the physical-layer swatch used in the
+            # Heatmap tab so users can cross-reference at a glance.
+            bg = phys_color_fn(row["name"]) if phys_color_fn else None
+            if bg:
+                fg = _contrasting_text_color(bg)
+                id_cell = (f"<td class='num' style='background-color:{bg};"
+                           f" color:{fg}; font-weight:bold;'>{row['layer_id']}</td>")
+            else:
+                id_cell = f"<td class='num'>{row['layer_id']}</td>"
+            parts.append("<tr>"
+                         f"{id_cell}"
+                         f"<td>{_esc(row['name'])}</td>"
+                         f"<td class='num'>{row['copper_thickness_mm']*1000:.3f} µm</td>"
+                         f"<td class='num'>{row['copper_thickness_mil']:.3f}</td>"
+                         f"<td class='num'>{row['copper_thickness_oz']:.3f}</td>"
+                         f"<td class='num'>{diel_cell}</td>"
+                         f"<td class='num'>{row['sheet_conductance_S']:.3f} S/sq</td>"
+                         f"<td class='num'>{row['sheet_resistance_milliohm_per_sq']:.4f} mΩ/sq</td>"
+                         f"<td>{_esc(', '.join(notes))}</td>"
+                         "</tr>")
+        parts.append("</table>")
+
+    # Physics constants
+    phys = metadata.get("physics_constants", {})
+    if phys:
+        # Per-hop via R varies; summarise the distribution from each via's
+        # segments list so users can see the actual range the FEM used.
+        seg_rs: list[float] = []
+        for v in metadata.get("vias", []):
+            for seg in v.get("segments") or []:
+                r = seg.get("resistance_ohm")
+                if r is not None and r > 0.0:
+                    seg_rs.append(float(r))
+        if seg_rs:
+            r_min = min(seg_rs) * 1000.0
+            r_max = max(seg_rs) * 1000.0
+            r_mean = (sum(seg_rs) / len(seg_rs)) * 1000.0
+            via_r_cell = (f"min {r_min:.3f} / mean {r_mean:.3f} / "
+                          f"max {r_max:.3f} mΩ "
+                          f"<span class='muted'>(over {len(seg_rs)} segment(s))</span>")
+        else:
+            via_r_cell = (f"<span class='muted'>(no via segments; fallback "
+                          f"= {phys.get('fallback_via_resistance_ohm', 0)*1000:.3f} mΩ)</span>")
+        parts.append("<h2>Physics constants</h2>")
+        parts.append("<table>"
+                     f"<tr><th>Copper conductivity</th>"
+                     f"<td class='num'>{phys.get('copper_conductivity_S_per_mm', 0):.3e} S/mm</td>"
+                     f"<td class='muted'>= {phys.get('copper_resistivity_microohm_cm', 0):.4f} µΩ·cm "
+                     f"= {phys.get('copper_resistivity_ohm_m', 0):.3e} Ω·m</td></tr>"
+                     f"<tr><th>Plating thickness</th>"
+                     f"<td class='num'>{phys.get('plating_thickness_mm', 0)*1000:.1f} µm</td>"
+                     f"<td class='muted'>Standard plated-through-hole copper "
+                     f"wall thickness (IPC-A-600 Class 2).</td></tr>"
+                     f"<tr><th>Via barrel resistance (per hop)</th>"
+                     f"<td>{via_r_cell}</td>"
+                     f"<td class='muted'>{_esc(phys.get('note_via_resistance', ''))}</td></tr>"
+                     f"<tr><th>Multi-pin coupling resistance</th>"
+                     f"<td class='num'>{phys.get('coupling_resistance_ohm', 0)*1000:.3f} mΩ</td>"
+                     f"<td class='muted'>{_esc(phys.get('note_coupling_resistance', ''))}</td></tr>"
+                     "</table>")
+
+    # Directives — each heading is a clickable toggle (collapsed by default).
+    directives = metadata.get("directives", [])
+    parts.append(f"<h2>PDN directives <span class='muted'>({len(directives)} — click a heading to expand)</span></h2>")
+    if not directives:
+        parts.append("<p class='warn'>No directives parsed — nothing to solve.</p>")
+    for d in directives:
+        desig = d.get("designator", "?")
+        # ``label`` (e.g. "U5#1") disambiguates multi-channel SOURCE/SINK
+        # so two channels on the same part get independent expand-state.
+        toggle_key = str(d.get("label") or desig)
+        is_open = toggle_key in expanded_directives
+        arrow = "&#9662;" if is_open else "&#9656;"  # ▼ / ▶
+        # The heading itself is an anchor; the viewer's anchorClicked handler
+        # intercepts ``toggle:<label>`` URLs and re-renders.
+        parts.append(
+            f"<h3 style='margin: 8px 0;'>"
+            f"<a href='toggle:{_esc(toggle_key)}' "
+            f"style='color:{_t['accent']}; text-decoration:none; font-weight:600;'>"
+            f"{arrow} {_esc(d.get('role','?'))} on {_esc(toggle_key)}"
+            f"</a> &nbsp;"
+            f"<span class='muted'>({_esc(d.get('schdoc',''))})</span> &nbsp;"
+            f"<span style='color:{_t['fg']};'>{_esc(d.get('value_str',''))}</span>"
+            f"</h3>"
+        )
+        if not is_open:
+            continue
+        terms = d.get("terminals", {})
+        if not terms:
+            continue
+        parts.append("<table>"
+                     "<tr><th>Terminal</th><th>Pin</th><th>Net</th>"
+                     "<th>Layer</th><th>X (mm)</th><th>Y (mm)</th></tr>")
+        for term_name, term in terms.items():
+            pins = term.get("pins", [])
+            if not pins:
+                parts.append(f"<tr><td>{_esc(term_name)}</td>"
+                             "<td colspan='5' class='warn'>(no pins resolved)</td></tr>")
+            else:
+                # Show the net the directive named (PDN_*_NET). When a SERIES
+                # bridge resolved the terminal onto a different net's pads,
+                # keep the named net as the headline and note the actual pad
+                # net after it, so the table matches what the user authored.
+                req_net = term.get("requested_net")
+                for i, pin in enumerate(pins):
+                    actual_net = pin.get('net', '')
+                    if req_net and actual_net and actual_net != req_net:
+                        net_cell = (f"<code>{_esc(req_net)}</code> "
+                                    f"<span class='muted'>(via "
+                                    f"{_esc(actual_net)})</span>")
+                    else:
+                        net_cell = f"<code>{_esc(req_net or actual_net)}</code>"
+                    parts.append("<tr>"
+                                 f"<td>{_esc(term_name) if i == 0 else ''}</td>"
+                                 f"<td>{_esc(pin.get('pad',''))}</td>"
+                                 f"<td>{net_cell}</td>"
+                                 f"<td class='num'>{pin.get('layer_id','')}</td>"
+                                 f"<td class='num'>{pin.get('x_mm', 0):.3f}</td>"
+                                 f"<td class='num'>{pin.get('y_mm', 0):.3f}</td>"
+                                 "</tr>")
+        parts.append("</table>")
+
+    # Active nets list
+    active = metadata.get("active_nets", [])
+    if active:
+        parts.append("<h2>Active nets</h2>")
+        parts.append("<p class='muted'>Only these nets have PDN parameter data set; "
+                     "other nets are excluded from the FEM.</p>")
+        parts.append("<p>" + ", ".join(f"<code>{_esc(n)}</code>" for n in active) + "</p>")
+
+    # FEM stats
+    fem = metadata.get("fem_stats", {}) or {}
+    mesher = metadata.get("mesher_config") or {}
+    solver = metadata.get("solver_stats") or {}
+    if fem or mesher or solver:
+        parts.append("<h2>FEM &amp; solver</h2>")
+        parts.append("<table>")
+        if mesher:
+            parts.append(f"<tr><th>Mesher min angle</th><td class='num'>{mesher.get('minimum_angle_deg', 0):.1f}°</td></tr>"
+                         f"<tr><th>Mesher max size</th><td class='num'>{mesher.get('maximum_size_mm', 0):.3f} mm</td></tr>")
+        if fem:
+            parts.append(f"<tr><th>Layers</th><td class='num'>{fem.get('padne_layer_count', 0)}</td></tr>"
+                         f"<tr><th>Networks (total)</th><td class='num'>{fem.get('padne_network_count', 0)}</td></tr>"
+                         f"<tr><th>Via coupling networks</th><td class='num'>{fem.get('via_coupling_network_count', 0)}</td></tr>")
+        if solver:
+            res = solver.get("residual_norm", 0.0)
+            gnd = solver.get("ground_node_current_A", 0.0)
+            res_flag = " class='err'" if res > 1.0 else (" class='warn'" if res > 1e-3 else "")
+            gnd_flag = " class='err'" if abs(gnd) > 0.1 else (" class='warn'" if abs(gnd) > 1e-3 else "")
+            parts.append(f"<tr><th>Solver residual ‖L·v − r‖</th><td{res_flag} class='num'>{res:.3e}</td></tr>"
+                         f"<tr><th>Ground-node current</th><td{gnd_flag} class='num'>{gnd*1000:.4f} mA "
+                         f"<span class='muted'>(should be ≈ 0 for a well-posed problem)</span></td></tr>")
+        parts.append("</table>")
+
+    # Warnings + errors
+    warnings = metadata.get("annotation_warnings") or []
+    errors = metadata.get("annotation_errors") or []
+    if warnings or errors:
+        parts.append("<h2>Annotation log</h2>")
+        if errors:
+            parts.append("<h3 class='err'>Errors</h3><ul>")
+            for e in errors:
+                parts.append(f"<li class='err'>{_esc(e)}</li>")
+            parts.append("</ul>")
+        if warnings:
+            parts.append("<h3 class='warn'>Warnings</h3><ul>")
+            for w in warnings:
+                parts.append(f"<li class='warn'>{_esc(w)}</li>")
+            parts.append("</ul>")
+
+    return "".join(parts)
+
+
+def _esc(s) -> str:
+    """Minimal HTML escape for user-supplied strings going into the Setup tab."""
+    return (str(s)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def _contrasting_text_color(hex_color: str) -> str:
+    """Return ``#000000`` or ``#ffffff`` — whichever gives better contrast
+    against ``hex_color`` (#RRGGBB). Uses the YIQ luma approximation
+    (0.299 R + 0.587 G + 0.114 B); threshold 0.5 puts mid-grey on black."""
+    h = hex_color.lstrip("#")
+    if len(h) != 6:
+        return "#000000"
+    try:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except ValueError:
+        return "#000000"
+    luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+    return "#000000" if luma > 0.5 else "#ffffff"

@@ -1,0 +1,3 @@
+[submodule "altium_monkey"]
+	path = altium_monkey
+	url = https://github.com/wavenumber-eng/altium_monkey

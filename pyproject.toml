@@ -1,0 +1,45 @@
+# Project tooling configuration for FYPA.
+#
+# FYPA is run as a set of top-level scripts (FYPA.py + sibling modules) rather
+# than an installed package, so this file intentionally carries no [project]
+# build metadata — it exists only to configure the dev tooling (pytest, ruff).
+
+[tool.pytest.ini_options]
+# Tests import `pdnsolver` (and, for regression tests, shell out to FYPA.py),
+# so the repo root must be on sys.path.
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "slow: end-to-end regression runs on the large example designs (deselect with '-m \"not slow\"')",
+]
+# Keep solver/mesher warnings visible but non-fatal during tests.
+filterwarnings = [
+    "default",
+]
+
+[tool.ruff]
+# The codebase predates linting; keep the line length generous to avoid a
+# mechanical reformat, and target the Python version the venv pins.
+line-length = 100
+target-version = "py311"
+# altium_monkey is a vendored git submodule with its own tooling.
+extend-exclude = ["altium_monkey", ".venv", "build", "dist"]
+
+[tool.ruff.lint]
+# Conservative first adoption: real bug-class checks only — pyflakes (`F`:
+# unused/undefined names, bad imports), syntax/import errors (`E4`/`E9`),
+# and comprehension / string-format / misc hygiene (`C4`, `UP`, `PIE`).
+#
+# Deliberately NOT enabled yet (the codebase predates linting; each is a
+# separate, larger cleanup, not a low-risk first step):
+#   * pycodestyle style rules (`E1`/`E2`/`E5`/`E7`) — cosmetic only here.
+#   * flake8-bugbear (`B`) — ~70 hits, mostly intentional abstract-base-class
+#     patterns and loop-variable closures. Add `"B"` to `select` when that
+#     review is scheduled.
+select = ["F", "E4", "E9", "C4", "UP", "PIE"]
+ignore = [
+    # Import-not-at-top: the GUI / loader modules deliberately place some
+    # imports mid-file (lazy heavy deps, conditional fallbacks). Placement is
+    # intentional, so this E4 sub-rule is silenced rather than enforced.
+    "E402",
+]

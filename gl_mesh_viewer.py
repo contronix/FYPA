@@ -1,0 +1,2025 @@
+"""Custom QOpenGLWidget that renders a 2D FEM mesh natively on the GPU.
+
+This is the high-performance replacement for the pyqtgraph
+``GraphicsLayoutWidget`` + ``ImageItem`` heatmap canvas. Instead of
+rasterising the mesh to a CPU RGBA texture and uploading it every time
+the user zooms, the triangle mesh lives in a GPU vertex buffer and the
+fragment shader interpolates the colour per pixel using a 1-D colormap
+LUT texture. Pan and zoom become single matrix updates — no resampling,
+always pixel-sharp at any zoom level.
+
+Public API
+----------
+Construction: ``GLMeshViewer(parent=None)``.
+
+Data flow:
+* :meth:`set_mesh(xs, ys, tris)` — upload vertex positions + triangle
+  indices once per (layer, rail, rail-only) change.
+* :meth:`set_values(values)` — push per-vertex scalar values for the
+  current mode. Cheap (one buffer upload).
+* :meth:`set_levels(vmin, vmax)` — update colormap window. Free (one
+  uniform update — no GPU work until next paint).
+* :meth:`set_colormap(lut_rgba_256)` — change the colour ramp. Rare.
+
+View interaction:
+* :meth:`fit_to_data()` — reset view so the data fills the widget.
+* :meth:`set_view_center_scale(cx, cy, mm_per_pixel)` — explicit view.
+* :meth:`view_range()` — current visible mm rectangle.
+
+Signals:
+* :attr:`viewChanged` — emitted on pan / zoom / resize.
+* :attr:`mouseHoveredAt(world_x, world_y, inside)` — every mouse move.
+
+Overlays (drawn via :class:`QPainter` inside ``paintGL``):
+* :meth:`set_overlay_top_left(text_html)` — title chip top-left corner.
+* :meth:`set_overlay_top_right(text_html)` — legend top-right corner.
+* :meth:`set_markers(list_of_marker_groups)` — scatter overlays.
+
+Vector-field arrows (drawn via the line shader, in world space):
+* :meth:`set_arrows(positions, color)` — push GL_LINES vertices that
+  encode arrow shafts + arrowheads.
+* :meth:`clear_arrows()`.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import numpy as np
+from OpenGL import GL
+from PySide6.QtCore import QElapsedTimer, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QMatrix4x4,
+    QPainter,
+    QPen,
+    QPolygonF,
+    QSurfaceFormat,
+    QTextDocument,
+    QVector3D,
+)
+from PySide6.QtOpenGL import (
+    QOpenGLBuffer,
+    QOpenGLShader,
+    QOpenGLShaderProgram,
+    QOpenGLTexture,
+    QOpenGLVertexArrayObject,
+)
+from PySide6.QtOpenGLWidgets import QOpenGLWidget
+
+
+# OpenGL 3.3 core profile shaders. The vertex shader applies an
+# orthographic MVP transform; the fragment shader looks up a colour from
+# the 1-D colormap texture using the normalised value passed through
+# from the vertex shader.
+_VERTEX_SHADER_SRC = """
+#version 330 core
+layout(location = 0) in vec3 a_position;
+layout(location = 1) in float a_value;
+uniform mat4 u_mvp;
+uniform vec2 u_levels;
+out float v_norm;
+void main() {
+    gl_Position = u_mvp * vec4(a_position, 1.0);
+    float span = max(u_levels.y - u_levels.x, 1e-30);
+    v_norm = clamp((a_value - u_levels.x) / span, 0.0, 1.0);
+}
+"""
+
+_FRAGMENT_SHADER_SRC = """
+#version 330 core
+in float v_norm;
+uniform sampler1D u_cmap;
+out vec4 frag_color;
+void main() {
+    frag_color = texture(u_cmap, v_norm);
+}
+"""
+
+# Flat-color line shader for the layer outlines. Vertex carries its own
+# RGB so we can pack all layers' outlines into a single GL_LINES batch
+# and draw them with one call.
+_LINE_VERTEX_SHADER_SRC = """
+#version 330 core
+layout(location = 0) in vec3 a_position;
+layout(location = 1) in vec3 a_color;
+uniform mat4 u_mvp;
+out vec3 v_color;
+void main() {
+    gl_Position = u_mvp * vec4(a_position, 1.0);
+    v_color = a_color;
+}
+"""
+
+_LINE_FRAGMENT_SHADER_SRC = """
+#version 330 core
+in vec3 v_color;
+out vec4 frag_color;
+void main() {
+    frag_color = vec4(v_color, 1.0);
+}
+"""
+
+
+@dataclass
+class MarkerGroup:
+    """A batch of identically-styled markers — one per directive role.
+
+    ``xs``/``ys`` are world-space (mm). ``color`` is the fill (HTML hex).
+    ``symbol`` is one of ``"o"``, ``"s"``, ``"d"``, ``"star"``. ``size``
+    is the diameter in pixels at any zoom level (pxMode-equivalent).
+    ``zs`` is the optional per-marker world-z (mm, pre-exaggeration);
+    only consulted in 3D mode — if None or omitted, every marker is
+    treated as z=0.
+
+    ``world_diameters_mm`` opts the marker into world-space sizing:
+    when set, each marker's pixel diameter is
+    ``max(world_diameters_mm[i] / mm_per_pixel, min_pixel_diameter)``,
+    so the marker visually matches its physical footprint at zoom-in
+    while staying visible (overlap is fine and intentional) at
+    zoom-out. ``size`` is ignored in that mode.
+    """
+    xs: np.ndarray
+    ys: np.ndarray
+    color: str
+    symbol: str
+    size: int
+    edge_color: str = "#000000"
+    edge_width: float = 0.8
+    zs: np.ndarray | None = None
+    world_diameters_mm: np.ndarray | None = None
+    min_pixel_diameter: float = 0.0
+
+
+def _install_default_surface_format() -> None:
+    """Request an OpenGL 3.3 Core context BEFORE the first QOpenGLWidget
+    is constructed. Idempotent — call from the module that creates the
+    widget once at application startup."""
+    fmt = QSurfaceFormat()
+    fmt.setVersion(3, 3)
+    fmt.setProfile(QSurfaceFormat.CoreProfile)
+    # 24-bit depth buffer is needed for the 3D-mode depth test; in 2D
+    # mode we just leave depth-test off so it's effectively unused.
+    fmt.setDepthBufferSize(24)
+    fmt.setStencilBufferSize(0)
+    fmt.setSwapInterval(1)  # vsync on — smoother and easier on the GPU
+    QSurfaceFormat.setDefaultFormat(fmt)
+
+
+class GLMeshViewer(QOpenGLWidget):
+    """OpenGL-backed FEM mesh viewer with pan/zoom and overlays."""
+
+    viewChanged = Signal()
+    # x_mm, y_mm, inside_widget — emitted on mouseMove (throttling is
+    # the caller's responsibility; widget always emits per-event).
+    mouseHoveredAt = Signal(float, float, bool)
+    # x_mm, y_mm — emitted on a left-click WITHOUT meaningful drag (i.e.
+    # press + release with the cursor moving < a few pixels). Useful for
+    # "click empty space to clear a highlight" interactions.
+    clicked = Signal(float, float)
+
+    # Maximum cursor movement (in screen pixels) between press and
+    # release that still counts as a click rather than a drag. 4 px is
+    # comfortable on both mice and trackpads.
+    _CLICK_DRAG_THRESHOLD_PX: float = 4.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+        # --- GPU resources, populated in initializeGL ---
+        self._program: QOpenGLShaderProgram | None = None
+        self._vao: QOpenGLVertexArrayObject | None = None
+        self._pos_vbo: QOpenGLBuffer | None = None
+        self._val_vbo: QOpenGLBuffer | None = None
+        self._ibo: QOpenGLBuffer | None = None
+        self._cmap_tex: QOpenGLTexture | None = None
+        self._u_mvp_loc: int = -1
+        self._u_levels_loc: int = -1
+        self._u_cmap_loc: int = -1
+        # Line / outline rendering (GL_LINES, flat per-vertex colour).
+        self._line_program: QOpenGLShaderProgram | None = None
+        self._line_vao: QOpenGLVertexArrayObject | None = None
+        self._line_pos_vbo: QOpenGLBuffer | None = None
+        self._line_col_vbo: QOpenGLBuffer | None = None
+        self._line_u_mvp_loc: int = -1
+        # Via cylinder rendering (GL_TRIANGLES). Shares the line shader
+        # (vec3 pos + vec3 colour, no LUT). Only drawn in 3D mode.
+        self._cyl_vao: QOpenGLVertexArrayObject | None = None
+        self._cyl_pos_vbo: QOpenGLBuffer | None = None
+        self._cyl_col_vbo: QOpenGLBuffer | None = None
+        # Current-arrow rendering (GL_LINES). Shares the line shader.
+        # A separate batch so it doesn't collide with the layer-outline
+        # batch — they're toggled independently from the side panel.
+        self._arrow_vao: QOpenGLVertexArrayObject | None = None
+        self._arrow_pos_vbo: QOpenGLBuffer | None = None
+        self._arrow_col_vbo: QOpenGLBuffer | None = None
+        # Stub-copper rendering (GL_TRIANGLES). Shares the line shader.
+        # These are flat-coloured polygons representing copper that was
+        # excluded from the FEM (dead-end stubs) — drawn so the user can
+        # still SEE the copper exists, even though no heatmap value is
+        # computed for it. Drawn in both 2D and 3D modes.
+        self._stub_vao: QOpenGLVertexArrayObject | None = None
+        self._stub_pos_vbo: QOpenGLBuffer | None = None
+        self._stub_col_vbo: QOpenGLBuffer | None = None
+        # Series-bar rendering (GL_TRIANGLES). Shares the line shader.
+        # Each RESISTOR/series directive contributes a gradient-filled
+        # rectangle (two triangles) connecting its two terminal pin positions.
+        self._sbar_vao: QOpenGLVertexArrayObject | None = None
+        self._sbar_pos_vbo: QOpenGLBuffer | None = None
+        self._sbar_col_vbo: QOpenGLBuffer | None = None
+        # Board-outline rendering (GL_TRIANGLES). Shares the line shader.
+        # The PCB's mechanical outline drawn as a thick ribbon of triangles
+        # so it's bold and visible at any zoom (and uniformly thick across
+        # drivers — glLineWidth past 1.0 is unreliable on Core profiles).
+        self._bdrl_vao: QOpenGLVertexArrayObject | None = None
+        self._bdrl_pos_vbo: QOpenGLBuffer | None = None
+        self._bdrl_col_vbo: QOpenGLBuffer | None = None
+        self._gl_initialized: bool = False
+
+        # --- CPU-side cached mesh data (re-uploaded when changed) ---
+        self._n_indices: int = 0
+        self._n_vertices: int = 0
+        self._pending_positions: np.ndarray | None = None
+        self._pending_indices: np.ndarray | None = None
+        self._pending_values: np.ndarray | None = None
+        self._pending_cmap: np.ndarray | None = None
+        # Outline (line) batch — packed (N, 2) positions + (N, 3) colours
+        # where vertices come in pairs (GL_LINES). N == 2 * num_segments.
+        self._n_line_vertices: int = 0
+        self._pending_line_positions: np.ndarray | None = None
+        self._pending_line_colors: np.ndarray | None = None
+        # Via cylinder triangles batch (GL_TRIANGLES). Vertex triples
+        # (every 3 = 1 triangle). Drawn in 3D mode only.
+        self._n_cyl_vertices: int = 0
+        self._pending_cyl_positions: np.ndarray | None = None
+        self._pending_cyl_colors: np.ndarray | None = None
+        # Current-arrow batch (GL_LINES). Vertex pairs (every 2 = 1
+        # segment). One arrow contributes 3 segments (shaft + two head
+        # wings) = 6 vertices.
+        self._n_arrow_vertices: int = 0
+        self._pending_arrow_positions: np.ndarray | None = None
+        self._pending_arrow_colors: np.ndarray | None = None
+        # Stub-copper batch (GL_TRIANGLES). Vertex triples; flat-coloured
+        # polygons of copper that the FEM stub filter dropped.
+        self._n_stub_vertices: int = 0
+        self._pending_stub_positions: np.ndarray | None = None
+        self._pending_stub_colors: np.ndarray | None = None
+        # Series-bar batch (GL_TRIANGLES). Two triangles per RESISTOR
+        # directive; vertices carry heatmap gradient colors. The first
+        # ``_n_sbar_under_vertices`` vertices are drawn BEFORE the heatmap
+        # mesh so bottom-side components sit visually beneath the bottom
+        # copper in 2D mode; the rest are drawn after (on top).
+        self._n_sbar_vertices: int = 0
+        self._n_sbar_under_vertices: int = 0
+        self._pending_sbar_positions: np.ndarray | None = None
+        self._pending_sbar_colors: np.ndarray | None = None
+        # Board-outline batch (GL_TRIANGLES). Pre-triangulated ribbon of
+        # the PCB's mechanical outline; flat-coloured vertices.
+        self._n_bdrl_vertices: int = 0
+        self._pending_bdrl_positions: np.ndarray | None = None
+        self._pending_bdrl_colors: np.ndarray | None = None
+
+        # Wireframe overlay over the main heatmap mesh. Off by default;
+        # toggled by :meth:`set_show_mesh_edges`. When on, paintGL redraws
+        # the mesh's triangles as line segments using the line shader with
+        # a constant attribute colour, on top of the filled heatmap.
+        self._show_mesh_edges: bool = False
+
+        # --- Data extents ---
+        self._data_bounds: tuple[float, float, float, float] | None = None
+
+        # --- View mode ---
+        # "2d" = orthographic top-down (the original/default behaviour).
+        # "3d" = perspective view of the stacked layers (z carried in the
+        # vertex positions). Toggled by :meth:`set_view_mode`.
+        self._view_mode: str = "2d"
+
+        # --- 2D view state (orthographic; "mm per logical pixel") ---
+        self._view_center_x: float = 0.0
+        self._view_center_y: float = 0.0
+        self._mm_per_pixel: float = 1.0
+        self._levels: tuple[float, float] = (0.0, 1.0)
+
+        # --- 3D camera (orbital around a target point in world mm) ---
+        # Yaw rotates around world +Z (vertical); pitch around the
+        # camera's right axis. Distance is camera-to-target in mm.
+        # ``_cam_target`` defaults to the centre of the data when
+        # ``fit_to_data`` runs.
+        self._cam_target: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._cam_yaw_deg: float = self._CAM_DEFAULT_YAW_DEG
+        self._cam_pitch_deg: float = self._CAM_DEFAULT_PITCH_DEG  # 0 = side view, 90 = top
+        self._cam_distance: float = 1.0    # mm
+        # Vertical exaggeration applied ONLY in 3D mode so layer
+        # separation is visually distinguishable on a 1-2 mm thick
+        # stackup vs a 200+ mm wide board.
+        self._vertical_exaggeration: float = 10.0
+        # Perspective field-of-view (vertical), in degrees.
+        self._cam_fov_deg: float = 35.0
+
+        # --- Mouse interaction state ---
+        # Left-button press: pan in 2D, click (without drag) in either mode.
+        self._press_origin: QPointF | None = None
+        self._press_center: tuple[float, float] = (0.0, 0.0)
+        self._is_panning: bool = False
+        # Right-button press: pan (both modes) / rotate (3D + Shift) —
+        # snapshots the view state at press time so dx/dy are cumulative
+        # from the press point rather than incremental.
+        self._right_press_origin: QPointF | None = None
+        self._right_press_center: tuple[float, float] = (0.0, 0.0)
+        self._right_press_mpp: float = 1.0
+        self._right_press_target: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._right_press_yaw: float = 0.0
+        self._right_press_pitch: float = 0.0
+        self._right_press_shift: bool = False
+        self._right_is_dragging: bool = False
+        # Middle-button press: drag up = zoom in, drag down = zoom out.
+        # In 2D this scales mm/pixel around the world point under the
+        # press cursor. In 3D this dollies the camera in/out (pivots
+        # around the camera target, which is the simplest sensible
+        # behaviour without doing per-frame ray-casts).
+        self._middle_press_origin: QPointF | None = None
+        self._middle_press_world: tuple[float, float] = (0.0, 0.0)
+        self._middle_press_mpp: float = 1.0
+        self._middle_press_distance: float = 1.0
+        # Last hover position in widget-logical pixels — kept so the host
+        # can re-unproject the cursor against an arbitrary z-plane (used
+        # by the 3D-mode probe to pick the layer under the cursor without
+        # round-tripping through ``screen_to_world``'s 2D-only path).
+        self._last_hover_pixel: tuple[float, float] = (0.0, 0.0)
+
+        # --- Overlay state (drawn via QPainter on top of GL) ---
+        self._overlay_top_left_html: str = ""
+        self._overlay_top_right_html: str = ""
+        self._markers: list[MarkerGroup] = []
+        # Measurement-line endpoints in world mm: (x0, y0, x1, y1) or
+        # ``None`` when no measurement is active. Drawn by the QPainter
+        # overlay pass as a thin white line on top of everything else.
+        self._measurement_line: tuple[float, float, float, float] | None = None
+
+        # --- Background (clear) colour — dark theme to match the rest ---
+        self._bg_r = 0x1f / 255.0
+        self._bg_g = 0x1f / 255.0
+        self._bg_b = 0x1f / 255.0
+
+        # --- 3D camera animation state ---
+        # Used by :meth:`reset_3d_view` to interpolate yaw / pitch /
+        # target / distance from the current camera to the reset pose
+        # over ~0.5 s instead of snapping. ``_view_anim`` is the active
+        # from/to snapshot dict, or ``None`` when nothing is animating.
+        self._view_anim: dict | None = None
+        self._view_anim_timer: QTimer | None = None
+        self._view_anim_elapsed: QElapsedTimer | None = None
+
+    # ------------------------------------------------------------------
+    # Public data interface
+    # ------------------------------------------------------------------
+
+    def set_mesh(self, xs: np.ndarray, ys: np.ndarray,
+                 tris: np.ndarray,
+                 data_bounds: tuple[float, float, float, float] | None = None,
+                 zs: np.ndarray | None = None,
+                 ) -> None:
+        """Upload a new triangulated mesh to the GPU.
+
+        ``xs``/``ys`` are 1-D float arrays of vertex coordinates (mm).
+        ``zs`` is an optional 1-D float array of per-vertex z (defaults
+        to zeros for the 2D case). ``tris`` is an (M, 3) int array of
+        vertex indices. ``data_bounds`` is the (xmin, xmax, ymin, ymax)
+        rectangle used for ``fit_to_data``.
+        """
+        positions = np.empty((xs.size, 3), dtype=np.float32)
+        positions[:, 0] = xs
+        positions[:, 1] = ys
+        if zs is not None:
+            positions[:, 2] = zs
+        else:
+            positions[:, 2] = 0.0
+        indices = np.asarray(tris, dtype=np.uint32).ravel()
+        self._pending_positions = positions
+        self._pending_indices = indices
+        self._n_vertices = positions.shape[0]
+        self._n_indices = indices.size
+        if data_bounds is not None:
+            self._data_bounds = (float(data_bounds[0]), float(data_bounds[1]),
+                                  float(data_bounds[2]), float(data_bounds[3]))
+        else:
+            self._data_bounds = (float(xs.min()), float(xs.max()),
+                                  float(ys.min()), float(ys.max()))
+        # Initial value array of zeros until set_values is called; lets
+        # the mesh render in the lowest colormap entry rather than crash.
+        self._pending_values = np.zeros(self._n_vertices, dtype=np.float32)
+        self.update()
+
+    def set_view_mode(self, mode: str) -> None:
+        """Switch between ``"2d"`` (orthographic top-down) and ``"3d"``
+        (perspective view of the stacked layers). Triggers a fit on the
+        first switch into 3D so the camera frames the data."""
+        mode = mode.lower()
+        if mode not in ("2d", "3d"):
+            raise ValueError(f"unknown view mode: {mode!r}")
+        if mode == self._view_mode:
+            return
+        self._view_mode = mode
+        if mode == "3d":
+            self._fit_3d_to_data()
+        self.viewChanged.emit()
+        self.update()
+
+    def set_view_mode_preserving(self, mode: str) -> None:
+        """Switch view mode while keeping the same world region framed.
+        Unlike :meth:`set_view_mode`, this does NOT re-fit on entering 3D.
+
+        2D → 3D: the current 2D centre becomes the 3D look-at point at
+        z=0; the camera goes to the default top-down orientation; the
+        camera distance is picked so the world height visible at the
+        focal plane matches what 2D was showing.
+
+        3D → 2D: the 3D look-at point (projected onto z=0) becomes the
+        2D centre; ``mm_per_pixel`` is derived from the current camera
+        distance + FOV so the apparent scale matches.
+
+        Equivalent to :meth:`set_view_mode` when already in the target
+        mode (no-op).
+        """
+        mode = mode.lower()
+        if mode not in ("2d", "3d"):
+            raise ValueError(f"unknown view mode: {mode!r}")
+        if mode == self._view_mode:
+            return
+        h_px = max(1, self.height())
+        fov_half = math.radians(self._cam_fov_deg) * 0.5
+        tan_half = max(math.tan(fov_half), 1e-9)
+        if mode == "3d":
+            cx, cy, mpp = (self._view_center_x, self._view_center_y,
+                            self._mm_per_pixel)
+            half_world_h = h_px * mpp * 0.5
+            self._cam_target = (cx, cy, 0.0)
+            self._cam_yaw_deg = self._CAM_DEFAULT_YAW_DEG
+            self._cam_pitch_deg = self._CAM_DEFAULT_PITCH_DEG
+            self._cam_distance = max(half_world_h / tan_half, 1.0)
+        else:
+            tx, ty, _ = self._cam_target
+            half_world_h = self._cam_distance * tan_half
+            self._view_center_x = float(tx)
+            self._view_center_y = float(ty)
+            self._mm_per_pixel = max(2.0 * half_world_h / h_px, 1e-9)
+        self._view_mode = mode
+        self.viewChanged.emit()
+        self.update()
+
+    def view_mode(self) -> str:
+        return self._view_mode
+
+    def set_vertical_exaggeration(self, factor: float) -> None:
+        """Set the multiplier applied to per-vertex z values in 3D mode.
+        Without exaggeration the ~1.6 mm stackup is invisible next to a
+        200+ mm wide board. Defaults to 50x."""
+        if not math.isfinite(factor) or factor <= 0:
+            return
+        self._vertical_exaggeration = float(factor)
+        if self._view_mode == "3d":
+            self.viewChanged.emit()
+            self.update()
+
+    def vertical_exaggeration(self) -> float:
+        return self._vertical_exaggeration
+
+    def set_values(self, values: np.ndarray) -> None:
+        """Update the per-vertex scalar values that the fragment shader
+        uses to look up colours. Must match the vertex count from the
+        most recent :meth:`set_mesh` call."""
+        arr = np.asarray(values, dtype=np.float32)
+        if arr.size != self._n_vertices:
+            raise ValueError(
+                f"set_values length {arr.size} doesn't match vertex count "
+                f"{self._n_vertices}"
+            )
+        self._pending_values = arr
+        self.update()
+
+    def set_levels(self, vmin: float, vmax: float) -> None:
+        """Set the colormap window. Cheap — just changes a uniform."""
+        if vmax <= vmin:
+            vmax = vmin + 1e-12
+        self._levels = (float(vmin), float(vmax))
+        self.update()
+
+    def set_colormap(self, lut_rgba_256: np.ndarray) -> None:
+        """Replace the 1-D colormap. ``lut_rgba_256`` must be a
+        (256, 4) uint8 array of RGBA values."""
+        arr = np.ascontiguousarray(lut_rgba_256, dtype=np.uint8)
+        if arr.shape != (256, 4):
+            raise ValueError("LUT must be (256, 4) uint8")
+        self._pending_cmap = arr
+        self.update()
+
+    def clear_mesh(self) -> None:
+        """Drop all mesh data — the canvas paints background only."""
+        self._n_indices = 0
+        self._n_vertices = 0
+        self._pending_positions = None
+        self._pending_indices = None
+        self._pending_values = None
+        self._data_bounds = None
+        self.update()
+
+    def set_show_mesh_edges(self, enabled: bool) -> None:
+        """Toggle drawing the FEM triangle edges on top of the filled
+        heatmap. No mesh re-upload — just flips a flag that paintGL reads
+        to decide whether to do a second wireframe pass over the same
+        index buffer."""
+        flag = bool(enabled)
+        if flag == self._show_mesh_edges:
+            return
+        self._show_mesh_edges = flag
+        self.update()
+
+    def set_outlines(self, positions: np.ndarray,
+                     colors: np.ndarray) -> None:
+        """Push a batch of outline line segments to the GPU.
+
+        ``positions`` is an (N, 2) OR (N, 3) float array; vertices come
+        in pairs (``GL_LINES``), so N == 2 * num_segments. A (N, 2)
+        array is broadcast to z=0. ``colors`` is an (N, 3) float array
+        of RGB triples in [0..1]. The two arrays must have matching N.
+        """
+        pos2_or_3 = np.ascontiguousarray(positions, dtype=np.float32)
+        if pos2_or_3.ndim != 2 or pos2_or_3.shape[1] not in (2, 3):
+            raise ValueError("positions must be (N, 2) or (N, 3)")
+        if pos2_or_3.shape[1] == 2:
+            # Promote to (N, 3) with z=0 — the shader expects vec3.
+            pos = np.zeros((pos2_or_3.shape[0], 3), dtype=np.float32)
+            pos[:, :2] = pos2_or_3
+        else:
+            pos = pos2_or_3
+        col = np.ascontiguousarray(colors, dtype=np.float32)
+        if col.ndim != 2 or col.shape[1] != 3:
+            raise ValueError("colors must be (N, 3)")
+        if pos.shape[0] != col.shape[0]:
+            raise ValueError("positions and colors length mismatch")
+        self._pending_line_positions = pos
+        self._pending_line_colors = col
+        self._n_line_vertices = pos.shape[0]
+        self.update()
+
+    def clear_outlines(self) -> None:
+        """Drop all outline data — the canvas paints just the heatmap
+        and any markers / overlay text."""
+        self._n_line_vertices = 0
+        self._pending_line_positions = None
+        self._pending_line_colors = None
+        self.update()
+
+    def set_cylinders(self, positions: np.ndarray,
+                      colors: np.ndarray) -> None:
+        """Push a batch of cylinder triangles to the GPU.
+
+        ``positions`` is an (N, 3) float array of vertex triples
+        (consecutive triples form one triangle), so N must be a
+        multiple of 3. ``colors`` is an (N, 3) RGB array in [0..1]
+        matching ``positions`` length.
+
+        Drawn only in 3D mode (skipped in 2D where stacked cylinders
+        would just be confusing overlapping circles).
+        """
+        pos = np.ascontiguousarray(positions, dtype=np.float32)
+        col = np.ascontiguousarray(colors, dtype=np.float32)
+        if pos.ndim != 2 or pos.shape[1] != 3 or pos.shape[0] % 3 != 0:
+            raise ValueError("positions must be (3*k, 3)")
+        if col.shape != pos.shape:
+            raise ValueError("colors shape must match positions")
+        self._pending_cyl_positions = pos
+        self._pending_cyl_colors = col
+        self._n_cyl_vertices = pos.shape[0]
+        self.update()
+
+    def clear_cylinders(self) -> None:
+        self._n_cyl_vertices = 0
+        self._pending_cyl_positions = None
+        self._pending_cyl_colors = None
+        self.update()
+
+    def set_arrows(self, positions: np.ndarray,
+                   color: tuple[float, float, float] = (1.0, 1.0, 1.0),
+                   ) -> None:
+        """Push a batch of arrow line segments to the GPU.
+
+        ``positions`` is an (N, 2) OR (N, 3) float array of GL_LINES
+        vertices, so N must be even. Each arrow contributes 6 vertices
+        (shaft + two head wings, three segments). A (N, 2) array is
+        broadcast to z=0. ``color`` is a single RGB tuple in [0..1]
+        applied to every vertex — arrows are drawn flat-coloured so the
+        underlying heatmap colour stays readable.
+        """
+        pos2_or_3 = np.ascontiguousarray(positions, dtype=np.float32)
+        if pos2_or_3.ndim != 2 or pos2_or_3.shape[1] not in (2, 3):
+            raise ValueError("positions must be (N, 2) or (N, 3)")
+        if pos2_or_3.shape[0] % 2 != 0:
+            raise ValueError("positions length must be even (GL_LINES pairs)")
+        if pos2_or_3.shape[1] == 2:
+            pos = np.zeros((pos2_or_3.shape[0], 3), dtype=np.float32)
+            pos[:, :2] = pos2_or_3
+        else:
+            pos = pos2_or_3
+        n = pos.shape[0]
+        cols = np.broadcast_to(
+            np.asarray(color, dtype=np.float32), (n, 3)
+        ).copy()
+        self._pending_arrow_positions = pos
+        self._pending_arrow_colors = cols
+        self._n_arrow_vertices = n
+        self.update()
+
+    def clear_arrows(self) -> None:
+        self._n_arrow_vertices = 0
+        self._pending_arrow_positions = None
+        self._pending_arrow_colors = None
+        self.update()
+
+    def set_stub_triangles(self, positions: np.ndarray,
+                           colors: np.ndarray) -> None:
+        """Push a batch of stub-copper triangles to the GPU.
+
+        ``positions`` is an (N, 3) float array of vertex triples
+        (consecutive triples form one triangle), so N must be a multiple
+        of 3. ``colors`` is an (N, 3) RGB array in [0..1] matching
+        ``positions`` length.
+
+        Drawn in both 2D and 3D modes — the user wants to see this
+        copper exists even though no FEM result is computed for it.
+        """
+        pos = np.ascontiguousarray(positions, dtype=np.float32)
+        col = np.ascontiguousarray(colors, dtype=np.float32)
+        if pos.ndim != 2 or pos.shape[1] != 3 or pos.shape[0] % 3 != 0:
+            raise ValueError("positions must be (3*k, 3)")
+        if col.shape != pos.shape:
+            raise ValueError("colors shape must match positions")
+        self._pending_stub_positions = pos
+        self._pending_stub_colors = col
+        self._n_stub_vertices = pos.shape[0]
+        self.update()
+
+    def clear_stub_triangles(self) -> None:
+        self._n_stub_vertices = 0
+        self._pending_stub_positions = None
+        self._pending_stub_colors = None
+        self.update()
+
+    def set_series_bars(self, positions: np.ndarray,
+                        colors: np.ndarray,
+                        under_mesh_count: int = 0) -> None:
+        """Push a batch of series-bar triangles to the GPU.
+
+        Each RESISTOR directive contributes 6 vertices (two triangles
+        forming a gradient-filled rectangle between its two terminal
+        pin positions). ``positions`` is (N, 3) float32; ``colors``
+        is (N, 3) RGB float32. Both must have matching N and N % 6 == 0.
+
+        ``under_mesh_count`` (must be a multiple of 3) selects how many
+        leading vertices are drawn BEFORE the heatmap mesh — used in 2D
+        mode to push bottom-side bars behind the bottom copper. The
+        remaining vertices are drawn after the mesh, on top.
+        """
+        pos = np.ascontiguousarray(positions, dtype=np.float32)
+        col = np.ascontiguousarray(colors, dtype=np.float32)
+        if pos.ndim != 2 or pos.shape[1] != 3 or pos.shape[0] % 3 != 0:
+            raise ValueError("positions must be (3*k, 3)")
+        if col.shape != pos.shape:
+            raise ValueError("colors shape must match positions")
+        if not (0 <= under_mesh_count <= pos.shape[0]) or under_mesh_count % 3 != 0:
+            raise ValueError("under_mesh_count must be a multiple of 3 in [0, N]")
+        self._pending_sbar_positions = pos
+        self._pending_sbar_colors = col
+        self._n_sbar_vertices = pos.shape[0]
+        self._n_sbar_under_vertices = int(under_mesh_count)
+        self.update()
+
+    def clear_series_bars(self) -> None:
+        self._n_sbar_vertices = 0
+        self._n_sbar_under_vertices = 0
+        self._pending_sbar_positions = None
+        self._pending_sbar_colors = None
+        self.update()
+
+    def set_board_outline(self, positions: np.ndarray,
+                           colors: np.ndarray) -> None:
+        """Push a triangulated board-outline ribbon to the GPU.
+
+        Vertices come as triples (GL_TRIANGLES), so ``positions`` is (N, 3)
+        float and N is a multiple of 3. ``colors`` is (N, 3) RGB float in
+        [0..1] matching ``positions`` length. The caller is responsible
+        for the ribbon triangulation (typically the polyline expanded by a
+        fixed mm half-width). Drawn in both 2D and 3D modes.
+        """
+        pos = np.ascontiguousarray(positions, dtype=np.float32)
+        col = np.ascontiguousarray(colors, dtype=np.float32)
+        if pos.ndim != 2 or pos.shape[1] != 3 or pos.shape[0] % 3 != 0:
+            raise ValueError("positions must be (3*k, 3)")
+        if col.shape != pos.shape:
+            raise ValueError("colors shape must match positions")
+        self._pending_bdrl_positions = pos
+        self._pending_bdrl_colors = col
+        self._n_bdrl_vertices = pos.shape[0]
+        self.update()
+
+    def clear_board_outline(self) -> None:
+        self._n_bdrl_vertices = 0
+        self._pending_bdrl_positions = None
+        self._pending_bdrl_colors = None
+        self.update()
+
+    # ------------------------------------------------------------------
+    # View interface
+    # ------------------------------------------------------------------
+
+    def fit_to_data(self, padding: float = 1.05) -> None:
+        """Pick the largest mm-per-pixel that fits ``_data_bounds`` into
+        the current widget size with a small margin, then centre."""
+        if self._data_bounds is None:
+            return
+        w_px = max(1, self.width())
+        h_px = max(1, self.height())
+        x_min, x_max, y_min, y_max = self._data_bounds
+        board_w = max(x_max - x_min, 1e-9)
+        board_h = max(y_max - y_min, 1e-9)
+        mpp = max(board_w * padding / w_px, board_h * padding / h_px)
+        cx = (x_min + x_max) * 0.5
+        cy = (y_min + y_max) * 0.5
+        self.set_view_center_scale(cx, cy, mpp)
+
+    def set_view_center_scale(self, cx: float, cy: float,
+                              mm_per_pixel: float) -> None:
+        """Explicit view: centre + scale. Emits :attr:`viewChanged`."""
+        if mm_per_pixel <= 0 or not math.isfinite(mm_per_pixel):
+            return
+        self._view_center_x = float(cx)
+        self._view_center_y = float(cy)
+        self._mm_per_pixel = float(mm_per_pixel)
+        self.viewChanged.emit()
+        self.update()
+
+    def view_center_scale(self) -> tuple[float, float, float]:
+        return self._view_center_x, self._view_center_y, self._mm_per_pixel
+
+    def view_range(self) -> tuple[float, float, float, float]:
+        """Visible world rectangle as (x_min, x_max, y_min, y_max)."""
+        half_w = self.width() * self._mm_per_pixel * 0.5
+        half_h = self.height() * self._mm_per_pixel * 0.5
+        return (self._view_center_x - half_w, self._view_center_x + half_w,
+                self._view_center_y - half_h, self._view_center_y + half_h)
+
+    def data_bounds(self) -> tuple[float, float, float, float] | None:
+        return self._data_bounds
+
+    # --- 3D camera helpers -------------------------------------------------
+
+    # Default 3D camera angles — restored by :meth:`reset_3d_view`.
+    # Default 3D view = essentially top-down so it visually matches 2D
+    # mode on first entry / reset. 89° (not 90°) avoids gimbal lock —
+    # at exactly 90° the world-up (0, 0, 1) would be parallel to the
+    # view direction and lookAt becomes degenerate. The 1° tilt is
+    # imperceptible at typical viewer distances.
+    _CAM_DEFAULT_YAW_DEG: float = 0.0
+    _CAM_DEFAULT_PITCH_DEG: float = 89.0
+
+    def _fit_3d_to_data(self) -> None:
+        """Centre the 3D camera target on the data and pick a distance
+        that frames the board with a healthy margin."""
+        if self._data_bounds is None:
+            return
+        x_min, x_max, y_min, y_max = self._data_bounds
+        cx = (x_min + x_max) * 0.5
+        cy = (y_min + y_max) * 0.5
+        board_w = max(x_max - x_min, 1.0)
+        board_h = max(y_max - y_min, 1.0)
+        # Distance ≈ half-diagonal / tan(fov/2), with margin so the
+        # board isn't kissing the viewport edges.
+        diag = math.hypot(board_w, board_h) * 1.6
+        self._cam_target = (cx, cy, 0.0)
+        self._cam_distance = max(diag / (2.0 * math.tan(
+            math.radians(self._cam_fov_deg) * 0.5)), 1.0)
+
+    def reset_3d_view(self) -> None:
+        """Reset the 3D camera to its default yaw / pitch and re-fit
+        the target + distance to frame the data. Equivalent to flipping
+        2D → 3D fresh; used by the host's '0' hotkey.
+
+        Animated over ~0.5 s with smoothstep easing rather than
+        snapping, so the user can see where the camera was vs where
+        it lands. If there's no data yet there's nothing to frame, so
+        just snap the angles."""
+        if self._data_bounds is None:
+            self._cam_yaw_deg = self._CAM_DEFAULT_YAW_DEG
+            self._cam_pitch_deg = self._CAM_DEFAULT_PITCH_DEG
+            self.viewChanged.emit()
+            self.update()
+            return
+        # Compute the reset target/distance without disturbing the
+        # live camera — we'll animate towards them.
+        saved_target = self._cam_target
+        saved_distance = self._cam_distance
+        self._fit_3d_to_data()
+        to_target = self._cam_target
+        to_distance = self._cam_distance
+        self._cam_target = saved_target
+        self._cam_distance = saved_distance
+        self._animate_3d_view_to(
+            yaw_deg=self._CAM_DEFAULT_YAW_DEG,
+            pitch_deg=self._CAM_DEFAULT_PITCH_DEG,
+            target=to_target,
+            distance=to_distance,
+            duration_ms=500,
+        )
+
+    def _animate_3d_view_to(self, *, yaw_deg: float, pitch_deg: float,
+                            target: tuple[float, float, float],
+                            distance: float, duration_ms: int) -> None:
+        """Start an interpolation of the orbital-camera state to the
+        given pose. A new call while one is already running re-snaps
+        ``from_*`` to the current (mid-animation) values, so a second
+        '0' press partway through still produces a smooth motion."""
+        # Shortest angular path for yaw so we don't take the long way
+        # around when current yaw is already near the target.
+        delta_yaw = yaw_deg - self._cam_yaw_deg
+        while delta_yaw > 180.0:
+            delta_yaw -= 360.0
+        while delta_yaw < -180.0:
+            delta_yaw += 360.0
+        self._view_anim = {
+            "from_yaw": self._cam_yaw_deg,
+            "delta_yaw": delta_yaw,
+            "from_pitch": self._cam_pitch_deg,
+            "to_pitch": pitch_deg,
+            "from_target": self._cam_target,
+            "to_target": target,
+            "from_distance": self._cam_distance,
+            "to_distance": distance,
+            "duration_ms": max(1, duration_ms),
+        }
+        if self._view_anim_timer is None:
+            self._view_anim_timer = QTimer(self)
+            self._view_anim_timer.setInterval(16)  # ~60 Hz
+            self._view_anim_timer.timeout.connect(self._tick_view_animation)
+        self._view_anim_elapsed = QElapsedTimer()
+        self._view_anim_elapsed.start()
+        self._view_anim_timer.start()
+
+    def _tick_view_animation(self) -> None:
+        anim = self._view_anim
+        if anim is None or self._view_anim_elapsed is None:
+            if self._view_anim_timer is not None:
+                self._view_anim_timer.stop()
+            return
+        t = min(1.0, self._view_anim_elapsed.elapsed() / anim["duration_ms"])
+        # Smoothstep ease-in-out: 3t² − 2t³. No extra dependency,
+        # zero slope at both endpoints, looks natural.
+        ease = t * t * (3.0 - 2.0 * t)
+        self._cam_yaw_deg = anim["from_yaw"] + anim["delta_yaw"] * ease
+        self._cam_pitch_deg = (anim["from_pitch"]
+                                + (anim["to_pitch"] - anim["from_pitch"]) * ease)
+        fx, fy, fz = anim["from_target"]
+        tx, ty, tz = anim["to_target"]
+        self._cam_target = (
+            fx + (tx - fx) * ease,
+            fy + (ty - fy) * ease,
+            fz + (tz - fz) * ease,
+        )
+        self._cam_distance = (anim["from_distance"]
+                              + (anim["to_distance"] - anim["from_distance"]) * ease)
+        self.viewChanged.emit()
+        self.update()
+        if t >= 1.0:
+            self._view_anim_timer.stop()
+            self._view_anim = None
+            self._view_anim_elapsed = None
+
+    def _camera_position(self) -> tuple[float, float, float]:
+        """World-space camera position derived from yaw/pitch/distance
+        around :attr:`_cam_target`."""
+        tx, ty, tz = self._cam_target
+        yaw = math.radians(self._cam_yaw_deg)
+        pitch = math.radians(self._cam_pitch_deg)
+        # Standard spherical-to-cartesian. Pitch=0 puts the camera on
+        # the equator (side view); pitch=90 → directly above (top down).
+        cosp = math.cos(pitch)
+        x = tx + self._cam_distance * cosp * math.sin(yaw)
+        y = ty - self._cam_distance * cosp * math.cos(yaw)
+        z = tz + self._cam_distance * math.sin(pitch)
+        return x, y, z
+
+    def _current_mvp(self) -> QMatrix4x4:
+        """Compute the MVP matrix for the current view mode. In 2D this
+        is a straight orthographic projection of the visible rect (with
+        a wide z-range so layers at any z still pass the clip test). In
+        3D this is perspective * lookAt with the per-vertex z scaled by
+        :attr:`_vertical_exaggeration`."""
+        mvp = QMatrix4x4()
+        if self._view_mode == "3d":
+            w_px = max(1, self.width())
+            h_px = max(1, self.height())
+            aspect = w_px / h_px
+            near = max(self._cam_distance * 0.01, 0.1)
+            far = max(self._cam_distance * 100.0, near + 1.0)
+            mvp.perspective(self._cam_fov_deg, aspect, near, far)
+            cam_x, cam_y, cam_z = self._camera_position()
+            tx, ty, tz = self._cam_target
+            mvp.lookAt(
+                QVector3D(cam_x, cam_y, cam_z),
+                QVector3D(tx, ty, tz),
+                QVector3D(0.0, 0.0, 1.0),
+            )
+            # Per-vertex z exaggeration goes into the model matrix.
+            mvp.scale(1.0, 1.0, self._vertical_exaggeration)
+        else:
+            x_min, x_max, y_min, y_max = self.view_range()
+            # Wide z range so any leftover non-zero z's in the buffer
+            # still pass the clip test in 2D mode.
+            mvp.ortho(x_min, x_max, y_min, y_max, -1e6, 1e6)
+        return mvp
+
+    # ------------------------------------------------------------------
+    # Overlay interface
+    # ------------------------------------------------------------------
+
+    def set_overlay_top_left(self, html: str) -> None:
+        self._overlay_top_left_html = html or ""
+        self.update()
+
+    def set_overlay_top_right(self, html: str) -> None:
+        self._overlay_top_right_html = html or ""
+        self.update()
+
+    def set_markers(self, groups: list[MarkerGroup]) -> None:
+        self._markers = list(groups)
+        self.update()
+
+    def clear_markers(self) -> None:
+        self._markers = []
+        self.update()
+
+    def set_measurement_line(self, x0: float, y0: float,
+                              x1: float, y1: float) -> None:
+        """Show a thin white line from world-mm ``(x0, y0)`` to ``(x1, y1)``.
+        Drawn on top of every other overlay (markers / chips). Used by
+        the host's Shift-drag voltage-difference tool."""
+        self._measurement_line = (float(x0), float(y0),
+                                  float(x1), float(y1))
+        self.update()
+
+    def clear_measurement_line(self) -> None:
+        if self._measurement_line is not None:
+            self._measurement_line = None
+            self.update()
+
+    # ------------------------------------------------------------------
+    # Coord transforms (logical pixels → world mm and back)
+    # ------------------------------------------------------------------
+
+    def screen_to_world(self, x_px: float, y_px: float) -> tuple[float, float]:
+        """Convert a widget-local pixel position to world mm. ``y_px`` is
+        Qt-style top-down; we flip to mm-style bottom-up internally.
+
+        In 2D this is the orthographic-projection inverse. In 3D, where a
+        single screen pixel corresponds to a whole world-space ray, the
+        return value is the ray's intersection with the z=0 plane — use
+        :meth:`screen_to_world_at_z` to pick a different z (e.g. an inner
+        layer's stackup height) so the cursor lands on the copper the
+        user is actually looking at."""
+        if self._view_mode == "3d":
+            return self.screen_to_world_at_z(x_px, y_px, 0.0)
+        cx, cy = self._view_center_x, self._view_center_y
+        mpp = self._mm_per_pixel
+        wx = cx + (x_px - self.width() * 0.5) * mpp
+        wy = cy - (y_px - self.height() * 0.5) * mpp
+        return wx, wy
+
+    def screen_to_world_at_z(self, x_px: float, y_px: float,
+                               z_world: float) -> tuple[float, float]:
+        """Unproject a widget-local pixel to the world-space (x, y) where
+        the camera ray meets the plane z = ``z_world``.
+
+        In 2D mode the z plane is irrelevant — returns the same
+        coordinates as :meth:`screen_to_world` would. In 3D mode the
+        ray is built from the inverse MVP (so ``z_world`` is in the
+        same un-exaggerated mm as the host's stackup z values; the
+        vertical-exaggeration scale baked into the MVP cancels out on
+        inversion). If the ray is parallel to the requested plane the
+        far-plane unprojection is returned as a graceful fallback.
+        """
+        if self._view_mode != "3d":
+            cx, cy = self._view_center_x, self._view_center_y
+            mpp = self._mm_per_pixel
+            wx = cx + (x_px - self.width() * 0.5) * mpp
+            wy = cy - (y_px - self.height() * 0.5) * mpp
+            return wx, wy
+        w_px = max(1, self.width())
+        h_px = max(1, self.height())
+        ndc_x = 2.0 * float(x_px) / w_px - 1.0
+        ndc_y = 1.0 - 2.0 * float(y_px) / h_px
+        mvp = self._current_mvp()
+        inv, ok = mvp.inverted()
+        if not ok:
+            return 0.0, 0.0
+
+        def _unproject(ndc_z: float) -> tuple[float, float, float]:
+            # QMatrix4x4 has no QVector4D multiply; do the dot products
+            # manually (same pattern as world_to_screen).
+            r0 = inv.row(0); r1 = inv.row(1)
+            r2 = inv.row(2); r3 = inv.row(3)
+            x = (r0.x() * ndc_x + r0.y() * ndc_y
+                 + r0.z() * ndc_z + r0.w())
+            y = (r1.x() * ndc_x + r1.y() * ndc_y
+                 + r1.z() * ndc_z + r1.w())
+            z = (r2.x() * ndc_x + r2.y() * ndc_y
+                 + r2.z() * ndc_z + r2.w())
+            w = (r3.x() * ndc_x + r3.y() * ndc_y
+                 + r3.z() * ndc_z + r3.w())
+            if abs(w) < 1e-12:
+                w = 1e-12
+            return x / w, y / w, z / w
+
+        ox, oy, oz = _unproject(-1.0)   # near
+        fx, fy, fz = _unproject(1.0)    # far
+        dz = fz - oz
+        if abs(dz) < 1e-9:
+            return fx, fy
+        t = (float(z_world) - oz) / dz
+        wx = ox + t * (fx - ox)
+        wy = oy + t * (fy - oy)
+        return wx, wy
+
+    def last_hover_pixel(self) -> tuple[float, float]:
+        """Most recent mouse-move pixel position in widget-local logical
+        coordinates. Lets the host re-unproject the cursor against an
+        arbitrary z (per-layer ray picking) without re-fielding the
+        mouse event itself."""
+        return self._last_hover_pixel
+
+    def set_last_hover_pixel(self, x_px: float, y_px: float) -> None:
+        """Seed the last-hover pixel from outside the move-event path —
+        used when the host wants to synthesize a hover without a real
+        mouse event (e.g. on toggling the cursor tooltip on)."""
+        self._last_hover_pixel = (float(x_px), float(y_px))
+
+    def world_to_screen(self, wx: float, wy: float,
+                        wz: float = 0.0) -> tuple[float, float]:
+        """Project a world-space point (mm) to widget-pixel coords.
+
+        In 2D mode ``wz`` is ignored. In 3D mode the point is run
+        through the current MVP (including the vertical-exaggeration
+        scale) and undergoes perspective divide. Points behind the
+        camera return a far-off-screen sentinel so caller clipping
+        skips them naturally.
+        """
+        if self._view_mode == "3d":
+            mvp = self._current_mvp()
+            # PySide6's QMatrix4x4 doesn't expose ``__mul__`` for
+            # QVector4D, so do the row-by-row dot product manually to
+            # get clip-space coords (we need ``w`` for the
+            # behind-camera test, which ``map(QVector3D)`` swallows).
+            x = float(wx); y = float(wy); z = float(wz)
+            r0 = mvp.row(0); r1 = mvp.row(1); r3 = mvp.row(3)
+            cx = r0.x()*x + r0.y()*y + r0.z()*z + r0.w()
+            cy = r1.x()*x + r1.y()*y + r1.z()*z + r1.w()
+            cw = r3.x()*x + r3.y()*y + r3.z()*z + r3.w()
+            if cw <= 1e-6:
+                return -1e9, -1e9
+            ndc_x = cx / cw
+            ndc_y = cy / cw
+            x_px = (ndc_x + 1.0) * 0.5 * self.width()
+            y_px = (1.0 - ndc_y) * 0.5 * self.height()
+            return x_px, y_px
+        # 2D orthographic.
+        cx, cy = self._view_center_x, self._view_center_y
+        mpp = self._mm_per_pixel
+        x_px = self.width() * 0.5 + (wx - cx) / mpp
+        y_px = self.height() * 0.5 - (wy - cy) / mpp
+        return x_px, y_px
+
+    # ------------------------------------------------------------------
+    # QOpenGLWidget lifecycle
+    # ------------------------------------------------------------------
+
+    def initializeGL(self) -> None:
+        # Background colour — the bare-substrate look outside the mesh.
+        GL.glClearColor(self._bg_r, self._bg_g, self._bg_b, 1.0)
+        # Build & link the shader program.
+        prog = QOpenGLShaderProgram()
+        prog.addShaderFromSourceCode(QOpenGLShader.Vertex, _VERTEX_SHADER_SRC)
+        prog.addShaderFromSourceCode(QOpenGLShader.Fragment,
+                                      _FRAGMENT_SHADER_SRC)
+        if not prog.link():
+            log = prog.log()
+            raise RuntimeError(f"GLMeshViewer: shader link failed: {log}")
+        self._program = prog
+        self._u_mvp_loc = prog.uniformLocation("u_mvp")
+        self._u_levels_loc = prog.uniformLocation("u_levels")
+        self._u_cmap_loc = prog.uniformLocation("u_cmap")
+
+        # VAO + VBOs. We allocate Qt wrappers (cleanup at destruction)
+        # and use raw GL calls through them for the actual data uploads.
+        self._vao = QOpenGLVertexArrayObject()
+        self._vao.create()
+        self._pos_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._pos_vbo.create()
+        self._val_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._val_vbo.create()
+        self._ibo = QOpenGLBuffer(QOpenGLBuffer.IndexBuffer)
+        self._ibo.create()
+
+        # 1-D colormap texture. We make a placeholder grayscale until
+        # set_colormap is called by the host.
+        self._cmap_tex = QOpenGLTexture(QOpenGLTexture.Target1D)
+        self._cmap_tex.setMinificationFilter(QOpenGLTexture.Linear)
+        self._cmap_tex.setMagnificationFilter(QOpenGLTexture.Linear)
+        self._cmap_tex.setWrapMode(QOpenGLTexture.ClampToEdge)
+        self._cmap_tex.setSize(256)
+        self._cmap_tex.setFormat(QOpenGLTexture.RGBA8_UNorm)
+        self._cmap_tex.allocateStorage(QOpenGLTexture.RGBA, QOpenGLTexture.UInt8)
+        placeholder = np.tile(np.linspace(0, 255, 256, dtype=np.uint8)[:, None],
+                              (1, 4))
+        placeholder[:, 3] = 255
+        self._cmap_tex.setData(0, QOpenGLTexture.RGBA, QOpenGLTexture.UInt8,
+                                placeholder.tobytes())
+
+        # Line / outline shader program — vec2 position + vec3 colour,
+        # MVP-transformed, no texture lookup. Used for per-layer copper
+        # outlines drawn on top of the heatmap mesh.
+        line_prog = QOpenGLShaderProgram()
+        line_prog.addShaderFromSourceCode(QOpenGLShader.Vertex,
+                                            _LINE_VERTEX_SHADER_SRC)
+        line_prog.addShaderFromSourceCode(QOpenGLShader.Fragment,
+                                            _LINE_FRAGMENT_SHADER_SRC)
+        if not line_prog.link():
+            log = line_prog.log()
+            raise RuntimeError(f"GLMeshViewer: line shader link failed: {log}")
+        self._line_program = line_prog
+        self._line_u_mvp_loc = line_prog.uniformLocation("u_mvp")
+        self._line_vao = QOpenGLVertexArrayObject()
+        self._line_vao.create()
+        self._line_pos_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._line_pos_vbo.create()
+        self._line_col_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._line_col_vbo.create()
+
+        # Via cylinder VAO/VBOs — share the line shader.
+        self._cyl_vao = QOpenGLVertexArrayObject()
+        self._cyl_vao.create()
+        self._cyl_pos_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._cyl_pos_vbo.create()
+        self._cyl_col_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._cyl_col_vbo.create()
+
+        # Current-arrow VAO/VBOs — share the line shader.
+        self._arrow_vao = QOpenGLVertexArrayObject()
+        self._arrow_vao.create()
+        self._arrow_pos_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._arrow_pos_vbo.create()
+        self._arrow_col_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._arrow_col_vbo.create()
+
+        # Stub-copper VAO/VBOs — share the line shader.
+        self._stub_vao = QOpenGLVertexArrayObject()
+        self._stub_vao.create()
+        self._stub_pos_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._stub_pos_vbo.create()
+        self._stub_col_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._stub_col_vbo.create()
+
+        # Series-bar VAO/VBOs — share the line shader.
+        self._sbar_vao = QOpenGLVertexArrayObject()
+        self._sbar_vao.create()
+        self._sbar_pos_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._sbar_pos_vbo.create()
+        self._sbar_col_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._sbar_col_vbo.create()
+
+        # Board-outline VAO/VBOs — share the line shader.
+        self._bdrl_vao = QOpenGLVertexArrayObject()
+        self._bdrl_vao.create()
+        self._bdrl_pos_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._bdrl_pos_vbo.create()
+        self._bdrl_col_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._bdrl_col_vbo.create()
+
+        self._gl_initialized = True
+
+    def resizeGL(self, w: int, h: int) -> None:
+        # Use device pixels for the GL viewport on Hi-DPI displays.
+        dpr = self.devicePixelRatio()
+        GL.glViewport(0, 0, int(w * dpr), int(h * dpr))
+        # Resize doesn't change centre/scale — that's the CAD-style fixed
+        # zoom; the visible area grows or shrinks instead. Host can call
+        # fit_to_data if it wants a re-fit.
+        self.viewChanged.emit()
+
+    def paintGL(self) -> None:
+        # Depth test only matters in 3D where overlapping layers and
+        # cylinders need correct front/back ordering. In 2D it would
+        # discard fragments from later draws even when they intentionally
+        # paint over earlier ones.
+        if self._view_mode == "3d":
+            GL.glEnable(GL.GL_DEPTH_TEST)
+            GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
+        else:
+            GL.glDisable(GL.GL_DEPTH_TEST)
+            GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+        self._flush_pending_uploads()
+        # Stubs first — flat-grey copper polygons drawn underneath the
+        # heatmap mesh. If a stub happens to overlap a solved layer
+        # piece (unlikely after the filter, but possible), the heatmap
+        # paints on top.
+        if (self._n_stub_vertices > 0
+                and self._line_program is not None):
+            self._draw_stubs()
+        # Bottom-side series bars sit before the mesh so the bottom
+        # copper draws over them (the resistor body is physically below
+        # the bottom copper). Top-side bars are drawn after the mesh
+        # below, so they sit on top.
+        if (self._n_sbar_under_vertices > 0
+                and self._line_program is not None):
+            self._draw_series_bars(0, self._n_sbar_under_vertices)
+        if self._n_indices > 0 and self._program is not None:
+            self._draw_mesh()
+            if (self._show_mesh_edges
+                    and self._line_program is not None):
+                self._draw_mesh_wireframe()
+        over_first = self._n_sbar_under_vertices
+        over_count = self._n_sbar_vertices - over_first
+        if (over_count > 0
+                and self._line_program is not None):
+            self._draw_series_bars(over_first, over_count)
+        if (self._n_line_vertices > 0
+                and self._line_program is not None):
+            self._draw_lines()
+        if (self._view_mode == "3d"
+                and self._n_cyl_vertices > 0
+                and self._line_program is not None):
+            self._draw_cylinders()
+        if (self._n_arrow_vertices > 0
+                and self._line_program is not None):
+            self._draw_arrows()
+        # Board outline last so it always paints on top of the heatmap,
+        # outlines, stubs, and arrows — the user uses this overlay to see
+        # the PCB boundary against all the other visuals.
+        if (self._n_bdrl_vertices > 0
+                and self._line_program is not None):
+            self._draw_board_outline()
+        # Overlays (markers + text chips) drawn via QPainter — works on
+        # the QOpenGLWidget because QPainter uses the GL paint engine.
+        # MUST be called outside the active program's bind to avoid
+        # state corruption from the painter.
+        self._draw_overlays()
+
+    # ------------------------------------------------------------------
+    # GL upload / draw helpers
+    # ------------------------------------------------------------------
+
+    def _flush_pending_uploads(self) -> None:
+        """If new mesh / values / cmap arrived since the last paint,
+        push them to the GPU now (inside the active GL context)."""
+        if self._pending_positions is not None:
+            self._pos_vbo.bind()
+            self._pos_vbo.allocate(self._pending_positions.tobytes(),
+                                   self._pending_positions.nbytes)
+            self._pos_vbo.release()
+            self._pending_positions = None
+        if self._pending_indices is not None:
+            self._ibo.bind()
+            self._ibo.allocate(self._pending_indices.tobytes(),
+                               self._pending_indices.nbytes)
+            self._ibo.release()
+            self._pending_indices = None
+        if self._pending_values is not None:
+            self._val_vbo.bind()
+            self._val_vbo.allocate(self._pending_values.tobytes(),
+                                   self._pending_values.nbytes)
+            self._val_vbo.release()
+            self._pending_values = None
+        if self._pending_cmap is not None:
+            self._cmap_tex.bind()
+            self._cmap_tex.setData(0, QOpenGLTexture.RGBA,
+                                    QOpenGLTexture.UInt8,
+                                    self._pending_cmap.tobytes())
+            self._pending_cmap = None
+        if self._pending_line_positions is not None:
+            self._line_pos_vbo.bind()
+            self._line_pos_vbo.allocate(
+                self._pending_line_positions.tobytes(),
+                self._pending_line_positions.nbytes,
+            )
+            self._line_pos_vbo.release()
+            self._pending_line_positions = None
+        if self._pending_line_colors is not None:
+            self._line_col_vbo.bind()
+            self._line_col_vbo.allocate(
+                self._pending_line_colors.tobytes(),
+                self._pending_line_colors.nbytes,
+            )
+            self._line_col_vbo.release()
+            self._pending_line_colors = None
+        if self._pending_cyl_positions is not None:
+            self._cyl_pos_vbo.bind()
+            self._cyl_pos_vbo.allocate(
+                self._pending_cyl_positions.tobytes(),
+                self._pending_cyl_positions.nbytes,
+            )
+            self._cyl_pos_vbo.release()
+            self._pending_cyl_positions = None
+        if self._pending_cyl_colors is not None:
+            self._cyl_col_vbo.bind()
+            self._cyl_col_vbo.allocate(
+                self._pending_cyl_colors.tobytes(),
+                self._pending_cyl_colors.nbytes,
+            )
+            self._cyl_col_vbo.release()
+            self._pending_cyl_colors = None
+        if self._pending_arrow_positions is not None:
+            self._arrow_pos_vbo.bind()
+            self._arrow_pos_vbo.allocate(
+                self._pending_arrow_positions.tobytes(),
+                self._pending_arrow_positions.nbytes,
+            )
+            self._arrow_pos_vbo.release()
+            self._pending_arrow_positions = None
+        if self._pending_arrow_colors is not None:
+            self._arrow_col_vbo.bind()
+            self._arrow_col_vbo.allocate(
+                self._pending_arrow_colors.tobytes(),
+                self._pending_arrow_colors.nbytes,
+            )
+            self._arrow_col_vbo.release()
+            self._pending_arrow_colors = None
+        if self._pending_stub_positions is not None:
+            self._stub_pos_vbo.bind()
+            self._stub_pos_vbo.allocate(
+                self._pending_stub_positions.tobytes(),
+                self._pending_stub_positions.nbytes,
+            )
+            self._stub_pos_vbo.release()
+            self._pending_stub_positions = None
+        if self._pending_stub_colors is not None:
+            self._stub_col_vbo.bind()
+            self._stub_col_vbo.allocate(
+                self._pending_stub_colors.tobytes(),
+                self._pending_stub_colors.nbytes,
+            )
+            self._stub_col_vbo.release()
+            self._pending_stub_colors = None
+        if self._pending_sbar_positions is not None:
+            self._sbar_pos_vbo.bind()
+            self._sbar_pos_vbo.allocate(
+                self._pending_sbar_positions.tobytes(),
+                self._pending_sbar_positions.nbytes,
+            )
+            self._sbar_pos_vbo.release()
+            self._pending_sbar_positions = None
+        if self._pending_sbar_colors is not None:
+            self._sbar_col_vbo.bind()
+            self._sbar_col_vbo.allocate(
+                self._pending_sbar_colors.tobytes(),
+                self._pending_sbar_colors.nbytes,
+            )
+            self._sbar_col_vbo.release()
+            self._pending_sbar_colors = None
+        if self._pending_bdrl_positions is not None:
+            self._bdrl_pos_vbo.bind()
+            self._bdrl_pos_vbo.allocate(
+                self._pending_bdrl_positions.tobytes(),
+                self._pending_bdrl_positions.nbytes,
+            )
+            self._bdrl_pos_vbo.release()
+            self._pending_bdrl_positions = None
+        if self._pending_bdrl_colors is not None:
+            self._bdrl_col_vbo.bind()
+            self._bdrl_col_vbo.allocate(
+                self._pending_bdrl_colors.tobytes(),
+                self._pending_bdrl_colors.nbytes,
+            )
+            self._bdrl_col_vbo.release()
+            self._pending_bdrl_colors = None
+
+    def _draw_mesh(self) -> None:
+        prog = self._program
+        prog.bind()
+        prog.setUniformValue(self._u_mvp_loc, self._current_mvp())
+        prog.setUniformValue(self._u_levels_loc,
+                              float(self._levels[0]),
+                              float(self._levels[1]))
+        # Colormap on texture unit 0.
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        self._cmap_tex.bind()
+        prog.setUniformValue(self._u_cmap_loc, 0)
+
+        # Bind VAO and set up vertex attributes.
+        self._vao.bind()
+        self._pos_vbo.bind()
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._pos_vbo.release()
+        self._val_vbo.bind()
+        GL.glEnableVertexAttribArray(1)
+        GL.glVertexAttribPointer(1, 1, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._val_vbo.release()
+        self._ibo.bind()
+        GL.glDrawElements(GL.GL_TRIANGLES, self._n_indices,
+                          GL.GL_UNSIGNED_INT, None)
+        self._ibo.release()
+        GL.glDisableVertexAttribArray(0)
+        GL.glDisableVertexAttribArray(1)
+        self._vao.release()
+        self._cmap_tex.release()
+        prog.release()
+
+    def _draw_mesh_wireframe(self) -> None:
+        """Redraw the heatmap mesh's triangles as line segments to overlay
+        the FEM mesh edges on top of the filled heatmap.
+
+        Reuses the line shader (vec3 pos + vec3 colour) with attribute 1
+        disabled so every vertex receives the same constant colour set
+        via ``glVertexAttrib3f``. ``glPolygonMode(GL_FRONT_AND_BACK,
+        GL_LINE)`` plus a GL_TRIANGLES draw is the standard wireframe
+        trick — each triangle rasterises as its three edges, sharing the
+        edge between adjacent triangles for free.
+        """
+        prog = self._line_program
+        prog.bind()
+        prog.setUniformValue(self._line_u_mvp_loc, self._current_mvp())
+        self._vao.bind()
+        self._pos_vbo.bind()
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._pos_vbo.release()
+        # Constant colour for every wireframe vertex — disable the array
+        # for attribute 1 and supply a generic value. Dark grey reads on
+        # top of viridis without overpowering it.
+        GL.glDisableVertexAttribArray(1)
+        GL.glVertexAttrib3f(1, 0.08, 0.08, 0.08)
+        GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_LINE)
+        GL.glLineWidth(1.0)
+        self._ibo.bind()
+        GL.glDrawElements(GL.GL_TRIANGLES, self._n_indices,
+                          GL.GL_UNSIGNED_INT, None)
+        self._ibo.release()
+        GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_FILL)
+        GL.glDisableVertexAttribArray(0)
+        self._vao.release()
+        prog.release()
+
+    def _draw_lines(self) -> None:
+        """Draw the outline batch as GL_LINES with per-vertex colour."""
+        prog = self._line_program
+        prog.bind()
+        prog.setUniformValue(self._line_u_mvp_loc, self._current_mvp())
+
+        self._line_vao.bind()
+        self._line_pos_vbo.bind()
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._line_pos_vbo.release()
+        self._line_col_vbo.bind()
+        GL.glEnableVertexAttribArray(1)
+        GL.glVertexAttribPointer(1, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._line_col_vbo.release()
+
+        # Force a 1-pixel line; Core profile drivers vary on glLineWidth
+        # support past 1.0, but 1.0 is universally allowed.
+        GL.glLineWidth(1.0)
+        GL.glDrawArrays(GL.GL_LINES, 0, self._n_line_vertices)
+
+        GL.glDisableVertexAttribArray(0)
+        GL.glDisableVertexAttribArray(1)
+        self._line_vao.release()
+        prog.release()
+
+    def _draw_cylinders(self) -> None:
+        """Draw the via-cylinder triangle batch via the line shader."""
+        prog = self._line_program
+        prog.bind()
+        prog.setUniformValue(self._line_u_mvp_loc, self._current_mvp())
+
+        self._cyl_vao.bind()
+        self._cyl_pos_vbo.bind()
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._cyl_pos_vbo.release()
+        self._cyl_col_vbo.bind()
+        GL.glEnableVertexAttribArray(1)
+        GL.glVertexAttribPointer(1, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._cyl_col_vbo.release()
+
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, self._n_cyl_vertices)
+
+        GL.glDisableVertexAttribArray(0)
+        GL.glDisableVertexAttribArray(1)
+        self._cyl_vao.release()
+        prog.release()
+
+    def _draw_stubs(self) -> None:
+        """Draw the stub-copper triangle batch via the line shader.
+
+        Flat-coloured polygons of copper the FEM excluded as dead-end
+        stubs. Drawn in 2D and 3D so the user always sees the copper
+        is there, even though there's no heatmap value for it.
+        """
+        prog = self._line_program
+        prog.bind()
+        prog.setUniformValue(self._line_u_mvp_loc, self._current_mvp())
+
+        self._stub_vao.bind()
+        self._stub_pos_vbo.bind()
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._stub_pos_vbo.release()
+        self._stub_col_vbo.bind()
+        GL.glEnableVertexAttribArray(1)
+        GL.glVertexAttribPointer(1, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._stub_col_vbo.release()
+
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, self._n_stub_vertices)
+
+        GL.glDisableVertexAttribArray(0)
+        GL.glDisableVertexAttribArray(1)
+        self._stub_vao.release()
+        prog.release()
+
+    def _draw_series_bars(self, first: int, count: int) -> None:
+        """Draw a slice of the series-bar triangle batch via the line
+        shader. ``first`` and ``count`` are vertex indices; both must be
+        multiples of 3 so each draw covers whole triangles."""
+        prog = self._line_program
+        prog.bind()
+        prog.setUniformValue(self._line_u_mvp_loc, self._current_mvp())
+
+        self._sbar_vao.bind()
+        self._sbar_pos_vbo.bind()
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._sbar_pos_vbo.release()
+        self._sbar_col_vbo.bind()
+        GL.glEnableVertexAttribArray(1)
+        GL.glVertexAttribPointer(1, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._sbar_col_vbo.release()
+
+        GL.glDrawArrays(GL.GL_TRIANGLES, first, count)
+
+        GL.glDisableVertexAttribArray(0)
+        GL.glDisableVertexAttribArray(1)
+        self._sbar_vao.release()
+        prog.release()
+
+    def _draw_board_outline(self) -> None:
+        """Draw the board-outline ribbon as flat-coloured triangles via the
+        line shader. Pre-triangulated by the caller as a fixed-mm-wide
+        ribbon so the line thickness reads boldly on any driver."""
+        prog = self._line_program
+        prog.bind()
+        prog.setUniformValue(self._line_u_mvp_loc, self._current_mvp())
+
+        self._bdrl_vao.bind()
+        self._bdrl_pos_vbo.bind()
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._bdrl_pos_vbo.release()
+        self._bdrl_col_vbo.bind()
+        GL.glEnableVertexAttribArray(1)
+        GL.glVertexAttribPointer(1, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._bdrl_col_vbo.release()
+
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, self._n_bdrl_vertices)
+
+        GL.glDisableVertexAttribArray(0)
+        GL.glDisableVertexAttribArray(1)
+        self._bdrl_vao.release()
+        prog.release()
+
+    def _draw_arrows(self) -> None:
+        """Draw the current-arrow batch as GL_LINES via the line shader."""
+        prog = self._line_program
+        prog.bind()
+        prog.setUniformValue(self._line_u_mvp_loc, self._current_mvp())
+
+        self._arrow_vao.bind()
+        self._arrow_pos_vbo.bind()
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._arrow_pos_vbo.release()
+        self._arrow_col_vbo.bind()
+        GL.glEnableVertexAttribArray(1)
+        GL.glVertexAttribPointer(1, 3, GL.GL_FLOAT, GL.GL_FALSE, 0, None)
+        self._arrow_col_vbo.release()
+
+        GL.glLineWidth(1.0)
+        GL.glDrawArrays(GL.GL_LINES, 0, self._n_arrow_vertices)
+
+        GL.glDisableVertexAttribArray(0)
+        GL.glDisableVertexAttribArray(1)
+        self._arrow_vao.release()
+        prog.release()
+
+    # ------------------------------------------------------------------
+    # QPainter overlay (markers + title + legend)
+    # ------------------------------------------------------------------
+
+    def _draw_overlays(self) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        self._draw_markers(painter)
+        self._draw_measurement_line(painter)
+        self._draw_overlay_chip(
+            painter, self._overlay_top_left_html, anchor_right=False
+        )
+        self._draw_overlay_chip(
+            painter, self._overlay_top_right_html, anchor_right=True
+        )
+        painter.end()
+
+    def _draw_measurement_line(self, painter: QPainter) -> None:
+        """Draw the host-supplied measurement line (Shift-drag voltage
+        probe) as a thin white segment in pixel space, plus a small
+        filled circle at the origin endpoint so the anchor point is
+        obvious at a glance. World-mm endpoints are projected through
+        :meth:`world_to_screen` so the line tracks pan/zoom and the 3D
+        camera correctly."""
+        if self._measurement_line is None:
+            return
+        x0_mm, y0_mm, x1_mm, y1_mm = self._measurement_line
+        x0_px, y0_px = self.world_to_screen(x0_mm, y0_mm)
+        x1_px, y1_px = self.world_to_screen(x1_mm, y1_mm)
+        # world_to_screen returns -1e9 sentinels for behind-camera points
+        # in 3D — drop the line entirely if either endpoint is invalid.
+        if min(x0_px, x1_px) < -1e8 or min(y0_px, y1_px) < -1e8:
+            return
+        painter.save()
+        pen = QPen(QColor("#ffffff"))
+        pen.setWidthF(1.0)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawLine(QPointF(x0_px, y0_px), QPointF(x1_px, y1_px))
+        # Origin marker: small filled white disc anchored at (x0, y0).
+        # 3 px radius reads at any zoom level without obscuring the
+        # underlying copper.
+        painter.setBrush(QBrush(QColor("#ffffff")))
+        painter.drawEllipse(QPointF(x0_px, y0_px), 3.0, 3.0)
+        painter.restore()
+
+    def _draw_markers(self, painter: QPainter) -> None:
+        if not self._markers:
+            return
+        mpp = max(float(self._mm_per_pixel), 1e-9)
+        for group in self._markers:
+            if group.xs.size == 0:
+                continue
+            fill = QBrush(QColor(group.color))
+            pen = QPen(QColor(group.edge_color))
+            pen.setWidthF(group.edge_width)
+            painter.setBrush(fill)
+            painter.setPen(pen)
+            default_size = float(group.size)
+            zs = group.zs
+            wdiams = group.world_diameters_mm
+            min_px = float(group.min_pixel_diameter)
+            for i in range(group.xs.size):
+                wx = float(group.xs[i])
+                wy = float(group.ys[i])
+                wz = float(zs[i]) if zs is not None else 0.0
+                # World-space sizing: each marker scales with zoom, but
+                # never shrinks below ``min_pixel_diameter`` — keeps
+                # vias visible (with intentional overlap) when zoomed
+                # out beyond the via's physical footprint.
+                if wdiams is not None:
+                    size = max(float(wdiams[i]) / mpp, min_px)
+                else:
+                    size = default_size
+                # Skip points outside the viewport — saves QPainter calls
+                # in deep zoom and silently drops behind-camera points
+                # in 3D (world_to_screen returns the sentinel -1e9).
+                px, py = self.world_to_screen(wx, wy, wz)
+                if (px < -size or px > self.width() + size
+                        or py < -size or py > self.height() + size):
+                    continue
+                self._draw_symbol(painter, px, py, group.symbol, size)
+
+    @staticmethod
+    def _draw_symbol(painter: QPainter, px: float, py: float,
+                     symbol: str, size: float) -> None:
+        """Draw a single marker centred at (px, py) at the given pixel
+        size. Pixel-mode: marker doesn't scale with zoom."""
+        r = size * 0.5
+        if symbol == "o":
+            painter.drawEllipse(QPointF(px, py), r, r)
+        elif symbol == "s":
+            painter.drawRect(QRectF(px - r, py - r, size, size))
+        elif symbol == "d":
+            poly = QPolygonF([
+                QPointF(px, py - r),
+                QPointF(px + r, py),
+                QPointF(px, py + r),
+                QPointF(px - r, py),
+            ])
+            painter.drawPolygon(poly)
+        elif symbol == "star":
+            # 5-pointed star — outer radius r, inner radius r*0.4.
+            outer = r
+            inner = r * 0.4
+            poly = QPolygonF()
+            for k in range(10):
+                angle = -math.pi / 2.0 + k * math.pi / 5.0
+                rad = outer if (k % 2 == 0) else inner
+                poly.append(QPointF(px + rad * math.cos(angle),
+                                    py + rad * math.sin(angle)))
+            painter.drawPolygon(poly)
+        elif symbol == "tri_up":
+            # Equilateral upward-pointing triangle, apex at top.
+            painter.drawPolygon(QPolygonF([
+                QPointF(px,             py - r),
+                QPointF(px + r * 0.866, py + r * 0.5),
+                QPointF(px - r * 0.866, py + r * 0.5),
+            ]))
+        elif symbol == "tri_down":
+            # Equilateral downward-pointing triangle, apex at bottom.
+            painter.drawPolygon(QPolygonF([
+                QPointF(px,             py + r),
+                QPointF(px + r * 0.866, py - r * 0.5),
+                QPointF(px - r * 0.866, py - r * 0.5),
+            ]))
+        elif symbol == "bolt":
+            # Lightning bolt — 7-point concave polygon. Geometry lifted
+            # from the Material Design ``flash_on`` icon and normalised
+            # to ±1 from the marker centre.
+            pts = (
+                (-0.50, -1.00),
+                (-0.20, -0.20),
+                ( 0.10, -0.20),
+                ( 0.50, -1.00),
+                ( 0.20,  0.10),
+                ( 0.50,  0.10),
+                (-0.20,  1.00),
+            )
+            painter.drawPolygon(QPolygonF([
+                QPointF(px + dx * r, py + dy * r) for dx, dy in pts
+            ]))
+        elif symbol == "target":
+            # Bullseye — outer filled circle in the marker's brush
+            # colour, with a small contrasting centre dot stamped on
+            # top so it reads as a target / "here" pin at any zoom.
+            painter.drawEllipse(QPointF(px, py), r, r)
+            pen = painter.pen()
+            painter.save()
+            painter.setBrush(QBrush(pen.color()))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(QPointF(px, py), r * 0.35, r * 0.35)
+            painter.restore()
+        else:
+            painter.drawEllipse(QPointF(px, py), r, r)
+
+    def _draw_overlay_chip(self, painter: QPainter, html: str,
+                           anchor_right: bool) -> None:
+        if not html:
+            return
+        # Build a QTextDocument so we can measure + render HTML cleanly.
+        doc = QTextDocument()
+        doc.setDefaultFont(QFont("Segoe UI", 9))
+        doc.setHtml(html)
+        # Force light text — the dark chip background otherwise eats the
+        # default near-black foreground.
+        doc.setDefaultStyleSheet("body, p, table, td, span { color: #e6e6e6; }")
+        doc.setHtml(html)  # re-set so style sheet applies
+        doc.adjustSize()
+        size = doc.size()
+        margin = 8
+        chip_w = size.width() + 12
+        chip_h = size.height() + 6
+        if anchor_right:
+            x = self.width() - chip_w - margin
+        else:
+            x = margin
+        y = margin
+        # Background + border in one drawRect. Setting BOTH pen and
+        # brush explicitly here is critical — _draw_markers leaves the
+        # painter's brush set to whatever the last marker group used
+        # (e.g. the yellow Vias-tab "Go" highlight), and drawRect would
+        # otherwise re-fill the chip interior with that leftover brush.
+        painter.save()
+        painter.setPen(QColor("#666"))
+        painter.setBrush(QBrush(QColor(34, 34, 34, 240)))
+        painter.drawRect(QRectF(x, y, chip_w, chip_h))
+        # Text.
+        painter.translate(x + 6, y + 3)
+        doc.drawContents(painter)
+        painter.restore()
+
+    # ------------------------------------------------------------------
+    # Mouse interaction (matches Altium's PCB view conventions)
+    #   Both modes: RightDrag = pan, Wheel = zoom, LeftClick = clicked,
+    #               MiddleDrag vertical = exponential zoom
+    #   3D mode also: Shift+RightDrag = rotate (orbit around target)
+    #   Left-drag (any mode) is just drag-detection so the click-clears-
+    #   highlight handler can ignore accidental tiny drags.
+    # ------------------------------------------------------------------
+
+    # Pixels of drag per degree of yaw/pitch in 3D rotate mode.
+    _ROTATE_PIXELS_PER_DEG: float = 4.0
+    # 2D middle-button zoom sensitivity: number of pixels of vertical
+    # drag that doubles / halves the visible mm/pixel. Drag UP zooms IN
+    # (smaller mm/pixel), drag DOWN zooms OUT.
+    _MIDDLE_ZOOM_PIXELS_PER_DOUBLING: float = 150.0
+
+    def mousePressEvent(self, ev) -> None:
+        if ev.button() == Qt.LeftButton:
+            self._press_origin = QPointF(ev.position())
+            self._press_center = (self._view_center_x, self._view_center_y)
+            self._is_panning = False
+            ev.accept()
+            return
+        if ev.button() == Qt.RightButton:
+            # Right-button pans (both modes); Shift+Right rotates in 3D.
+            self._right_press_origin = QPointF(ev.position())
+            self._right_press_center = (
+                self._view_center_x, self._view_center_y,
+            )
+            self._right_press_target = self._cam_target
+            self._right_press_yaw = self._cam_yaw_deg
+            self._right_press_pitch = self._cam_pitch_deg
+            self._right_press_mpp = self._mm_per_pixel
+            self._right_press_shift = bool(ev.modifiers() & Qt.ShiftModifier)
+            self._right_is_dragging = False
+            ev.accept()
+            return
+        if ev.button() == Qt.MiddleButton:
+            # Hold-and-drag zoom in either mode. Vertical drag scales
+            # exponentially (drag up = zoom in, drag down = zoom out).
+            pos = ev.position()
+            self._middle_press_origin = QPointF(pos)
+            if self._view_mode == "2d":
+                # 2D: pivot around the world point under the press cursor.
+                self._middle_press_world = self.screen_to_world(pos.x(), pos.y())
+                self._middle_press_mpp = self._mm_per_pixel
+            else:
+                # 3D: dolly the camera in/out (pivots around the camera
+                # target — simplest sensible behaviour without ray-casts).
+                self._middle_press_distance = self._cam_distance
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev) -> None:
+        pos = ev.position()
+        # Left-button drag is no longer wired to pan. We only track its
+        # drag-distance so the click-clears-highlight handler can ignore
+        # accidental movements.
+        if self._press_origin is not None:
+            dx_px = pos.x() - self._press_origin.x()
+            dy_px = pos.y() - self._press_origin.y()
+            if not self._is_panning and (
+                abs(dx_px) > self._CLICK_DRAG_THRESHOLD_PX
+                or abs(dy_px) > self._CLICK_DRAG_THRESHOLD_PX
+            ):
+                self._is_panning = True
+
+        # --- Right-button drag ---
+        # 2D: pan the orthographic view.
+        # 3D: pan the camera target (no shift) or rotate (Shift held).
+        if self._right_press_origin is not None:
+            dx_px = pos.x() - self._right_press_origin.x()
+            dy_px = pos.y() - self._right_press_origin.y()
+            if not self._right_is_dragging and (
+                abs(dx_px) > self._CLICK_DRAG_THRESHOLD_PX
+                or abs(dy_px) > self._CLICK_DRAG_THRESHOLD_PX
+            ):
+                self._right_is_dragging = True
+            if self._right_is_dragging and self._view_mode == "2d":
+                cx0, cy0 = self._right_press_center
+                mpp = self._right_press_mpp
+                new_cx = cx0 - dx_px * mpp
+                new_cy = cy0 + dy_px * mpp
+                self.set_view_center_scale(new_cx, new_cy, mpp)
+            elif self._right_is_dragging and self._view_mode == "3d":
+                if self._right_press_shift:
+                    # Rotate. Yaw is INVERTED relative to the raw dx so
+                    # the model orbits with the drag (drag-right makes
+                    # the right-hand side of the board come toward the
+                    # camera, matching Altium / SolidWorks convention).
+                    # Pitch follows the drag direction directly: drag
+                    # down → camera tilts to look more top-down.
+                    self._cam_yaw_deg = (self._right_press_yaw
+                                          - dx_px / self._ROTATE_PIXELS_PER_DEG)
+                    new_pitch = (self._right_press_pitch
+                                  + dy_px / self._ROTATE_PIXELS_PER_DEG)
+                    # Clamp so we never flip past straight-up or straight-
+                    # down (avoids gimbal-style camera roll surprises).
+                    self._cam_pitch_deg = max(-89.0, min(89.0, new_pitch))
+                else:
+                    # Pan: shift the camera target in the view plane.
+                    # mm per screen pixel at the target depth ≈
+                    # 2 * dist * tan(fov/2) / widget_height
+                    h_px = max(1, self.height())
+                    mm_per_px = (2.0 * self._cam_distance * math.tan(
+                        math.radians(self._cam_fov_deg) * 0.5)) / h_px
+                    yaw = math.radians(self._cam_yaw_deg)
+                    pitch = math.radians(self._cam_pitch_deg)
+                    # Right and up basis vectors in world space.
+                    right = (math.cos(yaw), math.sin(yaw), 0.0)
+                    up = (-math.sin(pitch) * math.sin(yaw),
+                           math.sin(pitch) * math.cos(yaw),
+                           math.cos(pitch))
+                    tx0, ty0, tz0 = self._right_press_target
+                    self._cam_target = (
+                        tx0 - dx_px * mm_per_px * right[0]
+                            + dy_px * mm_per_px * up[0],
+                        ty0 - dx_px * mm_per_px * right[1]
+                            + dy_px * mm_per_px * up[1],
+                        tz0 - dx_px * mm_per_px * right[2]
+                            + dy_px * mm_per_px * up[2],
+                    )
+                self.viewChanged.emit()
+                self.update()
+
+        # --- Middle-button drag = exponential zoom (both modes) ---
+        # Vertical drag from the press origin determines the zoom
+        # factor; negative dy (drag UP) zooms in, positive zooms out.
+        if self._middle_press_origin is not None:
+            dy_px = pos.y() - self._middle_press_origin.y()
+            factor = pow(2.0,
+                         dy_px / self._MIDDLE_ZOOM_PIXELS_PER_DOUBLING)
+            if self._view_mode == "2d":
+                # Pivot around the world point under the press cursor.
+                new_mpp = self._middle_press_mpp * factor
+                new_mpp = max(min(new_mpp, 1e6), 1e-9)
+                wx0, wy0 = self._middle_press_world
+                anchor_px = self._middle_press_origin.x()
+                anchor_py = self._middle_press_origin.y()
+                new_cx = wx0 - (anchor_px - self.width() * 0.5) * new_mpp
+                new_cy = wy0 + (anchor_py - self.height() * 0.5) * new_mpp
+                self.set_view_center_scale(new_cx, new_cy, new_mpp)
+            else:  # 3D
+                new_dist = self._middle_press_distance * factor
+                new_dist = max(min(new_dist, 1e7), 0.01)
+                self._cam_distance = new_dist
+                self.viewChanged.emit()
+                self.update()
+
+        # Always emit hover (caller throttles + skips during drag).
+        self._last_hover_pixel = (float(pos.x()), float(pos.y()))
+        wx, wy = self.screen_to_world(pos.x(), pos.y())
+        inside = (0 <= pos.x() < self.width()
+                  and 0 <= pos.y() < self.height())
+        self.mouseHoveredAt.emit(wx, wy, inside)
+
+    def mouseReleaseEvent(self, ev) -> None:
+        if ev.button() == Qt.LeftButton:
+            was_panning = self._is_panning
+            self._press_origin = None
+            self._is_panning = False
+            if not was_panning:
+                wx, wy = self.screen_to_world(ev.position().x(),
+                                                ev.position().y())
+                self.clicked.emit(wx, wy)
+            ev.accept()
+            return
+        if ev.button() == Qt.RightButton:
+            self._right_press_origin = None
+            self._right_is_dragging = False
+            ev.accept()
+            return
+        if ev.button() == Qt.MiddleButton:
+            self._middle_press_origin = None
+            ev.accept()
+            return
+        super().mouseReleaseEvent(ev)
+
+    def contextMenuEvent(self, ev) -> None:
+        # Swallow the default right-click context menu — right-button
+        # drag is the pan gesture in both 2D and 3D modes, so a popup
+        # would only get in the way.
+        ev.accept()
+
+    def wheelEvent(self, ev) -> None:
+        delta = ev.angleDelta().y()
+        if delta == 0:
+            return
+        # 120 = one wheel click; 1.2x zoom factor per click.
+        factor = pow(1.0 / 1.2, delta / 120.0)
+        if self._view_mode == "3d":
+            # 3D: dolly the camera in/out (multiply distance).
+            new_dist = self._cam_distance * factor
+            self._cam_distance = max(min(new_dist, 1e7), 0.01)
+            self.viewChanged.emit()
+            self.update()
+            ev.accept()
+            return
+        # 2D: zoom around the cursor — keep the world point under the
+        # mouse fixed across the scale change.
+        pos = ev.position()
+        wx_before, wy_before = self.screen_to_world(pos.x(), pos.y())
+        new_mpp = self._mm_per_pixel * factor
+        new_mpp = max(min(new_mpp, 1e6), 1e-9)
+        new_cx = wx_before - (pos.x() - self.width() * 0.5) * new_mpp
+        new_cy = wy_before + (pos.y() - self.height() * 0.5) * new_mpp
+        self.set_view_center_scale(new_cx, new_cy, new_mpp)
+        ev.accept()
