@@ -1,0 +1,15 @@
+{
+  "baseBranch": "main",
+  "testBranch": "test/combined",
+  "deleteTestBranchFirst": true,
+  "extraFeatureBranches": [
+    "feature/series-vin-inferenz",
+    "fix/altium-monkey-sheet-entry-hotspot",
+    "chore/altium-monkey-2026.7.9",
+    "feature/shift-click-eye-isolate",
+    "fix/cap-value-spaced-units",
+    "feature/metric-footprints",
+    "fix/impedance-transient-locale",
+    "feature/impedance-cap-labels"
+  ]
+}
