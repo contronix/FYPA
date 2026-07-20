@@ -11,6 +11,7 @@
     "feature/metric-footprints",
     "fix/impedance-transient-locale",
     "feature/impedance-cap-labels",
-    "fix/nested-local-net-resolution"
+    "fix/nested-local-net-resolution",
+    "feature/area-weighted-pin-coupling"
   ]
 }
