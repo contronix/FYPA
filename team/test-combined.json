@@ -12,6 +12,7 @@
     "fix/impedance-transient-locale",
     "feature/impedance-cap-labels",
     "fix/nested-local-net-resolution",
-    "feature/area-weighted-pin-coupling"
+    "feature/area-weighted-pin-coupling",
+    "fix/cli-gui-import-parity"
   ]
 }
