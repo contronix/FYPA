@@ -4,7 +4,7 @@
   "deleteTestBranchFirst": true,
   "extraFeatureBranches": [
     "feature/series-vin-inferenz",
-    "fix/altium-monkey-sheet-entry-hotspot",
+    /*"fix/altium-monkey-sheet-entry-hotspot",*/
     "chore/altium-monkey-2026.7.9",
     "feature/shift-click-eye-isolate",
     "fix/cap-value-spaced-units",
@@ -13,6 +13,7 @@
     "feature/impedance-cap-labels",
     "fix/nested-local-net-resolution",
     "feature/area-weighted-pin-coupling",
-    "fix/cli-gui-import-parity"
+    "fix/cli-gui-import-parity",
+    "chore/altium-monkey-2026.7.9"
   ]
 }
