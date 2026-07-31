@@ -12,6 +12,6 @@
     "fix/nested-local-net-resolution",
     "feature/area-weighted-pin-coupling",
     "fix/cli-gui-import-parity",
-    "chore/altium-monkey-2026.7.9"
+    "chore/altium-monkey-2026.7.29"
   ]
 }
