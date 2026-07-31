@@ -12,6 +12,6 @@
     "feature/area-weighted-pin-coupling",
     "fix/cli-gui-import-parity",
     "chore/altium-monkey-2026.7.29",
-    "fix/local-net-channel-alias-scope"
+    "fix/local-net-channel-alias-scope-combined"
   ]
 }
