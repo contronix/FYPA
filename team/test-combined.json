@@ -11,7 +11,7 @@
     "feature/impedance-cap-labels",
     "feature/area-weighted-pin-coupling",
     "fix/cli-gui-import-parity",
-    "chore/altium-monkey-2026.7.29",
+    "chore/altium-monkey-2026.8.1",
     "fix/local-net-channel-alias-scope-combined",
     "feature/sheet-symbol-pdn-overrides-combined"
   ]
