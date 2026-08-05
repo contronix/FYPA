@@ -7,7 +7,6 @@
     "feature/area-weighted-pin-coupling",
     "feature/impedance-cap-labels",
     "feature/metric-footprints",
-    "feature/py314-run-script",
     "feature/rail-subnet-tree",
     "feature/series-vin-inferenz",
     "feature/sheet-symbol-pdn-overrides",
