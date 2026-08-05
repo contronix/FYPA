@@ -1,0 +1,55 @@
+# Fork-only: lives exclusively on branch team/local.
+# Do NOT merge this file into main or into upstream PR branches.
+name: Maintain test/combined
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - team/local
+    paths:
+      - team/test-combined.json
+      - .github/workflows/maintain-test-combined.yml
+
+permissions:
+  contents: write
+
+jobs:
+  maintain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Fetch all branch tips
+        run: |
+          git fetch origin main team/local
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Ensure maintain script from main
+        run: |
+          if [ ! -f scripts/maintain-test-combined.ps1 ]; then
+            echo "scripts/maintain-test-combined.ps1 missing on main — merge the central-test-combined changes first."
+            exit 1
+          fi
+
+      - name: Install PowerShell
+        shell: bash
+        run: |
+          if ! command -v pwsh >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y powershell
+          fi
+
+      - name: Rebuild and push test/combined
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/maintain-test-combined.ps1 -Rebuild -Push -TeamConfigRef team/local
