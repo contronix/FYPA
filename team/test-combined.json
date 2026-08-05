@@ -3,16 +3,19 @@
   "testBranch": "test/combined",
   "deleteTestBranchFirst": true,
   "extraFeatureBranches": [
+    "chore/altium-monkey-2026.8.1",
+    "feature/area-weighted-pin-coupling",
+    "feature/impedance-cap-labels",
+    "feature/metric-footprints",
+    "feature/py314-run-script",
+    "feature/rail-subnet-tree",
     "feature/series-vin-inferenz",
+    "feature/sheet-symbol-pdn-overrides",
     "feature/shift-click-eye-isolate",
     "fix/cap-value-spaced-units",
-    "feature/metric-footprints",
-    "fix/impedance-transient-locale",
-    "feature/impedance-cap-labels",
-    "feature/area-weighted-pin-coupling",
     "fix/cli-gui-import-parity",
-    "chore/altium-monkey-2026.8.1",
+    "fix/impedance-transient-locale",
     "fix/local-net-channel-alias-scope",
-    "feature/sheet-symbol-pdn-overrides"
+    "fix/nested-local-net-resolution"
   ]
 }
