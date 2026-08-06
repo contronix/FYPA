@@ -14,7 +14,6 @@
     "chore/altium-monkey-2026.8.1",
     "fix/local-net-channel-alias-scope",
     "feature/sheet-symbol-pdn-overrides",
-    "feature/rail-subnet-tree",
-    "fix/nested-local-net-resolution"
+    "feature/rail-subnet-tree"
   ]
 }
