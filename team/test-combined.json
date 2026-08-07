@@ -16,6 +16,7 @@
     "feature/sheet-symbol-pdn-overrides",
     "feature/rail-subnet-tree",
     "feature/pdn-channel-templates",
-    "feature/multi-connector-pdn-source"
+    "feature/multi-connector-pdn-source",
+    "feature/auto-nettie-bridges"
   ]
 }
