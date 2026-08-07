@@ -15,6 +15,7 @@
     "fix/local-net-channel-alias-scope",
     "feature/sheet-symbol-pdn-overrides",
     "feature/rail-subnet-tree",
-    "feature/pdn-channel-templates"
+    "feature/pdn-channel-templates",
+    "feature/multi-connector-pdn-source"
   ]
 }
