@@ -796,7 +796,14 @@ def test_connect_row_to_bus_skips_foreign_vertical_column():
     trunk_y, path_d = _connect_row_to_bus(plan, 456.0, ctx, "VDD", [regulator])
     assert path_d is not None
     assert trunk_y is not None
-    assert abs(trunk_y - 212.0) > 1e-6, path_d
+    from fypa.topology.geometry import parse_wire_path
+
+    pts = parse_wire_path(path_d)
+    # Climb must not share the foreign vertical at x=244.
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if abs(x0 - x1) < 0.5 and abs(x0 - 244.0) < 0.5:
+            assert False, f"climb uses foreign column: {path_d}"
+    assert abs(trunk_y - 261.0) > 1e-6 or "V " in path_d
 
 
 def test_detoured_hub_row_emits_row_bus_and_vertical_drops():

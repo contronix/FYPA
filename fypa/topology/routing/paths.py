@@ -785,11 +785,25 @@ def hub_tap_path(
         )
         if detoured is not None:
             return detoured
-        # Connectivity last resort: detour row into bus without claiming a
-        # blocked stub column (validation may still flag crossings).
-        ctx.reserve_vertical(attach, min(y, y_clear), max(y, y_clear), net)
-        ctx.reserve_horizontal(y_clear, min(attach, bus_x), max(attach, bus_x), net)
-        path = f"{start_leg} V {y_clear:.1f} H {bus_x:.1f}"
+        # Connectivity last resort: never replay the long port→attach stub on a
+        # foreign-owned port row — micro stub or port-face climb only.
+        micro = outward_escape_stub_x(port)
+        micro_lo, micro_hi = min(port.x, micro), max(port.x, micro)
+        if (
+            not _foreign_horizontal_blocks_row(ctx, y, micro_lo, micro_hi, net)
+            and horizontal_segment_clear(y, micro_lo, micro_hi, obstacles, {port.node_id})
+        ):
+            ctx.reserve_horizontal(y, micro_lo, micro_hi, net)
+            ctx.reserve_vertical(micro, min(y, y_clear), max(y, y_clear), net)
+            ctx.reserve_horizontal(y_clear, min(micro, bus_x), max(micro, bus_x), net)
+            path = (
+                f"M {port.x:.1f},{y:.1f} H {micro:.1f} "
+                f"V {y_clear:.1f} H {bus_x:.1f}"
+            )
+        else:
+            ctx.reserve_vertical(port.x, min(y, y_clear), max(y, y_clear), net)
+            ctx.reserve_horizontal(y_clear, min(port.x, bus_x), max(port.x, bus_x), net)
+            path = f"M {port.x:.1f},{y:.1f} V {y_clear:.1f} H {bus_x:.1f}"
         return simplify_wire_path(path), y_clear
     if foreign_vertical_covers_y(ctx, attach, y, net):
         escape = clear_outward_stub_x(

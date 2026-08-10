@@ -92,6 +92,32 @@ def hub_row_edge_x(row_lo: float, row_hi: float, bus_x: float) -> float:
     return row_hi if bus_x >= mid else row_lo
 
 
+def _clear_row_feed_column(
+    edge_x: float,
+    bus_x: float,
+    y_lo: float,
+    y_hi: float,
+    ctx: RoutingContext,
+    net: str,
+    obstacles: list[TopologyNode],
+) -> float | None:
+    """Pick a climb column between the row edge and the trunk that is free."""
+    toward = 1.0 if bus_x >= edge_x else -1.0
+    step_px = MIN_PARALLEL_GAP / 2.0
+    for step in range(0, 16):
+        x = round(edge_x + toward * step_px * step, 1)
+        if (toward > 0 and x > bus_x + WIRE_EPS) or (
+            toward < 0 and x < bus_x - WIRE_EPS
+        ):
+            break
+        if _foreign_vertical_blocks_column(ctx, x, y_lo, y_hi, net):
+            continue
+        if not trunk_vertical_clear(x, y_lo, y_hi, obstacles, set()):
+            continue
+        return x
+    return None
+
+
 def _connector_family(designator: str) -> str | None:
     """J2.1 / J2.2 → ``J2``; plain designators → ``None``."""
     if "." not in designator:
@@ -246,41 +272,63 @@ def _connect_row_to_bus(
     # fall back onto a still-blocked nominal row — keep the obstacle/band
     # detour even when the feed must climb before reaching the trunk.
     y_forced = obstacle_detour_y(ctx, plan.y_row, lo, hi, obstacles, row_skip, net)
-    if abs(y_forced - plan.y_row) > WIRE_EPS:
-        y_lo, y_hi = min(plan.y_row, y_forced), max(plan.y_row, y_forced)
-        if not _foreign_vertical_blocks_column(ctx, edge_x, y_lo, y_hi, net):
-            ctx.reserve_vertical(edge_x, y_lo, y_hi, net)
-            ctx.reserve_horizontal(y_forced, lo, hi, net)
-            return y_forced, simplify_wire_path(
-                f"M {edge_x:.1f},{plan.y_row:.1f} V {y_forced:.1f} H {bus_x:.1f}",
-            )
+    forced_needed = abs(y_forced - plan.y_row) > WIRE_EPS
 
-    if _foreign_horizontal_blocks_row(ctx, plan.y_row, lo, hi, net):
-        # Try both directions; keep the first feed whose climb column is clear.
+    def _emit_feed(y_feed: float) -> tuple[float, str] | None:
+        y_lo, y_hi = min(plan.y_row, y_feed), max(plan.y_row, y_feed)
+        col_x = _clear_row_feed_column(
+            edge_x, bus_x, y_lo, y_hi, ctx, net, obstacles,
+        )
+        if col_x is None:
+            return None
+        if _foreign_horizontal_blocks_row(ctx, y_feed, min(col_x, bus_x), max(col_x, bus_x), net):
+            return None
+        if abs(col_x - edge_x) > WIRE_EPS:
+            # Step from the row edge onto the clear climb column at the port row
+            # before climbing, so the row stub stays tied to the feed.
+            if _foreign_horizontal_blocks_row(
+                ctx, plan.y_row, min(edge_x, col_x), max(edge_x, col_x), net,
+            ):
+                return None
+            ctx.reserve_horizontal(plan.y_row, min(edge_x, col_x), max(edge_x, col_x), net)
+            ctx.reserve_vertical(col_x, y_lo, y_hi, net)
+            ctx.reserve_horizontal(y_feed, min(col_x, bus_x), max(col_x, bus_x), net)
+            return y_feed, simplify_wire_path(
+                f"M {edge_x:.1f},{plan.y_row:.1f} H {col_x:.1f} "
+                f"V {y_feed:.1f} H {bus_x:.1f}",
+            )
+        ctx.reserve_vertical(col_x, y_lo, y_hi, net)
+        ctx.reserve_horizontal(y_feed, min(col_x, bus_x), max(col_x, bus_x), net)
+        return y_feed, simplify_wire_path(
+            f"M {edge_x:.1f},{plan.y_row:.1f} V {y_feed:.1f} H {bus_x:.1f}",
+        )
+
+    if forced_needed:
+        emitted = _emit_feed(y_forced)
+        if emitted is not None:
+            return emitted
+
+    if forced_needed or _foreign_horizontal_blocks_row(ctx, plan.y_row, lo, hi, net):
         for sign in (1.0, -1.0):
-            y_seed = plan.y_row + sign * MIN_PARALLEL_GAP
+            y_seed = (
+                y_forced if forced_needed and sign > 0 else
+                plan.y_row + sign * MIN_PARALLEL_GAP
+            )
             y_nudge = obstacle_detour_y(ctx, y_seed, lo, hi, obstacles, row_skip, net)
             if abs(y_nudge - plan.y_row) <= WIRE_EPS:
                 continue
-            if _foreign_horizontal_blocks_row(ctx, y_nudge, lo, hi, net):
-                continue
-            y_lo, y_hi = min(plan.y_row, y_nudge), max(plan.y_row, y_nudge)
-            if _foreign_vertical_blocks_column(ctx, edge_x, y_lo, y_hi, net):
-                continue
-            if not trunk_vertical_clear(edge_x, y_lo, y_hi, obstacles, set()):
-                continue
-            ctx.reserve_vertical(edge_x, y_lo, y_hi, net)
-            ctx.reserve_horizontal(y_nudge, lo, hi, net)
-            return y_nudge, simplify_wire_path(
-                f"M {edge_x:.1f},{plan.y_row:.1f} V {y_nudge:.1f} H {bus_x:.1f}",
-            )
-        # Still blocked: attach with a forced downward nudge so the net stays
-        # connected; prefer overwriting a gap rather than the foreign row itself.
+            emitted = _emit_feed(y_nudge)
+            if emitted is not None:
+                return emitted
         y_nudge = obstacle_detour_y(
             ctx, plan.y_row + MIN_PARALLEL_GAP, lo, hi, obstacles, row_skip, net,
         )
         if abs(y_nudge - plan.y_row) <= WIRE_EPS:
             y_nudge = plan.y_row + MIN_PARALLEL_GAP
+        emitted = _emit_feed(y_nudge)
+        if emitted is not None:
+            return emitted
+        # Absolute last resort: keep connectivity even if corridors conflict.
         y_lo, y_hi = min(plan.y_row, y_nudge), max(plan.y_row, y_nudge)
         ctx.reserve_vertical(edge_x, y_lo, y_hi, net)
         ctx.reserve_horizontal(y_nudge, lo, hi, net)
