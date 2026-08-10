@@ -1,70 +1,70 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="250" height="368" viewBox="0 0 250 368">
+<svg xmlns="http://www.w3.org/2000/svg" width="294" height="378" viewBox="0 0 294 378">
 <rect width="100%" height="100%" fill="#2b2b2b"/>
-<line x1="164" y1="111" x2="176" y2="111" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="176" y1="111" x2="178" y2="111" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="24" y1="146" x2="178" y2="146" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="24" y1="231" x2="36" y2="231" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="164" y1="93" x2="192" y2="93" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="192" y1="93" x2="196" y2="93" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="8" y1="130" x2="196" y2="130" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="8" y1="213" x2="36" y2="213" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="164" y1="75" x2="208" y2="75" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="208" y1="75" x2="214" y2="75" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="-8" y1="26" x2="214" y2="26" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="-8" y1="195" x2="36" y2="195" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="24" y1="249" x2="36" y2="249" stroke="#088b00" stroke-width="2" stroke-linecap="round"/>
-<path d="M 178,111 V 124.5 A 5.5,5.5 0 0 1 178,135.5 V 146" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M 24,146 V 189.5 A 5.5,5.5 0 0 1 24,200.5 V 207.5 A 5.5,5.5 0 0 1 24,218.5 V 231" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M 196,93 V 130" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M 8,130 V 189.5 A 5.5,5.5 0 0 1 8,200.5 V 213" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M 214,26 V 75" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M -8,26 V 195" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M 24,249 V 288" fill="none" stroke="#088b00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<line x1="24" y1="288" x2="24" y2="298" stroke="#909090" stroke-width="2" stroke-linecap="round"/>
-<line x1="10" y1="302" x2="38" y2="302" stroke="#909090" stroke-width="2" stroke-linecap="round"/>
-<line x1="15" y1="307" x2="33" y2="307" stroke="#909090" stroke-width="2" stroke-linecap="round"/>
-<line x1="18.5" y1="312" x2="29.5" y2="312" stroke="#909090" stroke-width="2" stroke-linecap="round"/>
-<text x="24" y="326" text-anchor="middle" fill="#e6e6e6" font-family="Segoe UI,sans-serif" font-size="9" font-weight="600">GND</text>
-<rect class="topo-hit" data-label="D1" x="36" y="36" width="128" height="92" rx="6" fill="#333333" stroke="#555555" stroke-width="1"/>
-<rect x="36" y="36" width="128" height="22" rx="6" fill="#1a7a3c"/>
-<rect x="36" y="52" width="128" height="6" fill="#1a7a3c"/>
-<text x="44" y="51" fill="#ffffff" font-family="Segoe UI,sans-serif" font-size="10" font-weight="600">SERIES</text>
-<text x="156" y="51" fill="#ffffff" text-anchor="end" font-family="Segoe UI,sans-serif" font-size="10" font-weight="600">D1</text>
-<circle cx="36" cy="75" r="5" fill="#1a7a3c" stroke="#555555" stroke-width="1"/>
-<text x="44" y="78" text-anchor="start" fill="#909090" font-family="Consolas,monospace" font-size="8">VDD</text>
-<circle cx="164" cy="75" r="5" fill="#1a7a3c" stroke="#555555" stroke-width="1"/>
-<text x="156" y="78" text-anchor="end" fill="#909090" font-family="Consolas,monospace" font-size="8">LED_R</text>
-<circle cx="164" cy="93" r="5" fill="#1a7a3c" stroke="#555555" stroke-width="1"/>
-<text x="156" y="96" text-anchor="end" fill="#909090" font-family="Consolas,monospace" font-size="8">LED_G</text>
-<circle cx="164" cy="111" r="5" fill="#1a7a3c" stroke="#555555" stroke-width="1"/>
-<text x="156" y="114" text-anchor="end" fill="#909090" font-family="Consolas,monospace" font-size="8">LED_B</text>
-<rect class="topo-hit" data-label="U4" x="36" y="156" width="128" height="110" rx="6" fill="#333333" stroke="#555555" stroke-width="1"/>
-<rect x="36" y="156" width="128" height="22" rx="6" fill="#3aa8ff"/>
-<rect x="36" y="172" width="128" height="6" fill="#3aa8ff"/>
-<text x="44" y="171" fill="#ffffff" font-family="Segoe UI,sans-serif" font-size="10" font-weight="600">SINK</text>
-<text x="156" y="171" fill="#ffffff" text-anchor="end" font-family="Segoe UI,sans-serif" font-size="10" font-weight="600">U4</text>
-<circle cx="36" cy="195" r="5" fill="#3aa8ff" stroke="#555555" stroke-width="1"/>
-<text x="44" y="198" text-anchor="start" fill="#909090" font-family="Consolas,monospace" font-size="8">LED_R</text>
-<circle cx="36" cy="213" r="5" fill="#3aa8ff" stroke="#555555" stroke-width="1"/>
-<text x="44" y="216" text-anchor="start" fill="#909090" font-family="Consolas,monospace" font-size="8">LED_G</text>
-<circle cx="36" cy="231" r="5" fill="#3aa8ff" stroke="#555555" stroke-width="1"/>
-<text x="44" y="234" text-anchor="start" fill="#909090" font-family="Consolas,monospace" font-size="8">LED_B</text>
-<circle cx="36" cy="249" r="5" fill="#3aa8ff" stroke="#555555" stroke-width="1"/>
-<text x="44" y="252" text-anchor="start" fill="#909090" font-family="Consolas,monospace" font-size="8">GND</text>
-<g transform="translate(8,171.5)">
+<line x1="208" y1="121" x2="220" y2="121" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="220" y1="121" x2="222" y2="121" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="68" y1="156" x2="222" y2="156" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="68" y1="241" x2="80" y2="241" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="208" y1="103" x2="236" y2="103" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="236" y1="103" x2="240" y2="103" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="52" y1="140" x2="240" y2="140" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="52" y1="223" x2="80" y2="223" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="208" y1="85" x2="252" y2="85" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="252" y1="85" x2="258" y2="85" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="36" y1="36" x2="258" y2="36" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="36" y1="205" x2="80" y2="205" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="68" y1="259" x2="80" y2="259" stroke="#088b00" stroke-width="2" stroke-linecap="round"/>
+<path d="M 222,121 V 134.5 A 5.5,5.5 0 0 1 222,145.5 V 156" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 68,156 V 199.5 A 5.5,5.5 0 0 1 68,210.5 V 217.5 A 5.5,5.5 0 0 1 68,228.5 V 241" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 240,103 V 140" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 52,140 V 199.5 A 5.5,5.5 0 0 1 52,210.5 V 223" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 258,36 V 85" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 36,36 V 205" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 68,259 V 298" fill="none" stroke="#088b00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<line x1="68" y1="298" x2="68" y2="308" stroke="#909090" stroke-width="2" stroke-linecap="round"/>
+<line x1="54" y1="312" x2="82" y2="312" stroke="#909090" stroke-width="2" stroke-linecap="round"/>
+<line x1="59" y1="317" x2="77" y2="317" stroke="#909090" stroke-width="2" stroke-linecap="round"/>
+<line x1="62.5" y1="322" x2="73.5" y2="322" stroke="#909090" stroke-width="2" stroke-linecap="round"/>
+<text x="68" y="336" text-anchor="middle" fill="#e6e6e6" font-family="Segoe UI,sans-serif" font-size="9" font-weight="600">GND</text>
+<rect class="topo-hit" data-label="D1" x="80" y="46" width="128" height="92" rx="6" fill="#333333" stroke="#555555" stroke-width="1"/>
+<rect x="80" y="46" width="128" height="22" rx="6" fill="#1a7a3c"/>
+<rect x="80" y="62" width="128" height="6" fill="#1a7a3c"/>
+<text x="88" y="61" fill="#ffffff" font-family="Segoe UI,sans-serif" font-size="10" font-weight="600">SERIES</text>
+<text x="200" y="61" fill="#ffffff" text-anchor="end" font-family="Segoe UI,sans-serif" font-size="10" font-weight="600">D1</text>
+<circle cx="80" cy="85" r="5" fill="#1a7a3c" stroke="#555555" stroke-width="1"/>
+<text x="88" y="88" text-anchor="start" fill="#909090" font-family="Consolas,monospace" font-size="8">VDD</text>
+<circle cx="208" cy="85" r="5" fill="#1a7a3c" stroke="#555555" stroke-width="1"/>
+<text x="200" y="88" text-anchor="end" fill="#909090" font-family="Consolas,monospace" font-size="8">LED_R</text>
+<circle cx="208" cy="103" r="5" fill="#1a7a3c" stroke="#555555" stroke-width="1"/>
+<text x="200" y="106" text-anchor="end" fill="#909090" font-family="Consolas,monospace" font-size="8">LED_G</text>
+<circle cx="208" cy="121" r="5" fill="#1a7a3c" stroke="#555555" stroke-width="1"/>
+<text x="200" y="124" text-anchor="end" fill="#909090" font-family="Consolas,monospace" font-size="8">LED_B</text>
+<rect class="topo-hit" data-label="U4" x="80" y="166" width="128" height="110" rx="6" fill="#333333" stroke="#555555" stroke-width="1"/>
+<rect x="80" y="166" width="128" height="22" rx="6" fill="#3aa8ff"/>
+<rect x="80" y="182" width="128" height="6" fill="#3aa8ff"/>
+<text x="88" y="181" fill="#ffffff" font-family="Segoe UI,sans-serif" font-size="10" font-weight="600">SINK</text>
+<text x="200" y="181" fill="#ffffff" text-anchor="end" font-family="Segoe UI,sans-serif" font-size="10" font-weight="600">U4</text>
+<circle cx="80" cy="205" r="5" fill="#3aa8ff" stroke="#555555" stroke-width="1"/>
+<text x="88" y="208" text-anchor="start" fill="#909090" font-family="Consolas,monospace" font-size="8">LED_R</text>
+<circle cx="80" cy="223" r="5" fill="#3aa8ff" stroke="#555555" stroke-width="1"/>
+<text x="88" y="226" text-anchor="start" fill="#909090" font-family="Consolas,monospace" font-size="8">LED_G</text>
+<circle cx="80" cy="241" r="5" fill="#3aa8ff" stroke="#555555" stroke-width="1"/>
+<text x="88" y="244" text-anchor="start" fill="#909090" font-family="Consolas,monospace" font-size="8">LED_B</text>
+<circle cx="80" cy="259" r="5" fill="#3aa8ff" stroke="#555555" stroke-width="1"/>
+<text x="88" y="262" text-anchor="start" fill="#909090" font-family="Consolas,monospace" font-size="8">GND</text>
+<g transform="translate(52,181.5)">
 <rect x="-8" y="-13.5" width="16" height="27" fill="#2b2b2b" fill-opacity="0.5" stroke="none" rx="2"/>
 <text transform="rotate(-90)" text-anchor="middle" dominant-baseline="middle" fill="#e6e6e6" font-family="Segoe UI,sans-serif" font-size="8">LED_G</text>
 </g>
-<rect x="177.1" y="69" width="31" height="12" fill="#2b2b2b" fill-opacity="0.5" stroke="none" rx="2"/>
-<text x="192.6" y="75" text-anchor="middle" dominant-baseline="middle" fill="#e6e6e6" font-family="Segoe UI,sans-serif" font-size="8">LED_R</text>
-<rect x="12" y="342" width="10" height="10" rx="2" fill="#ff3030"/>
-<text x="26" y="352" fill="#909090" font-family="Segoe UI,sans-serif" font-size="10">SOURCE</text>
-<rect x="90" y="342" width="10" height="10" rx="2" fill="#3aa8ff"/>
-<text x="104" y="352" fill="#909090" font-family="Segoe UI,sans-serif" font-size="10">SINK</text>
-<rect x="168" y="342" width="10" height="10" rx="2" fill="#1a7a3c"/>
-<text x="182" y="352" fill="#909090" font-family="Segoe UI,sans-serif" font-size="10">SERIES</text>
-<rect x="246" y="342" width="10" height="10" rx="2" fill="#ff66ff"/>
-<text x="260" y="352" fill="#909090" font-family="Segoe UI,sans-serif" font-size="10">REGULATOR</text>
-<line x1="324" y1="348" x2="342" y2="348" stroke="#909090" stroke-width="2" stroke-dasharray="5 4"/>
-<text x="348" y="352" fill="#909090" font-family="Segoe UI,sans-serif" font-size="10">extern</text>
+<rect x="221.1" y="79" width="31" height="12" fill="#2b2b2b" fill-opacity="0.5" stroke="none" rx="2"/>
+<text x="236.6" y="85" text-anchor="middle" dominant-baseline="middle" fill="#e6e6e6" font-family="Segoe UI,sans-serif" font-size="8">LED_R</text>
+<rect x="12" y="352" width="10" height="10" rx="2" fill="#ff3030"/>
+<text x="26" y="362" fill="#909090" font-family="Segoe UI,sans-serif" font-size="10">SOURCE</text>
+<rect x="90" y="352" width="10" height="10" rx="2" fill="#3aa8ff"/>
+<text x="104" y="362" fill="#909090" font-family="Segoe UI,sans-serif" font-size="10">SINK</text>
+<rect x="168" y="352" width="10" height="10" rx="2" fill="#1a7a3c"/>
+<text x="182" y="362" fill="#909090" font-family="Segoe UI,sans-serif" font-size="10">SERIES</text>
+<rect x="246" y="352" width="10" height="10" rx="2" fill="#ff66ff"/>
+<text x="260" y="362" fill="#909090" font-family="Segoe UI,sans-serif" font-size="10">REGULATOR</text>
+<line x1="324" y1="358" x2="342" y2="358" stroke="#909090" stroke-width="2" stroke-dasharray="5 4"/>
+<text x="348" y="362" fill="#909090" font-family="Segoe UI,sans-serif" font-size="10">extern</text>
 </svg>

@@ -171,6 +171,91 @@ def test_same_side_ports_get_distinct_rows_after_peer_orient():
     assert right[0][1] != right[1][1]
 
 
+def test_series_keeps_through_flow_despite_peers_on_one_side():
+    """SERIES/RESISTOR stay left↔right; peer-orient must not stack both faces."""
+    from fypa.topology.metadata.layout_bridge import (
+        ResolvedPort,
+        orient_ports_toward_peers,
+    )
+
+    series = _spec(
+        "R1",
+        role="RESISTOR",
+        ports=[("P", "left", 0), ("N", "right", 1)],
+        terms={
+            "P": {"requested_net": "VIN", "pins": [{"net": "VIN", "pad": "1"}]},
+            "N": {"requested_net": "VOUT", "pins": [{"net": "VOUT", "pad": "2"}]},
+        },
+    )
+    # Both nets only connect to peers further right → peer-orient would want
+    # both ports on the right if SERIES were not exempt.
+    right_a = _spec(
+        "A",
+        role="SINK",
+        ports=[("P", "left", 0)],
+        terms={"P": {"requested_net": "VIN", "pins": [{"net": "VIN", "pad": "1"}]}},
+    )
+    right_b = _spec(
+        "B",
+        role="SINK",
+        ports=[("P", "left", 0)],
+        terms={"P": {"requested_net": "VOUT", "pins": [{"net": "VOUT", "pad": "1"}]}},
+    )
+    series["resolved_ports"] = {
+        "P": ResolvedPort(wnet="VIN", plabel="VIN", tooltip=""),
+        "N": ResolvedPort(wnet="VOUT", plabel="VOUT", tooltip=""),
+    }
+    right_a["resolved_ports"] = {"P": ResolvedPort(wnet="VIN", plabel="VIN", tooltip="")}
+    right_b["resolved_ports"] = {"P": ResolvedPort(wnet="VOUT", plabel="VOUT", tooltip="")}
+    orient_ports_toward_peers(
+        [series, right_a, right_b],
+        {"R1": 0, "A": 1, "B": 1},
+        {},
+    )
+    sides = {pname: side for pname, side, _ in series["port_defs"]}
+    assert sides["P"] == "left"
+    assert sides["N"] == "right"
+
+
+def test_canvas_fits_wires_routed_above_origin():
+    """Detours above y=0 must expand/shift the canvas so nothing is clipped."""
+    from fypa.topology.builder import _fit_canvas_to_content
+    from fypa.topology.geometry import parse_wire_path
+    from fypa.topology.types import TopologyNode, TopologyWire
+
+    node = TopologyNode(
+        node_id="U1",
+        label="U1",
+        designator="U1",
+        role="SINK",
+        x=36.0,
+        y=36.0,
+        width=128.0,
+        height=56.0,
+        config_label="",
+        has_error=False,
+        bounds=(36.0, 36.0, 128.0, 56.0),
+    )
+    wire = TopologyWire(
+        net="VDD",
+        path_d="M 36.0,50.0 H 20.0 V -40.0 H 200.0",
+        routing_kind="hub_tap",
+        bus_x=200.0,
+    )
+    width, height, _gy, _gx = _fit_canvas_to_content(
+        [node],
+        [wire],
+        gnd_bus_y=None,
+        gnd_symbol_x=None,
+        needs_gnd=False,
+    )
+    ys = [y for _, y in parse_wire_path(wire.path_d)]
+    assert min(ys) >= 36.0 - 0.6
+    assert node.y >= 36.0 - 0.6
+    assert width >= 200.0 + 36.0 - 0.6
+    assert height > 56.0
+
+
 def test_multi_column_gutter_does_not_inflate_every_gap():
     """Buses on a long SOURCE→SINK span must not widen every intervening gap."""
     from fypa.topology.constants import COL_GAP, NODE_W

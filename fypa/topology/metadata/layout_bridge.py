@@ -1003,6 +1003,8 @@ def orient_ports_toward_peers(
 ) -> None:
     """Face each non-GND port toward its connected peers' columns (in place).
 
+    SERIES/RESISTOR keep through-flow faces from
+    :func:`orient_series_ports_for_columns` / role defaults (opposite sides).
     Loop-SERIES children keep the dedicated all-on-one-face rule from
     :func:`_orient_loop_series_ports` and are skipped here. Same-column peers
     leave the existing side unchanged.
@@ -1018,6 +1020,10 @@ def orient_ports_toward_peers(
     for s in node_specs:
         nid = s["node_id"]
         if nid in loop_parent:
+            continue
+        # Through-elements stay left↔right; peer-facing same-side stacks are for
+        # SOURCE/SINK/REGULATOR hubs, not series passives.
+        if spec_has_series_role(s):
             continue
         self_col = col.get(nid, 0)
         rports = s.get("resolved_ports") or {}
