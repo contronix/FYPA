@@ -2,8 +2,9 @@
 
 Schematic coordinates are a **soft hint**: they refine within-column order and
 optional left/right ranking inside a sheet, but they do not allocate an exclusive
-column block per subsheet. Column structure prefers the graph ``assign_columns``
-backbone (sources left, sinks right); sheets share that shared column space.
+column block per subsheet. Graph column *ranks* supply left→right order, then
+ranks are compressed into at most ``SCHEMATIC_MAX_COLUMNS`` so sparse chains do
+not dominate the diagram width. SOURCE/SINK stay on the outer columns.
 """
 
 from __future__ import annotations
@@ -16,6 +17,10 @@ from fypa.topology.metadata_schema import NodeSpec, PortDef, TopologyMetadata
 
 # Fraction of directive nodes that must carry sch_x/sch_y before seeding.
 SCHEMATIC_SEED_COVERAGE = 0.5
+# Soft cap on column count in schematic mode. Graph assign_columns can open a
+# long sparse chain (one SERIES per column); schematic packing collapses that
+# into a readable shared width while keeping left→right flow order.
+SCHEMATIC_MAX_COLUMNS = 4
 
 
 @dataclass(frozen=True)
@@ -145,6 +150,28 @@ def _compact_columns(columns: dict[str, int]) -> dict[str, int]:
     return {nid: remap[c] for nid, c in columns.items()}
 
 
+def _compress_column_ranks(
+    columns: dict[str, int],
+    max_cols: int,
+) -> dict[str, int]:
+    """Bucket ordered column ranks into at most *max_cols* shared columns.
+
+    Preserves left-to-right order of the backbone ranks while eliminating the
+    sparse one-node-per-column chains that make large boards unreadably wide.
+    """
+    if max_cols < 1:
+        return _compact_columns(columns)
+    used = sorted(set(columns.values()))
+    if len(used) <= max_cols:
+        return _compact_columns(columns)
+    n = len(used)
+    remap = {
+        old: int(round(i / (n - 1) * (max_cols - 1)))
+        for i, old in enumerate(used)
+    }
+    return {nid: remap[c] for nid, c in columns.items()}
+
+
 def _apply_source_sink_columns(
     node_specs: list[NodeSpec],
     columns: dict[str, int],
@@ -175,16 +202,14 @@ def _apply_source_sink_columns(
 
 def _shared_width(
     max_local: int,
-    graph_columns: dict[str, int] | None,
     node_specs: list[NodeSpec],
 ) -> int:
-    """Column count for the shared sheet-packing space."""
-    gmax = max(graph_columns.values(), default=0) + 1 if graph_columns else 0
-    w = max(max_local, gmax, 1)
+    """Column count for the shared sheet-packing space (no-graph path)."""
+    w = max(max_local, 1)
     roles = {s["role"] for s in node_specs}
     if "SOURCE" in roles and "SINK" in roles:
         w = max(w, 2)
-    return w
+    return min(w, SCHEMATIC_MAX_COLUMNS)
 
 
 def _map_local_to_shared(local: int, n_local: int, width: int) -> int:
@@ -206,8 +231,9 @@ def schematic_seed_placement(
     Schematic placement is a soft hint:
 
     * Subsheets **share** one column space (no exclusive block per sheet).
-    * When ``graph_columns`` is provided it is the structural backbone; schematic
-      coordinates then only drive within-column order and port-side flips.
+    * When ``graph_columns`` is provided it supplies left→right *order*; ranks
+      are then compressed into at most :data:`SCHEMATIC_MAX_COLUMNS` so sparse
+      one-node graph columns do not dominate the width.
     * Without graph columns, sheet-local X ranks pack into a shared width.
     * SOURCE nodes prefer column 0; SINK nodes prefer the last column.
     * Within a column, order follows schematic Y (and sheet-symbol X as tie-break).
@@ -244,11 +270,10 @@ def schematic_seed_placement(
             local_col[nid] = x_map[float(spec["sch_x"])]
             local_count[nid] = n_local
 
-    width = _shared_width(max_local, graph_columns, node_specs)
+    width = _shared_width(max_local, node_specs)
 
-    # Backbone: graph columns when present (schematic must not explode width by
-    # appending per-sheet blocks). Without graph columns, pack every sheet into
-    # one shared 0..width-1 range from local X ranks.
+    # Backbone: graph column *ranks* when present (order only — width is capped
+    # below). Without graph columns, pack every sheet into one shared range.
     columns: dict[str, int] = {}
     if graph_columns:
         for spec in node_specs:
@@ -275,6 +300,7 @@ def schematic_seed_placement(
         for spec in missing:
             columns[spec["node_id"]] = right
 
+    columns = _compress_column_ranks(columns, SCHEMATIC_MAX_COLUMNS)
     columns = _apply_source_sink_columns(node_specs, columns)
 
     # Within-column order: schematic Y (Altium Y up), then sheet rank, then id.

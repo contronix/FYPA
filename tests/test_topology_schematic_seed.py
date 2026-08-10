@@ -142,6 +142,33 @@ def test_schematic_seed_multi_sheet_does_not_inflate_width():
     assert all(seed.columns[s["node_id"]] == max(seed.columns.values()) for s in specs if s["role"] == "SINK")
 
 
+def test_schematic_seed_compresses_sparse_graph_columns():
+    """Long graph column chains are bucketed into SCHEMATIC_MAX_COLUMNS."""
+    from fypa.topology.metadata.schematic_seed import SCHEMATIC_MAX_COLUMNS
+
+    specs = [
+        _spec("SRC", role="SOURCE", sch_x=0, sch_y=0, schdoc="a.SchDoc"),
+    ]
+    graph = {"SRC": 0}
+    for i in range(1, 12):
+        nid = f"R{i}"
+        specs.append(
+            _spec(nid, role="RESISTOR", sch_x=float(i * 10), sch_y=0, schdoc=f"s{i}.SchDoc"),
+        )
+        graph[nid] = i
+    specs.append(_spec("SNK", role="SINK", sch_x=200, sch_y=0, schdoc="z.SchDoc"))
+    graph["SNK"] = 12
+    seed = schematic_seed_placement(specs, graph_columns=graph)
+    assert seed is not None
+    assert max(seed.columns.values()) < 12
+    assert max(seed.columns.values()) <= SCHEMATIC_MAX_COLUMNS - 1
+    assert seed.columns["SRC"] == 0
+    assert seed.columns["SNK"] == max(seed.columns.values())
+    # No empty column holes after compaction.
+    used = set(seed.columns.values())
+    assert used == set(range(max(used) + 1))
+
+
 def test_build_model_toggle_off_ignores_sch_coords():
     meta = {
         "directives": [
