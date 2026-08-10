@@ -103,14 +103,23 @@ def _column_roles(
 def _merge_adjacent_passive_columns(
     node_specs: list[NodeSpec],
     col: dict[str, int],
+    loop_parent: dict[str, str] | None = None,
 ) -> dict[str, int]:
     """Merge consecutive columns that contain only SERIES/RESISTOR nodes.
 
     Hop-depth assignment often isolates each fuse/ferrite in its own column;
     sharing those columns keeps the diagram dense without SchDoc hints.
+    Loop parent/child SERIES stay in separate columns.
     """
     out = dict(col)
     passive = {"SERIES", "RESISTOR"}
+    loop_ids: set[str] = set()
+    if loop_parent:
+        loop_ids = set(loop_parent) | set(loop_parent.values())
+
+    def _col_has_loop(c: int) -> bool:
+        return any(nid in loop_ids for nid, cc in out.items() if cc == c)
+
     while True:
         roles = _column_roles(node_specs, out)
         used = sorted(roles)
@@ -120,6 +129,8 @@ def _merge_adjacent_passive_columns(
             if not roles[left] or not roles[right]:
                 continue
             if roles[left] <= passive and roles[right] <= passive:
+                if _col_has_loop(left) or _col_has_loop(right):
+                    continue
                 for nid, c in list(out.items()):
                     if c == right:
                         out[nid] = left
@@ -859,6 +870,10 @@ def assign_columns(
                 col[s["node_id"]] = sink_col
 
     col = compress_column_ranks(col, GRAPH_LAYOUT_MAX_COLUMNS)
+    # Pin SOURCE/SINK before passive merges so a mid-chain SOURCE rank cannot
+    # sit between two RESISTOR columns and block packing (power_board).
+    col = _pin_source_sink_columns(node_specs, col, mixed_role_ids)
+    col = _merge_adjacent_passive_columns(node_specs, col, loop_parent)
     col = _pin_source_sink_columns(node_specs, col, mixed_role_ids)
 
     # Orient each SERIES/RESISTOR so the terminal carrying the downstream loads

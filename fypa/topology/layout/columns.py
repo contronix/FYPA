@@ -87,31 +87,54 @@ def _required_gaps(
     *,
     gnd_bus_y: float | None = None,
 ) -> list[float]:
-    """Per-gap widths: each gap only widens for gutters whose span crosses it."""
+    """Per-gap widths: each gap only widens for gutters whose span crosses it.
+
+    Bus *span* width (``x_max - x_min``) is applied only when those buses sit in
+    a **single** column gap. Multi-column port spans (e.g. SOURCE→far SINK) often
+    collect buses in different corridors; treating their global min/max as every
+    intervening gap's width previously exploded the canvas (empty-looking gutters).
+    """
     del gnd_bus_y
     gaps = [base_gap] * max_col
     spans = gutter_bus_span_from_plan(bus_plan, all_ports)
+    planned_xs: list[float] = []
+    for xs in bus_plan.gutter_spans.values():
+        planned_xs.extend(xs)
+    planned_xs.extend(bus_plan.hub_buses.values())
+    planned_xs.extend(bus_plan.pair_buses.values())
+    planned_xs.extend(bus_plan.stack_buses.values())
+
     for (x_lo, x_hi), nets_in_gutter in gutter_groups(all_ports).items():
         n_channels = _gutter_channel_count(nets_in_gutter, all_ports)
-        req = base_gap
-        if n_channels > 1:
-            req = max(req, _col_gap_for_gutter_slots(n_channels))
-        measured = spans.get((x_lo, x_hi))
-        if measured is not None:
-            x_min, x_max, n_buses = measured
-            if n_buses > 1:
-                req = max(
-                    req,
-                    _col_gap_for_bus_span(x_min, x_max),
-                    _col_gap_for_gutter_slots(n_buses),
-                )
-        if req <= base_gap + WIRE_EPS:
+        overlapped = [
+            g
+            for g in range(max_col)
+            if x_hi > col_x[g] + NODE_W + WIRE_EPS and x_lo < col_x[g + 1] - WIRE_EPS
+        ]
+        if not overlapped:
             continue
-        for g in range(max_col):
-            gap_lo = col_x[g] + NODE_W
-            gap_hi = col_x[g + 1]
-            if x_hi > gap_lo + WIRE_EPS and x_lo < gap_hi - WIRE_EPS:
-                gaps[g] = max(gaps[g], req)
+
+        slot_req = base_gap
+        if n_channels > 1:
+            slot_req = max(slot_req, _col_gap_for_gutter_slots(n_channels))
+        measured = spans.get((x_lo, x_hi))
+        if measured is not None and measured[2] > 1:
+            slot_req = max(slot_req, _col_gap_for_gutter_slots(measured[2]))
+
+        if len(overlapped) == 1 and measured is not None and measured[2] > 1:
+            x_min, x_max, _n_buses = measured
+            slot_req = max(slot_req, _col_gap_for_bus_span(x_min, x_max))
+
+        for g in overlapped:
+            gaps[g] = max(gaps[g], slot_req)
+
+    # Local parallel buses inside one corridor still need their measured span.
+    for g in range(max_col):
+        gap_lo = col_x[g] + NODE_W
+        gap_hi = col_x[g + 1]
+        local = [x for x in planned_xs if gap_lo - WIRE_EPS <= x <= gap_hi + WIRE_EPS]
+        if len(local) > 1:
+            gaps[g] = max(gaps[g], _col_gap_for_bus_span(min(local), max(local)))
     return gaps
 
 

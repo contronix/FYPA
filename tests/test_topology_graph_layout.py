@@ -126,3 +126,32 @@ def test_orient_ports_toward_peers_faces_neighbor_column():
     orient_ports_toward_peers([left, right], cols, {})
     assert left["port_defs"][0][1] == "right"
     assert right["port_defs"][0][1] == "left"
+
+
+def test_multi_column_gutter_does_not_inflate_every_gap():
+    """Buses on a long SOURCE→SINK span must not widen every intervening gap."""
+    from fypa.topology.constants import COL_GAP, NODE_W
+    from fypa.topology.layout.columns import _required_gaps
+    from fypa.topology.placement.plan_types import BusPlan
+    from fypa.topology.types import TopologyPort
+
+    # Three column gaps; ports span col0→col3 like a long rail.
+    col_x = [36.0, 36.0 + NODE_W + COL_GAP, 36.0 + 2 * (NODE_W + COL_GAP),
+             36.0 + 3 * (NODE_W + COL_GAP)]
+    ports = [
+        TopologyPort(terminal="P", net="VIN", label="VIN", side="right",
+                     x=col_x[0] + NODE_W, y=50.0, node_id="SRC"),
+        TopologyPort(terminal="P", net="VIN", label="VIN", side="left",
+                     x=col_x[3], y=50.0, node_id="SNK"),
+        TopologyPort(terminal="P", net="VOUT", label="VOUT", side="right",
+                     x=col_x[0] + NODE_W, y=80.0, node_id="SRC"),
+        TopologyPort(terminal="P", net="VOUT", label="VOUT", side="left",
+                     x=col_x[3], y=80.0, node_id="SNK"),
+    ]
+    plan = BusPlan()
+    # Two buses parked in different corridors (not one fat shared gutter).
+    plan.pair_buses["VIN"] = col_x[0] + NODE_W + COL_GAP / 2
+    plan.pair_buses["VOUT"] = col_x[2] + NODE_W + COL_GAP / 2
+    gaps = _required_gaps(ports, col_x, 3, COL_GAP, plan)
+    # Previously each gap became ~full board width; keep them near COL_GAP.
+    assert max(gaps) < NODE_W + 2 * COL_GAP
