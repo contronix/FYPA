@@ -195,6 +195,19 @@ def _apply_source_sink_columns(
         sink_col += 1
     for nid in pin_ids:
         out[nid] = sink_col
+    if has_source:
+        for s in node_specs:
+            nid = s["node_id"]
+            if nid not in exempt or s["role"] == "SOURCE":
+                continue
+            if out.get(nid, 0) == 0:
+                out[nid] = 1
+    if pin_ids and exempt:
+        exempt_max = max((out[nid] for nid in exempt if nid in out), default=-1)
+        if exempt_max >= 0:
+            for nid in pin_ids:
+                if out.get(nid, 0) <= exempt_max:
+                    out[nid] = exempt_max + 1
     return _compact_columns(out)
 
 

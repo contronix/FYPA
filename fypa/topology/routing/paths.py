@@ -144,15 +144,35 @@ def _hub_detour_via_clear_stub(
                 f"V {y_clear:.1f} H {bus_x:.1f}"
             )
         else:
-            # Prefer a micro stub over climbing on the symbol face.
+            # Prefer a micro stub over climbing on the symbol face. Walk further
+            # outward when the micro column itself is blocked by a body.
             micro = outward_escape_stub_x(port)
-            ctx.reserve_horizontal(y, min(port.x, micro), max(port.x, micro), net)
-            ctx.reserve_vertical(micro, min(y, y_clear), max(y, y_clear), net)
+            climb = micro
+            if not trunk_vertical_clear(
+                micro, min(y, y_clear), max(y, y_clear), obstacles, {port.node_id},
+            ) or _foreign_vertical_blocks_column(
+                ctx, micro, min(y, y_clear), max(y, y_clear), net,
+            ):
+                outward = -1.0 if port.side == "left" else 1.0
+                step_px = MIN_PARALLEL_GAP / 2.0
+                for step in range(1, 32):
+                    x = round(micro + outward * step_px * step, 1)
+                    y_lo, y_hi = min(y, y_clear), max(y, y_clear)
+                    if _foreign_vertical_blocks_column(ctx, x, y_lo, y_hi, net):
+                        continue
+                    if not trunk_vertical_clear(
+                        x, y_lo, y_hi, obstacles, {port.node_id},
+                    ):
+                        continue
+                    climb = x
+                    break
+            ctx.reserve_horizontal(y, min(port.x, climb), max(port.x, climb), net)
+            ctx.reserve_vertical(climb, min(y, y_clear), max(y, y_clear), net)
             ctx.reserve_horizontal(
-                y_clear, min(micro, bus_x), max(micro, bus_x), net,
+                y_clear, min(climb, bus_x), max(climb, bus_x), net,
             )
             path = (
-                f"M {port.x:.1f},{y:.1f} H {micro:.1f} "
+                f"M {port.x:.1f},{y:.1f} H {climb:.1f} "
                 f"V {y_clear:.1f} H {bus_x:.1f}"
             )
         return simplify_wire_path(path), y_clear
@@ -787,19 +807,30 @@ def hub_tap_path(
                 climb = x
                 break
             if climb is None:
-                # Keep connectivity off the face even when corridors conflict.
-                climb = micro
-        if abs(climb - port.x) > WIRE_EPS:
-            ctx.reserve_horizontal(y, min(port.x, climb), max(port.x, climb), net)
+                # Ignore foreign H but still require an obstacle-clear gutter
+                # column; never fall back onto the symbol face.
+                outward = -1.0 if port.side == "left" else 1.0
+                step_px = MIN_PARALLEL_GAP / 2.0
+                for step in range(0, 32):
+                    x = round(outward_escape_stub_x(port) + outward * step_px * step, 1)
+                    y_lo, y_hi = min(y, y_clear), max(y, y_clear)
+                    if _foreign_vertical_blocks_column(ctx, x, y_lo, y_hi, net):
+                        continue
+                    if not trunk_vertical_clear(
+                        x, y_lo, y_hi, obstacles, {port.node_id},
+                    ):
+                        continue
+                    climb = x
+                    break
+                if climb is None:
+                    climb = micro
+        ctx.reserve_horizontal(y, min(port.x, climb), max(port.x, climb), net)
         ctx.reserve_vertical(climb, min(y, y_clear), max(y, y_clear), net)
         ctx.reserve_horizontal(y_clear, min(climb, bus_x), max(climb, bus_x), net)
-        if abs(climb - port.x) > WIRE_EPS:
-            path = (
-                f"M {port.x:.1f},{y:.1f} H {climb:.1f} "
-                f"V {y_clear:.1f} H {bus_x:.1f}"
-            )
-        else:
-            path = f"M {port.x:.1f},{y:.1f} V {y_clear:.1f} H {bus_x:.1f}"
+        path = (
+            f"M {port.x:.1f},{y:.1f} H {climb:.1f} "
+            f"V {y_clear:.1f} H {bus_x:.1f}"
+        )
         return simplify_wire_path(path), y_clear
     if foreign_vertical_covers_y(ctx, attach, y, net):
         escape = clear_outward_stub_x(
