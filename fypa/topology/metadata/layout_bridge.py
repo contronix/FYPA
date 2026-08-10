@@ -326,17 +326,39 @@ def _apply_passive_column_col(
 def _dedupe_port_rows_on_same_side(
     port_defs: list[tuple[str, str, int]],
 ) -> list[tuple[str, str, int]]:
-    """Give each port on a symbol edge its own layout row (no overlapping circles)."""
+    """Give each port on a symbol edge its own layout row (no overlapping circles).
+
+    Channel ports on a side become contiguous ``0..n-1``. Return/GND ports keep
+    keys in the ``RETURN_PORT_SORT_BASE`` band so ``port_layout_rows`` still
+    stacks them below the channel block.
+    """
     by_side: dict[str, list[tuple[str, str, int]]] = defaultdict(list)
     for item in port_defs:
         by_side[item[1]].append(item)
     out: list[tuple[str, str, int]] = []
     for side in ("left", "right"):
-        for row_i, (pname, s, _sk) in enumerate(
-            sorted(by_side.get(side, []), key=lambda t: (t[2], t[0]))
-        ):
+        items = sorted(by_side.get(side, []), key=lambda t: (t[2], t[0]))
+        channel = [t for t in items if not is_return_port_row(t[2])]
+        returns = [t for t in items if is_return_port_row(t[2])]
+        for row_i, (pname, s, _sk) in enumerate(channel):
             out.append((pname, s, row_i))
+        for ret_i, (pname, s, _sk) in enumerate(returns):
+            out.append((pname, s, RETURN_PORT_SORT_BASE + ret_i))
+    for side, items in by_side.items():
+        if side in ("left", "right"):
+            continue
+        out.extend(items)
     return out
+
+
+def ensure_unique_port_rows(node_specs: list[NodeSpec]) -> None:
+    """Hard invariant: no two ports share ``(side, sort_key)`` on one symbol."""
+    for s in node_specs:
+        s["port_defs"] = _dedupe_port_rows_on_same_side(s["port_defs"])
+        for sec in s.get("sections") or []:
+            defs = sec.get("port_defs")
+            if defs:
+                sec["port_defs"] = _dedupe_port_rows_on_same_side(defs)
 
 
 def _child_facing_net_rows(spec: NodeSpec, face_side: str) -> dict[str, int]:
@@ -888,6 +910,7 @@ def assign_columns(
     orient_ports_toward_peers(
         node_specs, col, net_to_rail, loop_parent=loop_parent,
     )
+    ensure_unique_port_rows(node_specs)
 
     return _compact_columns(col)
 
@@ -1117,6 +1140,7 @@ __all__ = [
     "ResolvedPort",
     "assign_columns",
     "compress_column_ranks",
+    "ensure_unique_port_rows",
     "is_return_port_row",
     "jump_row_for_directive",
     "orient_ports_toward_peers",

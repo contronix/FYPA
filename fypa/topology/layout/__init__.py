@@ -10,6 +10,7 @@ from fypa.topology.layout.stubs import assign_edge_wire_columns, assign_stacked_
 from fypa.topology.layout.vertical_align import _spec_layout_height
 from fypa.topology.layout_result import LayoutResult
 from fypa.topology.metadata.layout_bridge import (
+    ensure_unique_port_rows,
     orient_ports_toward_peers,
     orient_series_ports_for_columns,
     parse_topology_directives,
@@ -109,6 +110,7 @@ def build_node_layout(
                             list(sec.get("port_defs") or []),
                         )
             orient_ports_toward_peers(node_specs, columns, parsed.net_to_rail)
+            ensure_unique_port_rows(node_specs)
             heights = {s["node_id"]: _spec_layout_height(s) for s in node_specs}
             y_override = y_assign_from_orders(
                 node_specs,

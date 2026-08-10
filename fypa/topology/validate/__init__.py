@@ -18,6 +18,7 @@ from fypa.topology.validate.segments import (
     check_wires_through_foreign_nodes,
 )
 from fypa.topology.validate.hub import check_hub_net_disconnected
+from fypa.topology.validate.ports import check_overlapping_ports
 from fypa.topology.validate.stubs import check_open_stub_ends
 from fypa.topology.validate.util import vertical_segment_overlaps_node_body
 from fypa.topology.validate.wires import check_dangling_wire_endpoints
@@ -26,6 +27,7 @@ __all__ = [
     "check_conditional_gnd_names",
     "check_dangling_wire_endpoints",
     "check_open_stub_ends",
+    "check_overlapping_ports",
     "check_segment_spacing",
     "merge_validation_issues",
     "validate_topology",
@@ -46,6 +48,7 @@ def validate_topology(
     issues: list[dict] = []
     directive_nodes = [n for n in model.nodes if n.role != "GND"]
 
+    issues.extend(check_overlapping_ports(model))
     issues.extend(check_wires_through_foreign_nodes(model))
     issues.extend(check_parallel_vertical_gap(model))
     issues.extend(check_vertical_bus_column_gaps(model))

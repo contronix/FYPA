@@ -61,10 +61,10 @@
 <rect x="36" y="154" width="128" height="6" fill="#ff3030"/>
 <text x="44" y="153" fill="#ffffff" font-family="Segoe UI,sans-serif" font-size="10" font-weight="600">SOURCE</text>
 <text x="156" y="153" fill="#ffffff" text-anchor="end" font-family="Segoe UI,sans-serif" font-size="10" font-weight="600">J1</text>
-<circle cx="164" cy="177" r="5" fill="#ff3030" stroke="#555555" stroke-width="1"/>
-<text x="156" y="180" text-anchor="end" fill="#909090" font-family="Consolas,monospace" font-size="8">VDD_3V3_PWR</text>
 <circle cx="36" cy="177" r="5" fill="#ff3030" stroke="#555555" stroke-width="1"/>
 <text x="44" y="180" text-anchor="start" fill="#909090" font-family="Consolas,monospace" font-size="8">GND</text>
+<circle cx="164" cy="177" r="5" fill="#ff3030" stroke="#555555" stroke-width="1"/>
+<text x="156" y="180" text-anchor="end" fill="#909090" font-family="Consolas,monospace" font-size="8">VDD_3V3_PWR</text>
 <rect class="topo-hit" data-label="D1" x="264" y="138" width="128" height="92" rx="6" fill="#333333" stroke="#555555" stroke-width="1"/>
 <rect x="264" y="138" width="128" height="22" rx="6" fill="#1a7a3c"/>
 <rect x="264" y="154" width="128" height="6" fill="#1a7a3c"/>

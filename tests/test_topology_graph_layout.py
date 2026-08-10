@@ -128,6 +128,49 @@ def test_orient_ports_toward_peers_faces_neighbor_column():
     assert right["port_defs"][0][1] == "left"
 
 
+def test_same_side_ports_get_distinct_rows_after_peer_orient():
+    """Peer-facing must not stack two ports on the same edge at one Y."""
+    from fypa.topology.metadata.layout_bridge import (
+        ResolvedPort,
+        ensure_unique_port_rows,
+        orient_ports_toward_peers,
+    )
+
+    src = _spec(
+        "SRC",
+        role="SOURCE",
+        ports=[("P", "right", 0), ("N", "right", 0)],  # collide on purpose
+        terms={
+            "P": {"requested_net": "VIN", "pins": [{"net": "VIN", "pad": "1"}]},
+            "N": {"requested_net": "VRET", "pins": [{"net": "VRET", "pad": "2"}]},
+        },
+    )
+    snk_a = _spec(
+        "A",
+        role="SINK",
+        ports=[("P", "left", 0)],
+        terms={"P": {"requested_net": "VIN", "pins": [{"net": "VIN", "pad": "1"}]}},
+    )
+    snk_b = _spec(
+        "B",
+        role="SINK",
+        ports=[("P", "left", 0)],
+        terms={"P": {"requested_net": "VRET", "pins": [{"net": "VRET", "pad": "1"}]}},
+    )
+    src["resolved_ports"] = {
+        "P": ResolvedPort(wnet="VIN", plabel="VIN", tooltip=""),
+        "N": ResolvedPort(wnet="VRET", plabel="VRET", tooltip=""),
+    }
+    snk_a["resolved_ports"] = {"P": ResolvedPort(wnet="VIN", plabel="VIN", tooltip="")}
+    snk_b["resolved_ports"] = {"P": ResolvedPort(wnet="VRET", plabel="VRET", tooltip="")}
+    cols = {"SRC": 0, "A": 1, "B": 1}
+    orient_ports_toward_peers([src, snk_a, snk_b], cols, {})
+    ensure_unique_port_rows([src, snk_a, snk_b])
+    right = [(p, sk) for p, side, sk in src["port_defs"] if side == "right"]
+    assert len(right) == 2
+    assert right[0][1] != right[1][1]
+
+
 def test_multi_column_gutter_does_not_inflate_every_gap():
     """Buses on a long SOURCE→SINK span must not widen every intervening gap."""
     from fypa.topology.constants import COL_GAP, NODE_W
