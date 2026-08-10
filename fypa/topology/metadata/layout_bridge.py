@@ -195,6 +195,15 @@ def _pin_source_sink_columns(
         sink_col = 1
     for nid in pin_ids:
         out[nid] = sink_col
+    # Multi-section / mixed non-SOURCE nodes keep graph rank, but must not sit
+    # in the SOURCE column when a SOURCE is present.
+    if has_source:
+        for s in node_specs:
+            nid = s["node_id"]
+            if nid not in exempt or s["role"] == "SOURCE":
+                continue
+            if out.get(nid, 0) == 0:
+                out[nid] = 1
     return _compact_columns(out)
 
 
@@ -436,7 +445,7 @@ def _ensure_loads_right_of_series_drivers(
     ``stack_column`` buses); only regulators need a free left approach so their
     IN port is not fed from a bus to the right of the body.
     """
-    role_by_id = {s["node_id"]: s["role"] for s in node_specs}
+    role_by_id = {s["node_id"]: s for s in node_specs}
     changed = True
     guard = 0
     while changed and guard < len(node_specs) * 2 + 5:
@@ -458,11 +467,27 @@ def _ensure_loads_right_of_series_drivers(
                 for lid in inputs_by_net.get(flow_net, []):
                     if lid == nid or loop_parent.get(lid) == nid:
                         continue
-                    if role_by_id.get(lid) != "REGULATOR":
+                    load = role_by_id.get(lid)
+                    if load is None or not spec_has_role(load, ("REGULATOR",)):
                         continue
                     if col.get(lid, 0) <= dcol:
                         col[lid] = dcol + 1
                         changed = True
+
+
+def _restore_column_invariants(
+    node_specs: list[NodeSpec],
+    col: dict[str, int],
+    mixed_role_ids: set[str],
+    inputs_by_net: dict[str, list[str]],
+    loop_parent: dict[str, str],
+) -> dict[str, int]:
+    """Family-align, then restore regulator/sink invariants that align can undo."""
+    _align_dotted_family_columns(node_specs, col)
+    _ensure_loads_right_of_series_drivers(
+        node_specs, col, inputs_by_net, loop_parent,
+    )
+    return _pin_source_sink_columns(node_specs, col, mixed_role_ids)
 
 
 def _dedupe_port_rows_on_same_side(
@@ -1035,21 +1060,11 @@ def assign_columns(
     _ensure_passives_right_of_upstream(
         node_specs, col, outputs_by_net, loop_parent,
     )
-    # REGULATOR/SINK loads on a SERIES N-output must sit right of the bridge
-    # (same invariant as SERIES→SERIES, but for non-through loads).
-    _ensure_loads_right_of_series_drivers(
-        node_specs, col, inputs_by_net, loop_parent,
+    # REGULATOR loads on a SERIES N-output must sit right of the bridge.
+    # Family align can pull a dotted regulator left again — restore after align.
+    col = _restore_column_invariants(
+        node_specs, col, mixed_role_ids, inputs_by_net, loop_parent,
     )
-    # Dotted channel symbols share one column so a deep channel is not parked
-    # in the sink column beside its loads.
-    _align_dotted_family_columns(node_specs, col)
-    col = _compact_columns(col)
-    col = _pin_source_sink_columns(node_specs, col, mixed_role_ids)
-    _ensure_loads_right_of_series_drivers(
-        node_specs, col, inputs_by_net, loop_parent,
-    )
-    _align_dotted_family_columns(node_specs, col)
-    col = _compact_columns(col)
 
     # Orient each SERIES/RESISTOR so the terminal carrying the downstream loads
     # faces right. Peers are keyed by *resolved physical net* (not the canonical

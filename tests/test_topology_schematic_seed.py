@@ -126,6 +126,37 @@ def test_schematic_seed_sources_first_sinks_last():
     assert seed.columns["SNK"] > seed.columns["SRC"]
 
 
+def test_schematic_seed_multi_section_sink_not_forced_last():
+    """Stacked SINK channels keep graph rank; leaf sinks still take the edge."""
+    src = _spec("SRC", role="SOURCE", sch_x=10, sch_y=50, schdoc="a.SchDoc")
+    composite = _spec("U2", role="SINK", sch_x=200, sch_y=50, schdoc="b.SchDoc")
+    composite["sections"] = [
+        {
+            "role": "SINK",
+            "port_defs": [("P1", "left", 0)],
+            "terms": {},
+            "port_directives": {},
+            "directives": [{"role": "SINK", "designator": "U2", "channel_index": 1}],
+        },
+        {
+            "role": "SINK",
+            "port_defs": [("P2", "left", 0)],
+            "terms": {},
+            "port_directives": {},
+            "directives": [{"role": "SINK", "designator": "U2", "channel_index": 2}],
+        },
+    ]
+    leaf = _spec("U3", role="SINK", sch_x=400, sch_y=50, schdoc="c.SchDoc")
+    seed = schematic_seed_placement(
+        [src, composite, leaf],
+        graph_columns={"SRC": 0, "U2": 1, "U3": 1},
+    )
+    assert seed is not None
+    assert seed.columns["SRC"] == 0
+    assert seed.columns["U2"] < seed.columns["U3"]
+    assert seed.columns["U3"] == max(seed.columns.values())
+
+
 def test_schematic_seed_multi_sheet_does_not_inflate_width():
     """Many single-node sheets must not each claim a new column."""
     specs = [
