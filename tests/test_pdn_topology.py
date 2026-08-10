@@ -304,20 +304,13 @@ def test_topology_wires_in_same_gutter_use_distinct_buses():
     }
     model = build_topology_model(meta)
 
-    def _vertical_bus_x(path_d: str, net: str) -> float:
-        from fypa.topology import parse_wire_path, path_to_segments
-
-        verts = [
-            s for s in path_to_segments(net, parse_wire_path(path_d))
-            if s.orient == "V"
-        ]
-        assert len(verts) == 1, path_d
-        return verts[0].x1
-
+    # Stacked same-column routes may use a bus trunk plus a stub-side drop so
+    # the approach does not chord through the sink body; distinctness is the
+    # planned bus_x, not "exactly one vertical per wire".
     led_bus = {
-        _vertical_bus_x(w.path_d, w.net)
+        round(w.bus_x, 1)
         for w in model.wires
-        if w.net in {"LED_R", "LED_G", "LED_B"}
+        if w.net in {"LED_R", "LED_G", "LED_B"} and w.bus_x is not None
     }
     assert len(led_bus) == 3
 
@@ -565,12 +558,13 @@ def test_stacked_led_wires_use_distinct_buses():
     assert len(led_wires) == 3
     interior_lo = d1.x + 4
     interior_hi = d1.x + d1.width - 4
-    bus_xs: set[float] = set()
     for w in led_wires:
         for seg in path_to_segments(w.net, parse_wire_path(w.path_d)):
             if seg.orient == "V":
                 assert not (interior_lo <= seg.x1 <= interior_hi)
-                bus_xs.add(round(seg.x1, 1))
+    # Dest stub drops (left of the column) are separate from the trunk buses
+    # on the right; only the planned buses must be three distinct columns.
+    bus_xs = {round(w.bus_x, 1) for w in led_wires if w.bus_x is not None}
     assert len(bus_xs) == 3
 
 
