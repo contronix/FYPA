@@ -2,11 +2,25 @@
 
 from __future__ import annotations
 
-from fypa.topology.constants import GND_BUS_BELOW, MARGIN
+from copy import deepcopy
+
+from fypa.topology.constants import GND_BUS_BELOW, MARGIN, ROW_GAP
 from fypa.topology.layout.columns import place_nodes, refine_place_nodes_for_gnd
 from fypa.topology.layout.stubs import assign_edge_wire_columns, assign_stacked_stub_lengths
+from fypa.topology.layout.vertical_align import _spec_layout_height
 from fypa.topology.layout_result import LayoutResult
-from fypa.topology.metadata.layout_bridge import parse_topology_directives, specs_by_column
+from fypa.topology.metadata.layout_bridge import (
+    orient_series_ports_for_columns,
+    parse_topology_directives,
+    specs_by_column,
+)
+from fypa.topology.metadata.schematic_seed import (
+    flip_port_defs,
+    schematic_seed_placement,
+    should_flip_lr,
+    y_assign_from_orders,
+)
+from fypa.topology.metadata.specs import spec_has_series_role
 from fypa.topology.metadata_schema import TopologyMetadata
 from fypa.topology.placement import BusPlan
 
@@ -21,8 +35,16 @@ __all__ = [
 
 def build_node_layout(
     metadata: TopologyMetadata | None,
+    *,
+    use_schematic_layout: bool = True,
 ) -> LayoutResult:
-    """Parse metadata and place nodes; returns layout state for wire routing."""
+    """Parse metadata and place nodes; returns layout state for wire routing.
+
+    When *use_schematic_layout* is true and enough directives carry schematic
+    ``sch_x``/``sch_y``, column/order (and orientation-based port flips) are
+    seeded from the Altium sheet placement. Otherwise graph ``assign_columns``
+    is used unchanged.
+    """
     empty = LayoutResult(
         nodes=[],
         ports=[],
@@ -40,11 +62,78 @@ def build_node_layout(
         return empty
 
     parsed = parse_topology_directives(metadata)
-    by_col, max_col = specs_by_column(parsed.node_specs, parsed.columns)
+    node_specs = parsed.node_specs
+    columns = parsed.columns
+    y_override: dict[str, float] | None = None
+    seed = None
+
+    if use_schematic_layout:
+        seed = schematic_seed_placement(
+            node_specs,
+            metadata=metadata,
+            graph_columns=parsed.columns,
+        )
+        if seed is not None:
+            columns = seed.columns
+            node_specs = deepcopy(node_specs)
+            if seed.port_defs:
+                for spec in node_specs:
+                    nid = spec["node_id"]
+                    if nid in seed.port_defs:
+                        spec["port_defs"] = seed.port_defs[nid]
+                        for sec in spec.get("sections") or []:
+                            if sec.get("role") in ("SERIES", "RESISTOR"):
+                                continue
+                            sec["port_defs"] = flip_port_defs(
+                                list(sec.get("port_defs") or []),
+                            )
+            # Re-orient SERIES/RESISTOR faces for the seeded column map.
+            orient_series_ports_for_columns(
+                node_specs, columns, parsed.net_to_rail,
+            )
+            # Schematic mirror/rotation for SERIES after column-flow orient so
+            # we do not flip graph-oriented faces twice, and composites get
+            # their SERIES sections mirrored too.
+            for spec in node_specs:
+                if not spec_has_series_role(spec):
+                    continue
+                if "sch_x" not in spec:
+                    continue
+                if not should_flip_lr(
+                    int(spec.get("sch_orientation_deg") or 0),
+                    bool(spec.get("sch_mirrored") or False),
+                ):
+                    continue
+                spec["port_defs"] = flip_port_defs(list(spec["port_defs"]))
+                for sec in spec.get("sections") or []:
+                    if sec.get("role") in ("SERIES", "RESISTOR"):
+                        sec["port_defs"] = flip_port_defs(
+                            list(sec.get("port_defs") or []),
+                        )
+            heights = {s["node_id"]: _spec_layout_height(s) for s in node_specs}
+            y_override = y_assign_from_orders(
+                node_specs,
+                columns,
+                seed.orders,
+                heights,
+                margin=MARGIN,
+                row_gap=ROW_GAP,
+            )
+
+    by_col, max_col = specs_by_column(node_specs, columns)
+    # Keep within-column list order consistent with schematic orders when seeded.
+    if seed is not None:
+        for col, specs in list(by_col.items()):
+            by_col[col] = sorted(
+                specs,
+                key=lambda s: (seed.orders.get(s["node_id"], 0), s["node_id"]),
+            )
+
     nodes, all_ports, content_right, bus_plan, gaps = place_nodes(
-        parsed.node_specs,
+        node_specs,
         by_col=by_col,
         max_col=max_col,
+        y_assign=y_override,
     )
 
     directive_nodes = [n for n in nodes if n.role != "GND"]
@@ -53,11 +142,12 @@ def build_node_layout(
 
     if parsed.needs_gnd and gnd_bus_y is not None:
         nodes, all_ports, content_right, bus_plan, gaps = refine_place_nodes_for_gnd(
-            parsed.node_specs,
+            node_specs,
             by_col=by_col,
             max_col=max_col,
             gaps=gaps,
             gnd_bus_y=gnd_bus_y,
+            y_assign=y_override,
         )
         directive_nodes = [n for n in nodes if n.role != "GND"]
         directive_bottom = max((n.y + n.height for n in directive_nodes), default=MARGIN)
@@ -71,7 +161,7 @@ def build_node_layout(
         needs_gnd=parsed.needs_gnd,
         gnd_bus_y=gnd_bus_y,
         directive_nodes=directive_nodes,
-        node_specs=parsed.node_specs,
+        node_specs=node_specs,
         net_to_rail=parsed.net_to_rail,
         driven_nets=parsed.driven_nets,
         bus_plan=bus_plan,

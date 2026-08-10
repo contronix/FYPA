@@ -18,12 +18,22 @@ from fypa.topology.routing import build_wires
 from fypa.topology.types import TopologyModel
 
 
-def build_topology_model(metadata: TopologyMetadata | None) -> TopologyModel:
-    """Build a Flow diagram layout model for the PDN simulation schematic."""
+def build_topology_model(
+    metadata: TopologyMetadata | None,
+    *,
+    use_schematic_layout: bool = True,
+) -> TopologyModel:
+    """Build a Flow diagram layout model for the PDN simulation schematic.
+
+    *use_schematic_layout* seeds column/order from Altium SchDoc placement when
+    coverage is sufficient (see ``schematic_seed_placement``).
+    """
     if metadata is None:
         return TopologyModel()
 
-    layout = build_node_layout(metadata)
+    layout = build_node_layout(
+        metadata, use_schematic_layout=use_schematic_layout,
+    )
 
     wires, gnd_symbol_x = build_wires(
         layout.ports,

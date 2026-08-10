@@ -401,6 +401,14 @@ class RawSchComponent:
     schdoc_name: str          # filename only, e.g. 'Power.SchDoc'
     parameters: dict[str, str]  # name -> text (case-preserved keys)
     pin_designators: tuple[str, ...]
+    # Schematic placement (Altium SchDoc units). Used as a topology layout
+    # template; only relative ranking matters, not absolute scale.
+    x: float = 0.0
+    y: float = 0.0
+    orientation_deg: int = 0  # 0 / 90 / 180 / 270
+    is_mirrored: bool = False
+    # True when Location.X/Y were present on the COMPONENT record.
+    has_location: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,6 +429,9 @@ class ExtractedProject:
     # Compiled schematic netlist (multi-sheet aware). Used to translate local
     # sheet net names in PDN_*_NET parameters to per-instance PCB connectivity.
     compiled_netlist: Any | None = None
+    # Sheet-symbol placements: (child SchDoc filename, parent-sheet X). Used to
+    # order multi-sheet topology column blocks left-to-right.
+    sch_sheet_placements: tuple[tuple[str, float], ...] = ()
     # User-defined Altium origin (Board6/ORIGINX,ORIGINY), in mm. Every
     # Pt2D produced above has already had this subtracted, so coordinates
     # match what Altium displays when the user has set a custom origin.
@@ -1305,6 +1316,37 @@ def _splice_plane_layers(
     return rebuilt
 
 
+def _sch_orientation_deg(comp) -> int:
+    """Map Altium ``Rotation90`` (quarter-turn index 0–3) to 0/90/180/270."""
+    orient = getattr(comp, "orientation", 0)
+    raw = int(getattr(orient, "value", orient) or 0)
+    # Enum values are quarter turns; already-degree values stay as-is.
+    if raw in (0, 1, 2, 3):
+        return raw * 90
+    return raw % 360
+
+
+def _sch_location_xy(comp) -> tuple[float, float, bool]:
+    """Return ``(x, y, has_location)`` from a schematic component.
+
+    ``has_location`` is true only when both Location.X and Location.Y were
+    present on the record, so callers do not seed layout from defaults.
+    """
+    loc = getattr(comp, "location", None)
+    if loc is None:
+        return 0.0, 0.0, False
+    has_x = bool(getattr(comp, "_has_location_x", False))
+    has_y = bool(getattr(comp, "_has_location_y", False))
+    if not (has_x and has_y):
+        return 0.0, 0.0, False
+    try:
+        x = float(getattr(loc, "x", 0) or 0)
+        y = float(getattr(loc, "y", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0, 0.0, False
+    return x, y, True
+
+
 def _extract_sch_component(comp, schdoc_name: str) -> RawSchComponent | None:
     """Extract one component's designator + parameters + pin list from its children.
 
@@ -1329,11 +1371,17 @@ def _extract_sch_component(comp, schdoc_name: str) -> RawSchComponent | None:
                 pins.append(str(pin_designator))
     if designator is None:
         return None
+    x, y, has_location = _sch_location_xy(comp)
     return RawSchComponent(
         designator=designator,
         schdoc_name=schdoc_name,
         parameters=parameters,
         pin_designators=tuple(pins),
+        x=x,
+        y=y,
+        orientation_deg=_sch_orientation_deg(comp),
+        is_mirrored=bool(getattr(comp, "is_mirrored", False)),
+        has_location=has_location,
     )
 
 
@@ -1345,6 +1393,43 @@ def _extract_sch_components(design) -> tuple[RawSchComponent, ...]:
             rec = _extract_sch_component(comp, schdoc_name)
             if rec is not None:
                 out.append(rec)
+    return tuple(out)
+
+
+def _sheet_symbol_child_filename(sym) -> str:
+    """Filename referenced by a hierarchical sheet symbol, if any."""
+    fn = getattr(sym, "filename", None) or getattr(sym, "file_name", None)
+    if fn is not None:
+        text = getattr(fn, "text", None)
+        if text:
+            return str(text).strip()
+    for child in getattr(sym, "children", []) or []:
+        cls = type(child).__name__
+        if cls in ("AltiumSchFileName", "AltiumSchSheetFileName"):
+            text = getattr(child, "text", None)
+            if text:
+                return str(text).strip()
+    return ""
+
+
+def _extract_sch_sheet_placements(design) -> tuple[tuple[str, float], ...]:
+    """``(child_schdoc_filename, x)`` for sheet symbols across all SchDocs."""
+    out: list[tuple[str, float]] = []
+    for sd in design.schdocs:
+        symbols = []
+        getter = getattr(sd, "get_sheet_symbols", None)
+        if callable(getter):
+            symbols = list(getter() or [])
+        else:
+            symbols = list(getattr(sd, "sheet_symbols", []) or [])
+        for sym in symbols:
+            child = _sheet_symbol_child_filename(sym)
+            if not child:
+                continue
+            x, _y, has_loc = _sch_location_xy(sym)
+            if not has_loc:
+                continue
+            out.append((Path(child).name, x))
     return tuple(out)
 
 
@@ -1442,6 +1527,7 @@ def extract_project(prjpcb_path: str | Path,
         nets=_extract_nets(pcb),
         stackup=_extract_stackup(pcb),
         sch_components=_extract_sch_components(design),
+        sch_sheet_placements=_extract_sch_sheet_placements(design),
         compiled_netlist=compiled_netlist,
         board_origin_mm=Pt2D(ox_mm, oy_mm),
         board_outline=_extract_board_outline(pcb, ox_mm, oy_mm),

@@ -23650,6 +23650,9 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             f"QToolButton {{ border: 1px solid {_t['border']}; border-radius: 4px;"
             f"  padding: 2px 10px; background-color: {_t['bg_alt']}; }}"
             f"QToolButton:hover {{ background-color: {_t['bg_hover']}; }}"
+            f"QToolButton:checked {{ background-color: {_t['bg_hover']};"
+            f"  border-color: {_t.get('accent', _t['border'])}; }}"
+            f"QToolButton:disabled {{ color: {_t['fg_dim']}; }}"
         )
         for label, tip, slot in (
             ("+", "Zoom in (Ctrl++, +)", self._topology_zoom_in),
@@ -23664,6 +23667,23 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             btn.setStyleSheet(btn_qss)
             btn.clicked.connect(slot)
             toolbar.addWidget(btn)
+
+        # Schematic-guided layout toggle (default on when coords exist).
+        self._topology_schematic_layout = True
+        sch_btn = QToolButton()
+        sch_btn.setText("From schematic")
+        sch_btn.setCheckable(True)
+        sch_btn.setChecked(True)
+        sch_btn.setToolTip(
+            "When on, arrange topology columns/order from Altium schematic "
+            "placement (if available). When off, use net-graph auto layout."
+        )
+        sch_btn.setCursor(Qt.PointingHandCursor)
+        sch_btn.setStyleSheet(btn_qss)
+        sch_btn.toggled.connect(self._topology_schematic_layout_toggled)
+        toolbar.addWidget(sch_btn)
+        self._topology_schematic_btn = sch_btn
+
         toolbar.addStretch()
         outer.addLayout(toolbar)
 
@@ -23692,6 +23712,41 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             sc = QShortcut(QKeySequence(keys), parent)
             sc.setContext(Qt.WidgetWithChildrenShortcut)
             sc.activated.connect(slot)
+
+    def _topology_schematic_layout_toggled(self, checked: bool) -> None:
+        self._topology_schematic_layout = bool(checked)
+        self._populate_topology()
+
+    def _topology_update_schematic_btn(self, preview_md: dict | None) -> None:
+        """Enable/disable the From-schematic button from metadata coverage."""
+        btn = getattr(self, "_topology_schematic_btn", None)
+        if btn is None:
+            return
+        from fypa.topology.metadata.layout_bridge import parse_topology_directives
+        from fypa.topology.metadata.schematic_seed import (
+            SCHEMATIC_SEED_COVERAGE,
+            schematic_coverage,
+        )
+
+        enabled = False
+        if preview_md is not None:
+            try:
+                parsed = parse_topology_directives(preview_md)
+                enabled = schematic_coverage(parsed.node_specs) >= SCHEMATIC_SEED_COVERAGE
+            except Exception:
+                enabled = False
+        btn.setEnabled(enabled)
+        if not enabled:
+            # Keep preferred state but force graph path while disabled.
+            btn.setToolTip(
+                "Schematic placement not available (need Altium SchDoc "
+                "coordinates on most directives). Using net-graph layout."
+            )
+        else:
+            btn.setToolTip(
+                "When on, arrange topology columns/order from Altium schematic "
+                "placement. When off, use net-graph auto layout."
+            )
 
     def _topology_zoom_in(self) -> None:
         view = getattr(self, "_topology_view", None)
@@ -23737,9 +23792,17 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             self._topology_view.set_empty_message("No setup metadata available.")
             self._topology_hint.setText("")
             self._topology_model = None
+            self._topology_update_schematic_btn(None)
             return
 
-        model = build_topology_model(preview_md)
+        self._topology_update_schematic_btn(preview_md)
+        use_sch = bool(getattr(self, "_topology_schematic_layout", True))
+        btn = getattr(self, "_topology_schematic_btn", None)
+        if btn is not None and not btn.isEnabled():
+            use_sch = False
+        model = build_topology_model(
+            preview_md, use_schematic_layout=use_sch,
+        )
         self._topology_model = model
         svg = render_topology_svg(model, theme=current_theme())
         self._topology_view.set_diagram_svg(QByteArray(svg.encode("utf-8")))

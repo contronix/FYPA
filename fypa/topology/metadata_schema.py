@@ -30,6 +30,12 @@ class DirectiveDict(TypedDict, total=False):
     channel_index: int
     gain: float
     terminals: dict[str, TerminalDict]
+    schdoc: str
+    # Schematic placement template (SchDoc units); absent when unknown.
+    sch_x: float
+    sch_y: float
+    sch_orientation_deg: int
+    sch_mirrored: bool
 
 
 class JumpRowDict(TypedDict, total=False):
@@ -87,6 +93,12 @@ class NodeSpec(TypedDict):
     # have sibling rows on the same terminal. Their pad set spans the whole
     # part, so the label shows the row's own net rather than every pad net.
     channel_ports: NotRequired[list[str]]
+    # Schematic placement template for layout seeding (optional).
+    schdoc: NotRequired[str]
+    sch_x: NotRequired[float]
+    sch_y: NotRequired[float]
+    sch_orientation_deg: NotRequired[int]
+    sch_mirrored: NotRequired[bool]
 
 
 class TopologyMetadata(TypedDict, total=False):
@@ -95,6 +107,8 @@ class TopologyMetadata(TypedDict, total=False):
     directives: list[DirectiveDict]
     net_canonical: dict[str, str]
     annotation_errors: list[str]
+    # Multi-sheet column block order: list of {filename, x} from sheet symbols.
+    sch_sheet_placements: list[dict[str, float | str]]
 
 
 def assert_topology_metadata(data: object) -> TopologyMetadata:

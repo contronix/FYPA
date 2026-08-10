@@ -776,13 +776,59 @@ def assign_columns(
     # make both terminals look identical). Flip P→right / N→left only when P has
     # downstream nodes and NO upstream driver (a mid-rail tap keeps its driver on
     # the P side, so the default P-left is correct and must stay).
+    orient_series_ports_for_columns(
+        node_specs, col, net_to_rail, loop_parent, outputs_by_net, inputs_by_net,
+    )
+
+    return _compact_columns(col)
+
+
+def orient_series_ports_for_columns(
+    node_specs: list[NodeSpec],
+    col: dict[str, int],
+    net_to_rail: dict[str, str],
+    loop_parent: dict[str, str] | None = None,
+    outputs_by_net: dict[str, list[str]] | None = None,
+    inputs_by_net: dict[str, list[str]] | None = None,
+) -> None:
+    """Orient SERIES/RESISTOR port faces for the given column map (in place).
+
+    Used after graph ``assign_columns`` and again after schematic column seeds
+    so P/N faces track the final column layout. When net maps / loop parents
+    are omitted, they are rebuilt from *node_specs* so loop SERIES pairs still
+    get parent-facing ports.
+    """
+    if outputs_by_net is None or inputs_by_net is None:
+        outputs_by_net = defaultdict(list)
+        inputs_by_net = defaultdict(list)
+        for s in node_specs:
+            nid = s["node_id"]
+            for pname, side, _ in s["port_defs"]:
+                term = (s["terms"] or {}).get(pname)
+                if is_ideal_return(term):
+                    continue
+                port_role = spec_port_role(s, pname)
+                flow_net = _column_net(port_role, term, net_to_rail, terminal=pname)
+                if not flow_net or flow_net == GND_NET:
+                    continue
+                if is_output_port(port_role, pname, side):
+                    outputs_by_net[flow_net].append(nid)
+                else:
+                    inputs_by_net[flow_net].append(nid)
+    if loop_parent is None:
+        loop_parent = _detect_loop_series_parents(
+            node_specs, outputs_by_net, inputs_by_net,
+        )
+
     wnet_cols: dict[str, list[tuple[str, int]]] = defaultdict(list)
     for s in node_specs:
         for rp in (s.get("resolved_ports") or {}).values():
             if rp.wnet and rp.wnet != GND_NET:
                 wnet_cols[rp.wnet].append((s["node_id"], col.get(s["node_id"], 0)))
 
-    _orient_loop_series_ports(node_specs, col, loop_parent, outputs_by_net, inputs_by_net)
+    _orient_loop_series_ports(
+        node_specs, col, loop_parent, outputs_by_net, inputs_by_net,
+    )
 
     for s in node_specs:
         if not spec_has_series_role(s):
@@ -793,13 +839,13 @@ def assign_columns(
         rcol = col.get(nid, 0)
         rports = s.get("resolved_ports") or {}
 
-        def _cols(prefix):
+        def _cols(prefix, _rports=rports, _nid=nid):
             return [
                 c
-                for pname, rp in rports.items()
+                for pname, rp in _rports.items()
                 if pname.startswith(prefix)
                 for oid, c in wnet_cols.get(rp.wnet, [])
-                if oid != nid
+                if oid != _nid
             ]
 
         p_cols, n_cols = _cols("P"), _cols("N")
@@ -814,8 +860,6 @@ def assign_columns(
                 )
                 for pname, side, sort_key in s["port_defs"]
             ]
-
-    return _compact_columns(col)
 
 
 def specs_by_column(
@@ -899,6 +943,7 @@ __all__ = [
     "assign_columns",
     "is_return_port_row",
     "jump_row_for_directive",
+    "orient_series_ports_for_columns",
     "parse_topology_directives",
     "specs_by_column",
 ]

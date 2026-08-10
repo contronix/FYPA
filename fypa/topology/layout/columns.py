@@ -122,13 +122,15 @@ def _place_columns(
     col_x: list[float],
     *,
     columns: dict[str, int] | None = None,
+    y_assign: dict[str, float] | None = None,
 ) -> tuple[list[TopologyNode], list[TopologyPort]]:
     if columns is None:
         columns = {}
         for c, col_specs in by_col.items():
             for s in col_specs:
                 columns[s["node_id"]] = c
-    y_assign = assign_vertical_positions(node_specs, columns, max_col)
+    if y_assign is None:
+        y_assign = assign_vertical_positions(node_specs, columns, max_col)
 
     nodes: list[TopologyNode] = []
     all_ports: list[TopologyPort] = []
@@ -241,6 +243,7 @@ def place_nodes(
     x_offset: float = MARGIN,
     col_gap: float = COL_GAP,
     gnd_bus_y: float | None = None,
+    y_assign: dict[str, float] | None = None,
 ) -> tuple[list[TopologyNode], list[TopologyPort], float, BusPlan, list[float]]:
     gaps = [col_gap] * max_col
     nodes: list[TopologyNode] = []
@@ -256,6 +259,7 @@ def place_nodes(
             max_col,
             col_x,
             columns=columns,
+            y_assign=y_assign,
         )
         new_gaps = _required_gaps(
             all_ports,
@@ -295,6 +299,7 @@ def place_nodes(
             max_col,
             col_x,
             columns=columns,
+            y_assign=y_assign,
         )
         by_net = group_ports_by_net(all_ports)
         gnd_ports = by_net.get(GND_NET, [])
@@ -318,6 +323,7 @@ def refine_place_nodes_for_gnd(
     gnd_bus_y: float,
     x_offset: float = MARGIN,
     col_gap: float = COL_GAP,
+    y_assign: dict[str, float] | None = None,
 ) -> tuple[list[TopologyNode], list[TopologyPort], float, BusPlan, list[float]]:
     """Re-plan signal buses with GND trunks; re-place only if gaps must widen."""
     columns = _columns_from_by_col(by_col)
@@ -328,6 +334,7 @@ def refine_place_nodes_for_gnd(
         max_col,
         col_x,
         columns=columns,
+        y_assign=y_assign,
     )
     by_net = group_ports_by_net(all_ports)
     gnd_ports = by_net.get(GND_NET, [])
@@ -354,6 +361,7 @@ def refine_place_nodes_for_gnd(
             max_col,
             col_x,
             columns=columns,
+            y_assign=y_assign,
         )
         by_net = group_ports_by_net(all_ports)
         gnd_ports = by_net.get(GND_NET, [])

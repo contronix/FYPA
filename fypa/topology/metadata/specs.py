@@ -179,6 +179,7 @@ def _merge_specs_for_designator(designator: str, specs: list[NodeSpec]) -> NodeS
         "tooltip": "\n".join(tooltip_parts),
         "directive": primary["directive"],
         "directives": directives,
+        **_sch_fields_from_directive(primary.get("directive") or {}),
     }
 
 
@@ -548,7 +549,30 @@ def component_spec_from_directives(
         "tooltip": component_tooltip(role, designator, channels),
         "directive": channels[0],
         "directives": channels,
+        **_sch_fields_from_directive(channels[0]),
     }
+
+
+def _sch_fields_from_directive(d: DirectiveDict) -> dict:
+    """Copy schematic placement fields from a directive onto a NodeSpec."""
+    out: dict = {}
+    schdoc = d.get("schdoc")
+    if schdoc:
+        out["schdoc"] = str(schdoc)
+    if "sch_x" in d and "sch_y" in d:
+        try:
+            out["sch_x"] = float(d["sch_x"])
+            out["sch_y"] = float(d["sch_y"])
+        except (TypeError, ValueError):
+            return out
+        if "sch_orientation_deg" in d:
+            try:
+                out["sch_orientation_deg"] = int(d["sch_orientation_deg"])
+            except (TypeError, ValueError):
+                pass
+        if "sch_mirrored" in d:
+            out["sch_mirrored"] = bool(d["sch_mirrored"])
+    return out
 
 
 def directives_to_component_specs(

@@ -19,6 +19,7 @@ import logging
 import math
 import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1921,6 +1922,70 @@ def build_solve_metadata(
         })
 
     # Directive summary — what each PDN_* annotation resolved to.
+    sch_by_key: dict[tuple[str, str], list] = defaultdict(list)
+    sch_by_des: dict[str, list] = defaultdict(list)
+    for sc in proj.sch_components:
+        des_u = sc.designator.upper()
+        sheet = sc.schdoc_name.replace("\\", "/").lower()
+        sch_by_key[(des_u, sheet)].append(sc)
+        base = sheet.rsplit("/", 1)[-1]
+        if base != sheet:
+            sch_by_key[(des_u, base)].append(sc)
+        sch_by_des[des_u].append(sc)
+
+    def _sch_des_candidates(designator: str) -> list[str]:
+        """PCB designator → schematic designator candidates.
+
+        Directive ``designator`` is often the PCB instance label (``U2.1``,
+        ``U1_CH1``) while SchDoc components keep the schematic name (``U2``).
+        """
+        des = (designator or "").upper()
+        out: list[str] = []
+        if des:
+            out.append(des)
+            if "." in des:
+                out.append(des.rsplit(".", 1)[0])
+            for sep in ("_CH", "#"):
+                if sep in des:
+                    out.append(des.split(sep, 1)[0])
+                    break
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for d in out:
+            d = d.strip()
+            if d and d not in seen:
+                seen.add(d)
+                uniq.append(d)
+        return uniq
+
+    def _unique_sch(matches: list):
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _sch_placement_for(designator: str, schdoc_name: str):
+        sheet_key = (schdoc_name or "").replace("\\", "/").lower()
+        sheet_base = sheet_key.rsplit("/", 1)[-1] if sheet_key else ""
+        for des_u in _sch_des_candidates(designator):
+            for key in (sheet_key, sheet_base):
+                if not key:
+                    continue
+                sc = _unique_sch(sch_by_key.get((des_u, key), []))
+                if sc is not None:
+                    return sc
+            # Bare designator only when the directive has no sheet, or the
+            # unique match is on that same sheet basename (avoid cross-sheet).
+            matches = sch_by_des.get(des_u, [])
+            sc = _unique_sch(matches)
+            if sc is None:
+                continue
+            if not sheet_base:
+                return sc
+            sc_sheet = sc.schdoc_name.replace("\\", "/").rsplit("/", 1)[-1].lower()
+            if sc_sheet == sheet_base:
+                return sc
+        return None
+
     directives = []
     for d in loaded.annotations.directives:
         ch_idx = getattr(d, "channel_index", None)
@@ -1935,6 +2000,12 @@ def build_solve_metadata(
             "label": label,
             "schdoc": d.schdoc_name,
         }
+        sc = _sch_placement_for(d.designator, d.schdoc_name)
+        if sc is not None and getattr(sc, "has_location", False):
+            common["sch_x"] = float(sc.x)
+            common["sch_y"] = float(sc.y)
+            common["sch_orientation_deg"] = int(sc.orientation_deg)
+            common["sch_mirrored"] = bool(sc.is_mirrored)
         if isinstance(d, SourceSpec):
             common["value"] = d.voltage
             common["unit"] = "V"
@@ -2452,6 +2523,10 @@ def build_solve_metadata(
             ),
         },
         "directives": directives,
+        "sch_sheet_placements": [
+            {"filename": fn, "x": float(x)}
+            for fn, x in getattr(proj, "sch_sheet_placements", ()) or ()
+        ],
         "net_canonical": build_net_canonical_map(proj.compiled_netlist),
         "active_nets": active_nets,
         "vias": vias,

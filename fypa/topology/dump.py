@@ -15,7 +15,12 @@ TOPOLOGY_PKL = "topology.pkl"
 WIRING_JSON = "wiring.json"
 TOPOLOGY_SVG = "topology.svg"
 
-_TOPOLOGY_PICKLE_KEYS = ("directives", "net_canonical", "annotation_errors")
+_TOPOLOGY_PICKLE_KEYS = (
+    "directives",
+    "net_canonical",
+    "annotation_errors",
+    "sch_sheet_placements",
+)
 
 
 def topology_pickle_metadata(metadata: dict) -> dict:
