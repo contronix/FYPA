@@ -26,7 +26,7 @@ from fypa.topology.metadata.specs import (
 )
 from fypa.topology.metadata.tooltips import port_tooltip
 from fypa.topology.metadata_schema import NodeSpec, TerminalDict, TopologyMetadata
-from fypa.topology.terminal_roles import is_output_port, is_power_input_port
+from fypa.topology.terminal_roles import is_output_port
 from fypa.topology.util import truncate_label
 
 
@@ -582,27 +582,21 @@ def _column_net(
     *,
     terminal: str = "",
 ) -> str | None:
-    """Net key for the column-placement graph.
+    """Physical net key for the column-placement / flow graph.
 
-    SERIES / RESISTOR / REGULATOR and load power inputs use physical wire
-    names so bridged or switched nets (``LX.1``, ``VDD_MCU``, …) do not
-    collapse onto an upstream rail via ``net_to_rail`` (e.g. ``LX.1`` →
-    ``VDD_24V_IN_``), which would hide the regulator as the series upstream
-    driver and park inductors left of their switcher.
+    Always the copper net (:func:`_column_flow_net`), never ``net_to_rail``
+    canonicalization. Net-ties and 0 Ω SERIES join two physical names that the
+    solver may put in one rail group; collapsing them here creates feedback
+    cycles and hides real upstream drivers (e.g. ``LX.1`` vs ``VDD_24V_IN``,
+    ``VDD_MCU`` vs ``VDD_3V3``).
 
-    SOURCE and other roles keep rail-canonical names so parallel loads on a
-    shared rail stay aligned.
+    ``role`` / ``net_to_rail`` / ``terminal`` are kept so call sites stay stable;
+    rail grouping remains for the viewer dropdown and labels only.
 
-    Port labels use :func:`~fypa.topology.metadata.nets.port_display_net`
-    (physical names) — not this function.
+    Port labels use :func:`~fypa.topology.metadata.nets.port_display_net`.
     """
-    if not term or is_ideal_return(term):
-        return None
-    if role in ("RESISTOR", "SERIES", "REGULATOR"):
-        return _column_flow_net(term)
-    if is_power_input_port(role, terminal):
-        return _column_flow_net(term)
-    return canonical_net(terminal_net(term), net_to_rail)
+    del role, net_to_rail, terminal
+    return _column_flow_net(term)
 
 
 def _push_passive_load_columns(
@@ -755,7 +749,6 @@ def assign_columns(
 
     outputs_by_net: dict[str, list[str]] = defaultdict(list)
     inputs_by_net: dict[str, list[str]] = defaultdict(list)
-    inputs_by_canonical: dict[str, list[str]] = defaultdict(list)
     for s in node_specs:
         nid = s["node_id"]
         for pname, side, _ in s["port_defs"]:
@@ -770,10 +763,6 @@ def assign_columns(
                 outputs_by_net[flow_net].append(nid)
             else:
                 inputs_by_net[flow_net].append(nid)
-            if not is_output_port(port_role, pname, side):
-                cn = canonical_net(terminal_net(term), net_to_rail)
-                if cn and cn != GND_NET:
-                    inputs_by_canonical[cn].append(nid)
 
     loop_parent = _detect_loop_series_parents(node_specs, outputs_by_net, inputs_by_net)
     back_edges = _detect_propagation_back_edges(
@@ -841,8 +830,9 @@ def assign_columns(
             loop_parent,
         )
 
-    # Parallel taps on the P-side rail sit to the right of the bridge (not
-    # downstream loads on the N-side nets).
+    # Parallel taps on the P-side *physical* net sit to the right of the
+    # bridge (not N-side downstream loads). Do not use rail-canonical membership
+    # — a net-tie's upstream and downstream names often share a rail group.
     for s in node_specs:
         if not spec_has_series_role(s):
             continue
@@ -863,10 +853,10 @@ def assign_columns(
                 continue
             if not pname.startswith("P"):
                 continue
-            rail = canonical_net(terminal_net(term), net_to_rail)
-            if not rail or rail == GND_NET:
+            p_net = _column_flow_net(term)
+            if not p_net or p_net == GND_NET:
                 continue
-            for other in inputs_by_canonical.get(rail, []):
+            for other in inputs_by_net.get(p_net, []):
                 if other == nid or other in downstream:
                     continue
                 if role_by_id.get(other) in ("RESISTOR", "SERIES"):

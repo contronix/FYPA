@@ -115,9 +115,11 @@ def port_display_net(
     """Label text for a topology port — physical PCB net name(s).
 
     ``physical_net`` is normally :func:`terminal_net` (first pin when pads
-    disagree). Rail grouping (:func:`canonical_net`, :func:`_column_net`) is
-    used only for column placement and wire grouping — not for labels — so
-    rail members keep distinct names (e.g. ``VDD_48V_PORT.1`` vs
+    disagree). Column placement always keys on physical copper nets
+    (:func:`~fypa.topology.metadata.layout_bridge._column_net`) so net-ties
+    keep distinct upstream/downstream names; rail grouping
+    (:func:`canonical_net`) is for the viewer dropdown only — not for flow
+    layout — so rail members keep distinct names (e.g. ``VDD_48V_PORT.1`` vs
     ``VDD_48V_RP``).
 
     A terminal whose pads span several nets normally lists them all,

@@ -279,6 +279,45 @@ def test_series_after_regulator_sits_right_of_switch_node():
     assert cols["L1"] <= cols["J1"], cols
 
 
+def test_nettie_keeps_distinct_physical_flow_columns():
+    """0 Ω / net-tie SERIES must not merge upstream and downstream into one hop.
+
+    Even when the solver puts both nets in one rail group, placement follows
+    copper: SOURCE → bridge → SINK stays left-to-right on distinct nets.
+    """
+    from fypa.topology.metadata.layout_bridge import (
+        _enrich_resolved_ports,
+        assign_columns,
+    )
+
+    src = _spec(
+        "J1",
+        role="SOURCE",
+        ports=[("P", "right", 0)],
+        terms={"P": {"requested_net": "VDD_A", "pins": [{"net": "VDD_A", "pad": "1"}]}},
+    )
+    bridge = _spec(
+        "R1",
+        role="SERIES",
+        ports=[("P", "left", 0), ("N", "right", 1)],
+        terms={
+            "P": {"requested_net": "VDD_A", "pins": [{"net": "VDD_A", "pad": "1"}]},
+            "N": {"requested_net": "VDD_B", "pins": [{"net": "VDD_B", "pad": "2"}]},
+        },
+    )
+    snk = _spec(
+        "U1",
+        role="SINK",
+        ports=[("P", "left", 0)],
+        terms={"P": {"requested_net": "VDD_B", "pins": [{"net": "VDD_B", "pad": "1"}]}},
+    )
+    for s in (src, bridge, snk):
+        _enrich_resolved_ports(s)
+    rail = {"VDD_A": "VDD_RAIL", "VDD_B": "VDD_RAIL", "VDD_RAIL": "VDD_RAIL"}
+    cols = assign_columns([src, bridge, snk], rail)
+    assert cols["J1"] < cols["R1"] < cols["U1"], cols
+
+
 def test_canvas_fits_wires_routed_above_origin():
     """Detours above y=0 must expand/shift the canvas so nothing is clipped."""
     from fypa.topology.builder import _fit_canvas_to_content
