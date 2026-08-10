@@ -323,6 +323,45 @@ def _apply_passive_column_col(
         col[nid] = max(min(downstream_cols), col.get(nid, 0))
 
 
+def _bump_passives_past_active_drivers(
+    node_specs: list[NodeSpec],
+    col: dict[str, int],
+    outputs_by_net: dict[str, list[str]],
+    loop_parent: dict[str, str],
+    role_by_id: dict[str, str],
+) -> None:
+    """Ensure SERIES sit right of REGULATOR/SOURCE drivers after rank compression.
+
+    ``compress_column_ranks`` may co-locate an inductor with its switcher; that
+    must be undone. SERIES→SERIES packing from compression is left intact.
+    """
+    passive = {"SERIES", "RESISTOR"}
+    for s in node_specs:
+        if not spec_has_series_role(s):
+            continue
+        nid = s["node_id"]
+        if nid in loop_parent:
+            continue
+        active_up: list[int] = []
+        for pname, term in spec_series_terms(s):
+            if not term or is_ideal_return(term) or not pname.startswith("P"):
+                continue
+            flow_net = _column_flow_net(term)
+            if not flow_net:
+                continue
+            for pid in outputs_by_net.get(flow_net, []):
+                if pid == nid or loop_parent.get(pid) == nid:
+                    continue
+                if role_by_id.get(pid) in passive:
+                    continue
+                active_up.append(col.get(pid, 0))
+        if not active_up:
+            continue
+        need = max(active_up) + 1
+        if col.get(nid, 0) < need:
+            col[nid] = need
+
+
 def _dedupe_port_rows_on_same_side(
     port_defs: list[tuple[str, str, int]],
 ) -> list[tuple[str, str, int]]:
@@ -545,17 +584,21 @@ def _column_net(
 ) -> str | None:
     """Net key for the column-placement graph.
 
-    SERIES / RESISTOR and load power inputs use physical wire names so
-    bridged downstream nets (VDD_MCU, LED_R, …) do not collapse onto the
-    upstream rail.  Other roles keep rail-canonical names so parallel loads
-    on a shared rail stay aligned.
+    SERIES / RESISTOR / REGULATOR and load power inputs use physical wire
+    names so bridged or switched nets (``LX.1``, ``VDD_MCU``, …) do not
+    collapse onto an upstream rail via ``net_to_rail`` (e.g. ``LX.1`` →
+    ``VDD_24V_IN_``), which would hide the regulator as the series upstream
+    driver and park inductors left of their switcher.
+
+    SOURCE and other roles keep rail-canonical names so parallel loads on a
+    shared rail stay aligned.
 
     Port labels use :func:`~fypa.topology.metadata.nets.port_display_net`
     (physical names) — not this function.
     """
     if not term or is_ideal_return(term):
         return None
-    if role in ("RESISTOR", "SERIES"):
+    if role in ("RESISTOR", "SERIES", "REGULATOR"):
         return _column_flow_net(term)
     if is_power_input_port(role, terminal):
         return _column_flow_net(term)
@@ -896,6 +939,13 @@ def assign_columns(
     # sit between two RESISTOR columns and block packing (power_board).
     col = _pin_source_sink_columns(node_specs, col, mixed_role_ids)
     col = _merge_adjacent_passive_columns(node_specs, col, loop_parent)
+    col = _pin_source_sink_columns(node_specs, col, mixed_role_ids)
+    # Rank bucketing can co-locate a REGULATOR with its LX inductor; push only
+    # those passives past active (non-series) drivers — do not unpack SERIES chains.
+    _bump_passives_past_active_drivers(
+        node_specs, col, outputs_by_net, loop_parent, role_by_id,
+    )
+    col = _compact_columns(col)
     col = _pin_source_sink_columns(node_specs, col, mixed_role_ids)
 
     # Orient each SERIES/RESISTOR so the terminal carrying the downstream loads

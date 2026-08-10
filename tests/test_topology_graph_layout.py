@@ -217,6 +217,68 @@ def test_series_keeps_through_flow_despite_peers_on_one_side():
     assert sides["N"] == "right"
 
 
+def test_series_after_regulator_sits_right_of_switch_node():
+    """Inductor on a regulator LX net must land right of the regulator.
+
+    Rail maps sometimes fold ``LX.1`` into the upstream rail name; column
+    connectivity must still see the regulator OUT as the series upstream.
+    """
+    from fypa.topology.metadata.layout_bridge import assign_columns
+
+    reg = _spec(
+        "U1",
+        role="REGULATOR",
+        ports=[("IN_P", "left", 0), ("OUT_P", "right", 1)],
+        terms={
+            "IN_P": {
+                "requested_net": "VIN",
+                "pins": [{"net": "VIN", "pad": "1"}],
+            },
+            "OUT_P": {
+                "requested_net": "LX",
+                "pins": [{"net": "LX.1", "pad": "2"}],
+            },
+        },
+    )
+    ind = _spec(
+        "L1",
+        role="RESISTOR",
+        ports=[("P", "left", 0), ("N", "right", 1)],
+        terms={
+            "P": {
+                "requested_net": "LX",
+                "pins": [{"net": "LX.1", "pad": "1"}],
+            },
+            "N": {
+                "requested_net": "VOUT",
+                "pins": [{"net": "VOUT", "pad": "2"}],
+            },
+        },
+    )
+    snk = _spec(
+        "J1",
+        role="SINK",
+        ports=[("P", "left", 0)],
+        terms={
+            "P": {
+                "requested_net": "VOUT",
+                "pins": [{"net": "VOUT", "pad": "1"}],
+            },
+        },
+    )
+    from fypa.topology.metadata.layout_bridge import _enrich_resolved_ports
+
+    for s in (reg, ind, snk):
+        _enrich_resolved_ports(s)
+    # Hostile rail map: physical LX collapses onto the upstream rail name.
+    cols = assign_columns(
+        [reg, ind, snk],
+        {"LX.1": "VIN", "LX": "VIN", "VOUT": "VIN", "VIN": "VIN"},
+    )
+    assert cols["U1"] < cols["L1"], cols
+    assert cols["L1"] <= cols["J1"], cols
+
+
 def test_canvas_fits_wires_routed_above_origin():
     """Detours above y=0 must expand/shift the canvas so nothing is clipped."""
     from fypa.topology.builder import _fit_canvas_to_content
