@@ -14,6 +14,7 @@ from fypa.topology.metadata_schema import NodeSpec
 def _spec(
     node_id: str,
     *,
+    role: str = "SOURCE",
     sch_x: float | None = None,
     sch_y: float | None = None,
     schdoc: str = "Main.SchDoc",
@@ -25,15 +26,15 @@ def _spec(
         "node_id": node_id,
         "label": node_id,
         "designator": node_id,
-        "role": "SOURCE",
+        "role": role,
         "config_label": "",
         "has_error": False,
         "terms": {},
         "port_defs": ports or [("P", "right", 0), ("N", "left", 1)],
         "port_directives": {},
         "tooltip": node_id,
-        "directive": {"designator": node_id, "role": "SOURCE"},
-        "directives": [{"designator": node_id, "role": "SOURCE"}],
+        "directive": {"designator": node_id, "role": role},
+        "directives": [{"designator": node_id, "role": role}],
         "schdoc": schdoc,
     }
     if sch_x is not None and sch_y is not None:
@@ -46,9 +47,9 @@ def _spec(
 
 def test_schematic_seed_orders_columns_by_x_and_y():
     specs = [
-        _spec("A", sch_x=100, sch_y=200),
-        _spec("B", sch_x=100, sch_y=50),   # below A (smaller Y → higher order)
-        _spec("C", sch_x=500, sch_y=200),  # right column
+        _spec("A", role="REGULATOR", sch_x=100, sch_y=200),
+        _spec("B", role="REGULATOR", sch_x=100, sch_y=50),
+        _spec("C", role="REGULATOR", sch_x=500, sch_y=200),
     ]
     seed = schematic_seed_placement(specs, graph_columns={"A": 0, "B": 0, "C": 1})
     assert seed is not None
@@ -79,10 +80,11 @@ def test_schematic_seed_flips_ports_when_mirrored():
     assert "B" not in seed.port_defs
 
 
-def test_schematic_seed_sheet_blocks_use_symbol_x():
+def test_schematic_seed_sheets_share_columns():
+    """Subsheets pack into one shared column space — no block offset per sheet."""
     specs = [
-        _spec("A", sch_x=10, sch_y=10, schdoc="mod/ChildB.SchDoc"),
-        _spec("B", sch_x=10, sch_y=10, schdoc="mod/ChildA.SchDoc"),
+        _spec("A", role="REGULATOR", sch_x=10, sch_y=10, schdoc="mod/ChildB.SchDoc"),
+        _spec("B", role="REGULATOR", sch_x=10, sch_y=10, schdoc="mod/ChildA.SchDoc"),
     ]
     meta = {
         "sch_sheet_placements": [
@@ -92,18 +94,52 @@ def test_schematic_seed_sheet_blocks_use_symbol_x():
     }
     seed = schematic_seed_placement(specs, metadata=meta)
     assert seed is not None
-    # ChildA left of ChildB → B's sheet block comes first
-    assert seed.columns["B"] < seed.columns["A"]
+    assert seed.columns["A"] == seed.columns["B"]
+    # Sheet-symbol X only breaks within-column order (ChildA before ChildB).
+    assert seed.orders["B"] < seed.orders["A"]
 
 
-def test_schematic_seed_keeps_same_basename_sheets_separate():
+def test_schematic_seed_same_basename_sheets_can_share():
     specs = [
-        _spec("A", sch_x=10, sch_y=10, schdoc="pwr/Rail.SchDoc"),
-        _spec("B", sch_x=10, sch_y=10, schdoc="io/Rail.SchDoc"),
+        _spec("A", role="REGULATOR", sch_x=10, sch_y=10, schdoc="pwr/Rail.SchDoc"),
+        _spec("B", role="REGULATOR", sch_x=10, sch_y=10, schdoc="io/Rail.SchDoc"),
     ]
     seed = schematic_seed_placement(specs)
     assert seed is not None
-    assert seed.columns["A"] != seed.columns["B"]
+    assert seed.columns["A"] == seed.columns["B"]
+
+
+def test_schematic_seed_sources_first_sinks_last():
+    specs = [
+        _spec("SRC", role="SOURCE", sch_x=900, sch_y=100, schdoc="a.SchDoc"),
+        _spec("MID", role="REGULATOR", sch_x=500, sch_y=100, schdoc="b.SchDoc"),
+        _spec("SNK", role="SINK", sch_x=100, sch_y=100, schdoc="c.SchDoc"),
+    ]
+    # Graph put the source oddly far right — seed must still prefer edges.
+    seed = schematic_seed_placement(
+        specs,
+        graph_columns={"SRC": 2, "MID": 1, "SNK": 0},
+    )
+    assert seed is not None
+    assert seed.columns["SRC"] == 0
+    assert seed.columns["SNK"] == max(seed.columns.values())
+    assert seed.columns["SNK"] > seed.columns["SRC"]
+
+
+def test_schematic_seed_multi_sheet_does_not_inflate_width():
+    """Many single-node sheets must not each claim a new column."""
+    specs = [
+        _spec(f"S{i}", role="SINK", sch_x=100.0 + i, sch_y=50.0, schdoc=f"con{i}.SchDoc")
+        for i in range(8)
+    ] + [
+        _spec("SRC", role="SOURCE", sch_x=10, sch_y=50, schdoc="pwr.SchDoc"),
+    ]
+    graph = {s["node_id"]: (0 if s["role"] == "SOURCE" else 3) for s in specs}
+    seed = schematic_seed_placement(specs, graph_columns=graph)
+    assert seed is not None
+    assert max(seed.columns.values()) <= 3
+    assert seed.columns["SRC"] == 0
+    assert all(seed.columns[s["node_id"]] == max(seed.columns.values()) for s in specs if s["role"] == "SINK")
 
 
 def test_build_model_toggle_off_ignores_sch_coords():

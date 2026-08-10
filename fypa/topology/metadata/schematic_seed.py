@@ -1,4 +1,10 @@
-"""Seed topology columns/order/port sides from Altium schematic placement."""
+"""Seed topology columns/order/port sides from Altium schematic placement.
+
+Schematic coordinates are a **soft hint**: they refine within-column order and
+optional left/right ranking inside a sheet, but they do not allocate an exclusive
+column block per subsheet. Column structure prefers the graph ``assign_columns``
+backbone (sources left, sinks right); sheets share that shared column space.
+"""
 
 from __future__ import annotations
 
@@ -47,7 +53,10 @@ def _order_sheets(
     sheet_keys: set[str],
     sheet_placements: list[dict] | None,
 ) -> list[str]:
-    """Left-to-right sheet block order from sheet-symbol X, else by name."""
+    """Left-to-right sheet preference from sheet-symbol X, else by name.
+
+    Used only as a within-column tie-break (not as a column-block offset).
+    """
     xs_by_child: dict[str, list[float]] = defaultdict(list)
     for row in sheet_placements or []:
         fn = str(row.get("filename") or "").replace("\\", "/").strip().lower()
@@ -127,6 +136,64 @@ def should_flip_lr(orientation_deg: int, mirrored: bool) -> bool:
     return flip
 
 
+def _compact_columns(columns: dict[str, int]) -> dict[str, int]:
+    """Remap used column indices to a dense 0..n-1 range."""
+    used = sorted(set(columns.values()))
+    if not used:
+        return columns
+    remap = {old: i for i, old in enumerate(used)}
+    return {nid: remap[c] for nid, c in columns.items()}
+
+
+def _apply_source_sink_columns(
+    node_specs: list[NodeSpec],
+    columns: dict[str, int],
+) -> dict[str, int]:
+    """Prefer SOURCE in column 0 and SINK in the rightmost occupied column."""
+    out = dict(columns)
+    for spec in node_specs:
+        if spec["role"] == "SOURCE":
+            out[spec["node_id"]] = 0
+
+    non_sink_cols = [
+        out[s["node_id"]]
+        for s in node_specs
+        if s["role"] != "SINK" and s["node_id"] in out
+    ]
+    has_source = any(s["role"] == "SOURCE" for s in node_specs)
+    has_sink = any(s["role"] == "SINK" for s in node_specs)
+    others_max = max(non_sink_cols, default=0)
+    if has_source and has_sink:
+        sink_col = max(others_max, 1)
+    else:
+        sink_col = others_max
+    for spec in node_specs:
+        if spec["role"] == "SINK":
+            out[spec["node_id"]] = sink_col
+    return _compact_columns(out)
+
+
+def _shared_width(
+    max_local: int,
+    graph_columns: dict[str, int] | None,
+    node_specs: list[NodeSpec],
+) -> int:
+    """Column count for the shared sheet-packing space."""
+    gmax = max(graph_columns.values(), default=0) + 1 if graph_columns else 0
+    w = max(max_local, gmax, 1)
+    roles = {s["role"] for s in node_specs}
+    if "SOURCE" in roles and "SINK" in roles:
+        w = max(w, 2)
+    return w
+
+
+def _map_local_to_shared(local: int, n_local: int, width: int) -> int:
+    """Map a sheet-local column into the shared 0..width-1 range."""
+    if width <= 1 or n_local <= 1:
+        return 0
+    return int(round(local / (n_local - 1) * (width - 1)))
+
+
 def schematic_seed_placement(
     node_specs: list[NodeSpec],
     *,
@@ -135,6 +202,15 @@ def schematic_seed_placement(
     min_coverage: float = SCHEMATIC_SEED_COVERAGE,
 ) -> SchematicSeed | None:
     """Build a column/order seed from ``sch_x``/``sch_y`` when coverage is enough.
+
+    Schematic placement is a soft hint:
+
+    * Subsheets **share** one column space (no exclusive block per sheet).
+    * When ``graph_columns`` is provided it is the structural backbone; schematic
+      coordinates then only drive within-column order and port-side flips.
+    * Without graph columns, sheet-local X ranks pack into a shared width.
+    * SOURCE nodes prefer column 0; SINK nodes prefer the last column.
+    * Within a column, order follows schematic Y (and sheet-symbol X as tie-break).
 
     Returns ``None`` when too few nodes carry schematic coordinates (caller
     keeps graph ``assign_columns``).
@@ -152,65 +228,88 @@ def schematic_seed_placement(
             by_sheet[_sheet_key(spec)].append(spec)
 
     sheet_order = _order_sheets(set(by_sheet.keys()), sheet_placements)
+    sheet_rank = {name: i for i, name in enumerate(sheet_order)}
 
-    columns: dict[str, int] = {}
-    orders: dict[str, int] = {}
-    port_defs: dict[str, list[PortDef]] = {}
-    col_offset = 0
-
-    for sheet in sheet_order:
-        group = by_sheet[sheet]
+    # Per-node sheet-local column and sheet size (for soft X → shared map).
+    local_col: dict[str, int] = {}
+    local_count: dict[str, int] = {}
+    max_local = 1
+    for sheet, group in by_sheet.items():
         xs = [float(s["sch_x"]) for s in group]
-        local_map = _cluster_xs_to_local_columns(xs)
-        # Per local column: order by descending sch_y (Altium Y grows upward).
-        members: dict[int, list[NodeSpec]] = defaultdict(list)
+        x_map = _cluster_xs_to_local_columns(xs)
+        n_local = max(x_map.values(), default=-1) + 1
+        max_local = max(max_local, n_local)
         for spec in group:
-            local = local_map[float(spec["sch_x"])]
-            members[local].append(spec)
-        n_local = max(members.keys(), default=-1) + 1
-        for local in range(n_local):
-            ranked = sorted(
-                members.get(local, []),
-                key=lambda s: (-float(s["sch_y"]), s["node_id"]),
-            )
-            global_col = col_offset + local
-            for order, spec in enumerate(ranked):
-                nid = spec["node_id"]
-                columns[nid] = global_col
-                orders[nid] = order
-                orient = int(spec.get("sch_orientation_deg") or 0)
-                mirrored = bool(spec.get("sch_mirrored") or False)
-                if not should_flip_lr(orient, mirrored):
-                    continue
-                # Pure SERIES/RESISTOR: faces come from column re-orient later.
-                if (
-                    spec_has_series_role(spec)
-                    and not spec.get("sections")
-                ):
-                    continue
-                if spec.get("sections") or spec_has_series_role(spec):
-                    port_defs[nid] = _flip_non_series_port_defs(spec)
-                else:
-                    port_defs[nid] = flip_port_defs(list(spec["port_defs"]))
-        col_offset += max(n_local, 1)
+            nid = spec["node_id"]
+            local_col[nid] = x_map[float(spec["sch_x"])]
+            local_count[nid] = n_local
 
-    # Nodes without schematic XY: hang off the right using graph columns.
+    width = _shared_width(max_local, graph_columns, node_specs)
+
+    # Backbone: graph columns when present (schematic must not explode width by
+    # appending per-sheet blocks). Without graph columns, pack every sheet into
+    # one shared 0..width-1 range from local X ranks.
+    columns: dict[str, int] = {}
+    if graph_columns:
+        for spec in node_specs:
+            columns[spec["node_id"]] = int(graph_columns.get(spec["node_id"], 0))
+    else:
+        for spec in node_specs:
+            nid = spec["node_id"]
+            if nid not in local_col:
+                continue
+            n_local = local_count[nid]
+            if n_local < 2:
+                # Single cluster — park mid-band; SOURCE/SINK overrides apply later.
+                columns[nid] = width // 2
+            else:
+                columns[nid] = _map_local_to_shared(local_col[nid], n_local, width)
+
+    # Nodes without schematic XY: keep graph column or hang at the right edge.
     missing = [s for s in node_specs if s["node_id"] not in columns]
     if missing and graph_columns:
-        gcols = sorted({graph_columns.get(s["node_id"], 0) for s in missing})
-        remap = {gc: col_offset + i for i, gc in enumerate(gcols)}
-        by_gcol: dict[int, list[NodeSpec]] = defaultdict(list)
         for spec in missing:
-            by_gcol[graph_columns.get(spec["node_id"], 0)].append(spec)
-        for gc in gcols:
-            ranked = sorted(by_gcol[gc], key=lambda s: s["node_id"])
-            for order, spec in enumerate(ranked):
-                columns[spec["node_id"]] = remap[gc]
-                orders[spec["node_id"]] = order
+            columns[spec["node_id"]] = int(graph_columns.get(spec["node_id"], 0))
     elif missing:
-        for order, spec in enumerate(sorted(missing, key=lambda s: s["node_id"])):
-            columns[spec["node_id"]] = col_offset
+        right = max(columns.values(), default=0)
+        for spec in missing:
+            columns[spec["node_id"]] = right
+
+    columns = _apply_source_sink_columns(node_specs, columns)
+
+    # Within-column order: schematic Y (Altium Y up), then sheet rank, then id.
+    orders: dict[str, int] = {}
+    by_col: dict[int, list[NodeSpec]] = defaultdict(list)
+    for spec in node_specs:
+        by_col[columns[spec["node_id"]]].append(spec)
+    for _col, members in by_col.items():
+        ranked = sorted(
+            members,
+            key=lambda s: (
+                -float(s["sch_y"]) if node_has_sch_placement(s) else 0.0,
+                sheet_rank.get(_sheet_key(s), 10**9),
+                s["node_id"],
+            ),
+        )
+        for order, spec in enumerate(ranked):
             orders[spec["node_id"]] = order
+
+    port_defs: dict[str, list[PortDef]] = {}
+    for spec in node_specs:
+        if not node_has_sch_placement(spec):
+            continue
+        nid = spec["node_id"]
+        orient = int(spec.get("sch_orientation_deg") or 0)
+        mirrored = bool(spec.get("sch_mirrored") or False)
+        if not should_flip_lr(orient, mirrored):
+            continue
+        # Pure SERIES/RESISTOR: faces come from column re-orient later.
+        if spec_has_series_role(spec) and not spec.get("sections"):
+            continue
+        if spec.get("sections") or spec_has_series_role(spec):
+            port_defs[nid] = _flip_non_series_port_defs(spec)
+        else:
+            port_defs[nid] = flip_port_defs(list(spec["port_defs"]))
 
     return SchematicSeed(columns=columns, orders=orders, port_defs=port_defs)
 
