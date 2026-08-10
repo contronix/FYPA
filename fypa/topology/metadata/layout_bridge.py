@@ -142,27 +142,59 @@ def _merge_adjacent_passive_columns(
     return out
 
 
+def _multi_section_node_ids(node_specs: list[NodeSpec]) -> set[str]:
+    """Designators whose symbol stacks more than one role section."""
+    return {
+        s["node_id"]
+        for s in node_specs
+        if len(s.get("sections") or []) > 1
+    }
+
+
+def _sink_column_pin_ids(
+    node_specs: list[NodeSpec],
+    mixed_role_ids: set[str],
+) -> set[str]:
+    """Pure single-section SINK leaves that belong in the rightmost column.
+
+    Mixed-role and multi-section composites keep their graph column so series
+    outputs retain a gutter toward last-column sink loads.
+    """
+    multi = _multi_section_node_ids(node_specs)
+    return {
+        s["node_id"]
+        for s in node_specs
+        if s["role"] == "SINK"
+        and s["node_id"] not in mixed_role_ids
+        and s["node_id"] not in multi
+    }
+
+
 def _pin_source_sink_columns(
     node_specs: list[NodeSpec],
     col: dict[str, int],
     mixed_role_ids: set[str],
 ) -> dict[str, int]:
-    """SOURCE → column 0; pure SINK → rightmost occupied column."""
+    """SOURCE → column 0; pure leaf SINK → rightmost occupied column."""
     out = dict(col)
     for s in node_specs:
         if s["role"] == "SOURCE":
             out[s["node_id"]] = 0
+    pin_ids = _sink_column_pin_ids(node_specs, mixed_role_ids)
     has_source = any(s["role"] == "SOURCE" for s in node_specs)
-    has_sink = any(
-        s["role"] == "SINK" and s["node_id"] not in mixed_role_ids
-        for s in node_specs
-    )
+    has_sink = bool(pin_ids)
     sink_col = max(out.values(), default=0)
-    if has_source and has_sink and sink_col == 0:
+    exempt = mixed_role_ids | _multi_section_node_ids(node_specs)
+    # Leaf sinks must not share the frontier column with composites that keep
+    # their graph rank — those symbols need a free gutter toward the loads.
+    if pin_ids and any(
+        out.get(nid) == sink_col and nid in exempt for nid in out
+    ):
+        sink_col += 1
+    elif has_source and has_sink and sink_col == 0:
         sink_col = 1
-    for s in node_specs:
-        if s["role"] == "SINK" and s["node_id"] not in mixed_role_ids:
-            out[s["node_id"]] = sink_col
+    for nid in pin_ids:
+        out[nid] = sink_col
     return _compact_columns(out)
 
 
@@ -355,6 +387,82 @@ def _ensure_passives_right_of_upstream(
             if col.get(nid, 0) < need:
                 col[nid] = need
                 changed = True
+
+
+def _dotted_designator_family(designator: str) -> str | None:
+    """``U27.3`` / ``J2.1`` → ``U27`` / ``J2``; plain designators → ``None``."""
+    if "." not in designator:
+        return None
+    return designator.rsplit(".", 1)[0]
+
+
+def _align_dotted_family_columns(
+    node_specs: list[NodeSpec],
+    col: dict[str, int],
+) -> None:
+    """Keep dotted sub-symbols (``U27.1``/``.2``/``.3``) in one shared column.
+
+    Propagation depth can push one channel further right than its siblings; the
+    family then collides with last-column sink loads that need a free gutter to
+    the composite's series outputs. Park the whole family at the leftmost rank
+    any member already occupies.
+    """
+    families: dict[str, list[str]] = defaultdict(list)
+    for spec in node_specs:
+        fam = _dotted_designator_family(spec.get("designator") or spec["node_id"])
+        if fam is None:
+            continue
+        nid = spec["node_id"]
+        if nid in col:
+            families[fam].append(nid)
+    for ids in families.values():
+        if len(ids) < 2:
+            continue
+        target = min(col[nid] for nid in ids)
+        for nid in ids:
+            col[nid] = target
+
+
+def _ensure_loads_right_of_series_drivers(
+    node_specs: list[NodeSpec],
+    col: dict[str, int],
+    inputs_by_net: dict[str, list[str]],
+    loop_parent: dict[str, str],
+) -> None:
+    """REGULATOR loads on a SERIES N-output sit strictly right of the driver.
+
+    SERIES→SERIES order is handled by :func:`_ensure_passives_right_of_upstream`.
+    Pure SINK loads may intentionally share the driver column (stacked LED /
+    ``stack_column`` buses); only regulators need a free left approach so their
+    IN port is not fed from a bus to the right of the body.
+    """
+    role_by_id = {s["node_id"]: s["role"] for s in node_specs}
+    changed = True
+    guard = 0
+    while changed and guard < len(node_specs) * 2 + 5:
+        guard += 1
+        changed = False
+        for s in node_specs:
+            if not spec_has_series_role(s):
+                continue
+            nid = s["node_id"]
+            if nid in loop_parent:
+                continue
+            dcol = col.get(nid, 0)
+            for pname, term in spec_series_terms(s):
+                if not term or is_ideal_return(term) or not pname.startswith("N"):
+                    continue
+                flow_net = _column_flow_net(term)
+                if not flow_net:
+                    continue
+                for lid in inputs_by_net.get(flow_net, []):
+                    if lid == nid or loop_parent.get(lid) == nid:
+                        continue
+                    if role_by_id.get(lid) != "REGULATOR":
+                        continue
+                    if col.get(lid, 0) <= dcol:
+                        col[lid] = dcol + 1
+                        changed = True
 
 
 def _dedupe_port_rows_on_same_side(
@@ -914,10 +1022,7 @@ def assign_columns(
     )
 
     if col:
-        sink_col = max(col.values())
-        for s in node_specs:
-            if s["role"] == "SINK" and s["node_id"] not in mixed_role_ids:
-                col[s["node_id"]] = sink_col
+        col = _pin_source_sink_columns(node_specs, col, mixed_role_ids)
 
     col = compress_column_ranks(col, GRAPH_LAYOUT_MAX_COLUMNS)
     # Pin SOURCE/SINK before passive merges so a mid-chain SOURCE rank cannot
@@ -930,8 +1035,21 @@ def assign_columns(
     _ensure_passives_right_of_upstream(
         node_specs, col, outputs_by_net, loop_parent,
     )
+    # REGULATOR/SINK loads on a SERIES N-output must sit right of the bridge
+    # (same invariant as SERIES→SERIES, but for non-through loads).
+    _ensure_loads_right_of_series_drivers(
+        node_specs, col, inputs_by_net, loop_parent,
+    )
+    # Dotted channel symbols share one column so a deep channel is not parked
+    # in the sink column beside its loads.
+    _align_dotted_family_columns(node_specs, col)
     col = _compact_columns(col)
     col = _pin_source_sink_columns(node_specs, col, mixed_role_ids)
+    _ensure_loads_right_of_series_drivers(
+        node_specs, col, inputs_by_net, loop_parent,
+    )
+    _align_dotted_family_columns(node_specs, col)
+    col = _compact_columns(col)
 
     # Orient each SERIES/RESISTOR so the terminal carrying the downstream loads
     # faces right. Peers are keyed by *resolved physical net* (not the canonical

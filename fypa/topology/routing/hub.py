@@ -155,11 +155,16 @@ def _merge_vertical_at_port(
     ctx: RoutingContext,
     net: str,
 ) -> bool:
-    """Vertical at the port column when joining a connector sub-symbol row."""
+    """Vertical at the stub column when joining a connector sub-symbol row.
+
+    Connector-family peers share a symbol-edge X; the climb itself stays on the
+    outward stub (gutter), never on the face.
+    """
     if port.x not in row_port_xs:
         return False
+    stub = port_stub_x(port)
     y_lo, y_hi = min(port.y, row_y), max(port.y, row_y)
-    if not _vertical_drop_to_row_clear(ctx, port.x, y_lo, y_hi, net, obstacles, {port.node_id}):
+    if not _vertical_drop_to_row_clear(ctx, stub, y_lo, y_hi, net, obstacles, {port.node_id}):
         return False
     fam = _connector_family(nodes_by_id[port.node_id].designator)
     if fam is None:
@@ -367,7 +372,6 @@ def _route_hub_tap(
             return hub_tap_vertical_to_row(
                 port,
                 row_y,
-                merge_at_port=True,
                 ctx=ctx,
                 net=net,
             )

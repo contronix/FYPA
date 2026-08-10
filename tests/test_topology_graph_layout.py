@@ -416,3 +416,171 @@ def test_multi_column_gutter_does_not_inflate_every_gap():
     gaps = _required_gaps(ports, col_x, 3, COL_GAP, plan)
     # Previously each gap became ~full board width; keep them near COL_GAP.
     assert max(gaps) < NODE_W + 2 * COL_GAP
+
+
+def test_regulator_load_sits_right_of_series_driver():
+    """REGULATOR on a SERIES N-output must not share the driver's column."""
+    from fypa.topology.metadata.layout_bridge import (
+        _enrich_resolved_ports,
+        assign_columns,
+    )
+
+    driver = _spec(
+        "R_DRV",
+        role="RESISTOR",
+        ports=[("P", "left", 0), ("N", "right", 1)],
+        terms={
+            "P": {"requested_net": "VIN", "pins": [{"net": "VIN", "pad": "1"}]},
+            "N": {"requested_net": "VMID", "pins": [{"net": "VMID", "pad": "2"}]},
+        },
+    )
+    load = _spec(
+        "U_REG",
+        role="REGULATOR",
+        ports=[("IN_P", "left", 0), ("OUT_P", "right", 1)],
+        terms={
+            "IN_P": {"requested_net": "VMID", "pins": [{"net": "VMID", "pad": "1"}]},
+            "OUT_P": {"requested_net": "VOUT", "pins": [{"net": "VOUT", "pad": "2"}]},
+        },
+    )
+    for s in (driver, load):
+        _enrich_resolved_ports(s)
+    cols = assign_columns([driver, load], {})
+    assert cols["R_DRV"] < cols["U_REG"], cols
+
+
+def test_dotted_family_shares_leftmost_column():
+    """U1.1/U1.2/U1.3 park together so a deep channel is not beside sink loads."""
+    from fypa.topology.metadata.layout_bridge import (
+        _enrich_resolved_ports,
+        assign_columns,
+    )
+
+    src = _spec(
+        "J1",
+        role="SOURCE",
+        ports=[("P", "right", 0)],
+        terms={"P": {"requested_net": "VIN", "pins": [{"net": "VIN", "pad": "1"}]}},
+    )
+    family = []
+    for i, mid in enumerate(("VMID1", "VMID2", "VMID3"), start=1):
+        # Mixed SERIES+SINK composite (two sections) with a series output to a
+        # leaf sink — mirrors multi-channel bridge symbols.
+        bridge = _spec(
+            f"U1.{i}",
+            role="SINK",
+            ports=[
+                ("P1", "left", 0),
+                ("N1", "right", 1),
+                ("P2", "left", 2),
+            ],
+            terms={
+                "P1": {"requested_net": "VIN", "pins": [{"net": "VIN", "pad": "1"}]},
+                "N1": {"requested_net": mid, "pins": [{"net": mid, "pad": "2"}]},
+                "P2": {"requested_net": "VDD", "pins": [{"net": "VDD", "pad": "3"}]},
+            },
+        )
+        bridge["sections"] = [
+            {
+                "role": "SERIES",
+                "port_defs": [("P1", "left", 0), ("N1", "right", 1)],
+                "terms": {
+                    "P1": bridge["terms"]["P1"],
+                    "N1": bridge["terms"]["N1"],
+                },
+                "port_directives": {},
+                "directives": [{"role": "SERIES", "designator": f"U1.{i}"}],
+            },
+            {
+                "role": "SINK",
+                "port_defs": [("P2", "left", 0)],
+                "terms": {"P2": bridge["terms"]["P2"]},
+                "port_directives": {},
+                "directives": [{"role": "SINK", "designator": f"U1.{i}"}],
+            },
+        ]
+        bridge["port_roles"] = {"P1": "SERIES", "N1": "SERIES", "P2": "SINK"}
+        family.append(bridge)
+    sinks = []
+    for i, mid in enumerate(("VMID1", "VMID2", "VMID3"), start=1):
+        sinks.append(
+            _spec(
+                f"R1.{i}",
+                role="SINK",
+                ports=[("P", "left", 0)],
+                terms={"P": {"requested_net": mid, "pins": [{"net": mid, "pad": "1"}]}},
+            )
+        )
+    specs = [src, *family, *sinks]
+    for s in specs:
+        _enrich_resolved_ports(s)
+    cols = assign_columns(specs, {})
+    assert cols["U1.1"] == cols["U1.2"] == cols["U1.3"], cols
+    assert cols["U1.3"] < cols["R1.3"], cols
+    assert cols["R1.1"] == cols["R1.2"] == cols["R1.3"] == max(cols.values())
+
+
+def test_multi_section_pure_sink_keeps_graph_column():
+    """Stacked SINK channels are not force-pinned into the leaf sink column."""
+    from fypa.topology.metadata.layout_bridge import (
+        _enrich_resolved_ports,
+        _mixed_role_node_ids,
+        assign_columns,
+    )
+
+    src = _spec(
+        "J1",
+        role="SOURCE",
+        ports=[("P", "right", 0)],
+        terms={"P": {"requested_net": "VIN", "pins": [{"net": "VIN", "pad": "1"}]}},
+    )
+    bridge = _spec(
+        "R1",
+        role="RESISTOR",
+        ports=[("P", "left", 0), ("N", "right", 1)],
+        terms={
+            "P": {"requested_net": "VIN", "pins": [{"net": "VIN", "pad": "1"}]},
+            "N": {"requested_net": "VOUT", "pins": [{"net": "VOUT", "pad": "2"}]},
+        },
+    )
+    composite = _spec(
+        "U2",
+        role="SINK",
+        ports=[
+            ("P1", "left", 0),
+            ("P2", "left", 1),
+        ],
+        terms={
+            "P1": {"requested_net": "VOUT", "pins": [{"net": "VOUT", "pad": "1"}]},
+            "P2": {"requested_net": "BRA", "pins": [{"net": "BRA", "pad": "2"}]},
+        },
+    )
+    composite["sections"] = [
+        {
+            "role": "SINK",
+            "port_defs": [("P1", "left", 0)],
+            "terms": {"P1": composite["terms"]["P1"]},
+            "port_directives": {},
+            "directives": [{"role": "SINK", "designator": "U2", "channel_index": 1}],
+        },
+        {
+            "role": "SINK",
+            "port_defs": [("P2", "left", 0)],
+            "terms": {"P2": composite["terms"]["P2"]},
+            "port_directives": {},
+            "directives": [{"role": "SINK", "designator": "U2", "channel_index": 2}],
+        },
+    ]
+    leaf = _spec(
+        "U3",
+        role="SINK",
+        ports=[("P", "left", 0)],
+        terms={"P": {"requested_net": "VOUT", "pins": [{"net": "VOUT", "pad": "1"}]}},
+    )
+    specs = [src, bridge, composite, leaf]
+    for s in specs:
+        _enrich_resolved_ports(s)
+    assert "U2" not in _mixed_role_node_ids(specs)
+    cols = assign_columns(specs, {})
+    assert cols["U2"] < cols["U3"], cols
+    assert cols["U3"] == max(cols.values())

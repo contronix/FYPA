@@ -670,28 +670,15 @@ def hub_tap_vertical_to_row(
     row_y: float,
     *,
     bus_x: float | None = None,
-    merge_at_port: bool = False,
     obstacles: list[TopologyNode] | None = None,
     skip: set[str] | None = None,
     ctx: RoutingContext | None = None,
     net: str | None = None,
 ) -> tuple[str, float]:
-    """Drop from a port onto an existing hub row.
+    """Drop from a port onto an existing hub row via the outward stub column.
 
     When ``bus_x`` is set, route onto the trunk column before the vertical.
     """
-    if merge_at_port:
-        if ctx is not None and net is not None:
-            ctx.reserve_vertical(
-                port.x,
-                min(port.y, row_y),
-                max(port.y, row_y),
-                net,
-            )
-        return (
-            simplify_wire_path(f"M {port.x:.1f},{port.y:.1f} V {row_y:.1f}"),
-            row_y,
-        )
     start_leg, col_x, _ = path_from_port_stub(port)
     if bus_x is not None and abs(col_x - bus_x) > WIRE_EPS:
         obs = obstacles or []

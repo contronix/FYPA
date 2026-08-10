@@ -12,7 +12,11 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 
-from fypa.topology.metadata.layout_bridge import compress_column_ranks
+from fypa.topology.metadata.layout_bridge import (
+    _mixed_role_node_ids,
+    _sink_column_pin_ids,
+    compress_column_ranks,
+)
 from fypa.topology.metadata.specs import spec_has_series_role
 from fypa.topology.metadata_schema import NodeSpec, PortDef, TopologyMetadata
 
@@ -155,27 +159,42 @@ def _apply_source_sink_columns(
     node_specs: list[NodeSpec],
     columns: dict[str, int],
 ) -> dict[str, int]:
-    """Prefer SOURCE in column 0 and SINK in the rightmost occupied column."""
+    """Prefer SOURCE in column 0 and leaf SINK in the rightmost occupied column.
+
+    Multi-section composites and mixed-role symbols keep their graph column so
+    series outputs retain a gutter toward last-column sink loads.
+    """
     out = dict(columns)
     for spec in node_specs:
         if spec["role"] == "SOURCE":
             out[spec["node_id"]] = 0
 
+    mixed = _mixed_role_node_ids(node_specs)
+    pin_ids = _sink_column_pin_ids(node_specs, mixed)
     non_sink_cols = [
         out[s["node_id"]]
         for s in node_specs
-        if s["role"] != "SINK" and s["node_id"] in out
+        if s["node_id"] in out and s["node_id"] not in pin_ids
     ]
     has_source = any(s["role"] == "SOURCE" for s in node_specs)
-    has_sink = any(s["role"] == "SINK" for s in node_specs)
+    has_sink = bool(pin_ids)
     others_max = max(non_sink_cols, default=0)
     if has_source and has_sink:
         sink_col = max(others_max, 1)
     else:
         sink_col = others_max
-    for spec in node_specs:
-        if spec["role"] == "SINK":
-            out[spec["node_id"]] = sink_col
+    # Prefer the global max so already-propagated leaf sinks are not pulled left
+    # onto a SERIES column, then open one more column when a composite sits there.
+    sink_col = max(sink_col, max(out.values(), default=0))
+    exempt = mixed | {
+        s["node_id"] for s in node_specs if len(s.get("sections") or []) > 1
+    }
+    if pin_ids and any(
+        out.get(nid) == sink_col and nid in exempt for nid in out
+    ):
+        sink_col += 1
+    for nid in pin_ids:
+        out[nid] = sink_col
     return _compact_columns(out)
 
 

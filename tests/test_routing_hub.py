@@ -989,7 +989,9 @@ def test_detoured_row_connector_merges_at_port_column():
     row_y = parse_wire_path(row_wire.path_d)[0][1]
     assert abs(row_y - 261.0) > 1e-6
     merge_tap = next(w for w in wires if w.src_node == "J2.3")
-    assert merge_tap.path_d == f"M 164.0,100.0 V {row_y:.1f}"
+    # Connector-family merge still drops via the outward stub (gutter), not the face.
+    assert merge_tap.path_d == f"M 164.0,100.0 H 184.0 V {row_y:.1f}"
+    assert "V 164.0" not in merge_tap.path_d.replace("164.0,100.0", "")
 
 
 def test_route_hub_tap_scans_later_row_spans_at_same_y():
@@ -1126,7 +1128,8 @@ def test_route_hub_tap_tries_later_row_when_first_span_fails():
     assert path_d.endswith("V 240.0")
 
 
-def test_hub_tap_vertical_merge_at_port_reserves_column():
+def test_hub_tap_vertical_to_row_reserves_stub_column():
+    """Row drops climb on the outward stub, never on the symbol face."""
     from fypa.topology.routing.paths import hub_tap_vertical_to_row
 
     port = TopologyPort(
@@ -1140,14 +1143,16 @@ def test_hub_tap_vertical_merge_at_port_reserves_column():
         wire_x=184.0,
     )
     ctx = RoutingContext()
-    hub_tap_vertical_to_row(
+    path_d, tap_y = hub_tap_vertical_to_row(
         port,
         261.0,
-        merge_at_port=True,
         ctx=ctx,
         net="VDD",
     )
-    assert ctx.vertical_bands == [(164.0, 100.0, 261.0, "VDD")]
+    assert tap_y == 261.0
+    assert path_d == "M 164.0,100.0 H 184.0 V 261.0"
+    assert ctx.vertical_bands == [(184.0, 100.0, 261.0, "VDD")]
+    assert all(abs(vx - port.x) > 1e-6 for vx, *_ in ctx.vertical_bands)
 
 
 def test_obstacle_detour_y_candidates_respects_wire_eps(monkeypatch):
