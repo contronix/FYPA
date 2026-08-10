@@ -12,6 +12,7 @@ from fypa.topology.constants import (
     NODE_W,
     PORT_ROW_H,
     PORT_WIRE_STUB,
+    PORT_WIRE_STUB_MIN,
     WIRE_EPS,
     WIRE_GUTTER_PAD,
 )
@@ -46,9 +47,15 @@ def _col_gap_for_gutter_slots(n_slots: int, *, gnd_reserve: bool = True) -> floa
         return COL_GAP
     gnd_pad = MIN_PARALLEL_GAP if gnd_reserve else 0.0
     needed_usable = (n_slots - 1) * MIN_PARALLEL_GAP + gnd_pad
+    # Stacked stubs on each face grow with channel count; size the gap for the
+    # longest outward stub so trunks stay between the two stub columns.
+    stub_reach = max(
+        PORT_WIRE_STUB,
+        PORT_WIRE_STUB_MIN + max(0, n_slots - 1) * MIN_PARALLEL_GAP,
+    )
     return max(
         COL_GAP,
-        needed_usable + 2 * PORT_WIRE_STUB + MIN_PARALLEL_GAP + WIRE_GUTTER_PAD,
+        needed_usable + 2 * stub_reach + MIN_PARALLEL_GAP + WIRE_GUTTER_PAD,
     )
 
 

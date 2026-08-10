@@ -433,17 +433,19 @@ def test_stacked_column_wires_route_beside_symbol():
     model = build_topology_model(meta)
     d1 = next(n for n in model.nodes if n.designator == "D1")
     u4 = next(n for n in model.nodes if n.designator == "U4")
-    assert d1.x == u4.x
-    interior_lo = d1.x + 4
-    interior_hi = d1.x + d1.width - 4
+    # Net-driver (D1 SERIES N-out) must sit left of its LED sink inputs.
+    assert d1.x < u4.x
     led_wires = [w for w in model.wires if w.net in {"LED_R", "LED_G", "LED_B"}]
     assert led_wires
     for w in led_wires:
         for seg in path_to_segments(w.net, parse_wire_path(w.path_d)):
             if seg.orient != "V":
                 continue
-            assert not (interior_lo <= seg.x1 <= interior_hi), (
+            assert not (d1.x + 4 <= seg.x1 <= d1.x + d1.width - 4), (
                 f"{w.net} vertical x={seg.x1} crosses {d1.label} body"
+            )
+            assert not (u4.x + 4 <= seg.x1 <= u4.x + u4.width - 4), (
+                f"{w.net} vertical x={seg.x1} crosses {u4.label} body"
             )
 
 
@@ -553,15 +555,14 @@ def test_stacked_led_wires_use_distinct_buses():
     model = build_topology_model(meta)
     d1 = next(n for n in model.nodes if n.designator == "D1")
     u4 = next(n for n in model.nodes if n.designator == "U4")
-    assert d1.x == u4.x
+    assert d1.x < u4.x
     led_wires = [w for w in model.wires if w.net in {"LED_R", "LED_G", "LED_B"}]
     assert len(led_wires) == 3
-    interior_lo = d1.x + 4
-    interior_hi = d1.x + d1.width - 4
     for w in led_wires:
         for seg in path_to_segments(w.net, parse_wire_path(w.path_d)):
             if seg.orient == "V":
-                assert not (interior_lo <= seg.x1 <= interior_hi)
+                assert not (d1.x + 4 <= seg.x1 <= d1.x + d1.width - 4)
+                assert not (u4.x + 4 <= seg.x1 <= u4.x + u4.width - 4)
     # Dest stub drops (left of the column) are separate from the trunk buses
     # on the right; only the planned buses must be three distinct columns.
     bus_xs = {round(w.bus_x, 1) for w in led_wires if w.bus_x is not None}

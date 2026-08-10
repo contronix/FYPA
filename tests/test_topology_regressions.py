@@ -270,12 +270,15 @@ def test_regression_gutter_parallel_min_bus_gap():
 
 
 def test_regression_stacked_column_buses_use_column_edge():
-    """Stack-column pair buses use column_bus_x and still pass gap validation."""
+    """Pair buses stay in column gaps (gutter or stack) with valid geometry."""
     from fypa.topology.validate.segments import check_vertical_bus_column_gaps
 
     model = build_topology_model(load_topology_fixture("gutter_parallel_four_nets"))
-    stack_wires = [w for w in model.wires if w.routing_kind == "stack_column"]
-    assert stack_wires, "fixture should include stack_column pair wires"
+    pair_wires = [
+        w for w in model.wires
+        if w.routing_kind in ("stack_column", "gutter") and w.bus_x is not None
+    ]
+    assert pair_wires, "fixture should include pair bus wires"
     assert not check_vertical_bus_column_gaps(model)
 
 

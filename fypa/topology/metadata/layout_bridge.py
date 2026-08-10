@@ -372,38 +372,89 @@ def _apply_passive_column_col(
         col[nid] = max(min(downstream_cols), col.get(nid, 0))
 
 
+def _ensure_loads_right_of_net_drivers(
+    node_specs: list[NodeSpec],
+    col: dict[str, int],
+    outputs_by_net: dict[str, list[str]],
+    inputs_by_net: dict[str, list[str]],
+    loop_parent: dict[str, str],
+    *,
+    back_edges: set[tuple[str, str]] | None = None,
+) -> None:
+    """Every net input sits strictly right of every driver of that net.
+
+    A block with a net *output* must lie left of every block that takes the
+    same net as an *input* (SOURCE/REGULATOR/SERIES drivers → any load). This
+    keeps left approaches clear so feeds are not routed around a co-located
+    driver. Loop-SERIES parent↔child edges and cycle back-edges (e.g. mutual
+    REGULATOR feeds) are skipped so feedback does not expand forever.
+    """
+    if back_edges is None:
+        edges: dict[str, list[str]] = defaultdict(list)
+        for net, drivers in outputs_by_net.items():
+            for did in drivers:
+                for lid in inputs_by_net.get(net) or []:
+                    if lid == did:
+                        continue
+                    if loop_parent.get(lid) == did or loop_parent.get(did) == lid:
+                        continue
+                    edges[did].append(lid)
+        roots = (
+            [s["node_id"] for s in node_specs if s["role"] == "SOURCE"]
+            + [s["node_id"] for s in node_specs if s["role"] == "REGULATOR"]
+            + [s["node_id"] for s in node_specs]
+        )
+        back_edges = _detect_propagation_back_edges(edges, roots)
+
+    changed = True
+    guard = 0
+    max_guard = max(len(node_specs), 1) * 4 + 5
+    while changed and guard < max_guard:
+        guard += 1
+        changed = False
+        for net, drivers in outputs_by_net.items():
+            loads = inputs_by_net.get(net) or []
+            if not drivers or not loads:
+                continue
+            for did in drivers:
+                dcol = col.get(did, 0)
+                for lid in loads:
+                    if lid == did:
+                        continue
+                    if loop_parent.get(lid) == did or loop_parent.get(did) == lid:
+                        continue
+                    if (did, lid) in back_edges:
+                        continue
+                    if col.get(lid, 0) <= dcol:
+                        col[lid] = dcol + 1
+                        changed = True
+
+
 def _ensure_passives_right_of_upstream(
     node_specs: list[NodeSpec],
     col: dict[str, int],
     outputs_by_net: dict[str, list[str]],
     loop_parent: dict[str, str],
+    inputs_by_net: dict[str, list[str]] | None = None,
 ) -> None:
-    """After rank compression, restore driver→load order for every SERIES.
-
-    Compression may co-locate a SERIES driver with its SERIES load; the load's
-    left port then faces away from the driver. Iterate until every passive sits
-    strictly right of all P-side upstream drivers (any role).
-    """
-    changed = True
-    guard = 0
-    while changed and guard < len(node_specs) * 2 + 5:
-        guard += 1
-        changed = False
+    """Restore driver→load column order (delegates to the general net rule)."""
+    if inputs_by_net is None:
+        inputs_by_net = defaultdict(list)
         for s in node_specs:
-            if not spec_has_series_role(s):
-                continue
             nid = s["node_id"]
-            if nid in loop_parent:
-                continue
-            upstream = _passive_upstream_cols(
-                s, nid, outputs_by_net, col, loop_parent,
-            )
-            if not upstream:
-                continue
-            need = max(upstream) + 1
-            if col.get(nid, 0) < need:
-                col[nid] = need
-                changed = True
+            for pname, side, _ in s["port_defs"]:
+                term = (s["terms"] or {}).get(pname)
+                if is_ideal_return(term):
+                    continue
+                port_role = spec_port_role(s, pname)
+                flow_net = _column_flow_net(term)
+                if not flow_net or flow_net == GND_NET:
+                    continue
+                if not is_output_port(port_role, pname, side):
+                    inputs_by_net[flow_net].append(nid)
+    _ensure_loads_right_of_net_drivers(
+        node_specs, col, outputs_by_net, inputs_by_net, loop_parent,
+    )
 
 
 def _dotted_designator_family(designator: str) -> str | None:
@@ -443,49 +494,6 @@ def _align_dotted_family_columns(
             col[nid] = target
 
 
-def _ensure_loads_right_of_series_drivers(
-    node_specs: list[NodeSpec],
-    col: dict[str, int],
-    inputs_by_net: dict[str, list[str]],
-    loop_parent: dict[str, str],
-) -> None:
-    """REGULATOR loads on a SERIES N-output sit strictly right of the driver.
-
-    SERIES→SERIES order is handled by :func:`_ensure_passives_right_of_upstream`.
-    Pure SINK loads may intentionally share the driver column (stacked LED /
-    ``stack_column`` buses); only regulators need a free left approach so their
-    IN port is not fed from a bus to the right of the body.
-    """
-    role_by_id = {s["node_id"]: s for s in node_specs}
-    changed = True
-    guard = 0
-    while changed and guard < len(node_specs) * 2 + 5:
-        guard += 1
-        changed = False
-        for s in node_specs:
-            if not spec_has_series_role(s):
-                continue
-            nid = s["node_id"]
-            if nid in loop_parent:
-                continue
-            dcol = col.get(nid, 0)
-            for pname, term in spec_series_terms(s):
-                if not term or is_ideal_return(term) or not pname.startswith("N"):
-                    continue
-                flow_net = _column_flow_net(term)
-                if not flow_net:
-                    continue
-                for lid in inputs_by_net.get(flow_net, []):
-                    if lid == nid or loop_parent.get(lid) == nid:
-                        continue
-                    load = role_by_id.get(lid)
-                    if load is None or not spec_has_role(load, ("REGULATOR",)):
-                        continue
-                    if col.get(lid, 0) <= dcol:
-                        col[lid] = dcol + 1
-                        changed = True
-
-
 def _restore_column_invariants(
     node_specs: list[NodeSpec],
     col: dict[str, int],
@@ -497,11 +505,15 @@ def _restore_column_invariants(
     """Family-align composites, then restore driver/load/sink invariants."""
     align_ids = mixed_role_ids | _multi_section_node_ids(node_specs)
     _align_dotted_family_columns(node_specs, col, align_ids)
-    _ensure_passives_right_of_upstream(
-        node_specs, col, outputs_by_net, loop_parent,
+    _ensure_loads_right_of_net_drivers(
+        node_specs, col, outputs_by_net, inputs_by_net, loop_parent,
     )
-    _ensure_loads_right_of_series_drivers(
-        node_specs, col, inputs_by_net, loop_parent,
+    col = _pin_source_sink_columns(node_specs, col, mixed_role_ids)
+    # Pin can yank a SOURCE back to column 0 even when it is a net load; restore
+    # driver→load order once more after pinning, then re-pin leaf sinks so they
+    # stay on the rightmost column.
+    _ensure_loads_right_of_net_drivers(
+        node_specs, col, outputs_by_net, inputs_by_net, loop_parent,
     )
     return _pin_source_sink_columns(node_specs, col, mixed_role_ids)
 
@@ -1071,13 +1083,12 @@ def assign_columns(
     col = _pin_source_sink_columns(node_specs, col, mixed_role_ids)
     col = _merge_adjacent_passive_columns(node_specs, col, loop_parent)
     col = _pin_source_sink_columns(node_specs, col, mixed_role_ids)
-    # Rank bucketing can co-locate a driver with its SERIES load. Restore
-    # strict left→right flow for every P-side upstream.
-    _ensure_passives_right_of_upstream(
-        node_specs, col, outputs_by_net, loop_parent,
+    # Rank bucketing can co-locate a driver with its load. Restore strict
+    # left→right flow: every net output sits left of every input of that net.
+    _ensure_loads_right_of_net_drivers(
+        node_specs, col, outputs_by_net, inputs_by_net, loop_parent,
     )
-    # REGULATOR loads on a SERIES N-output must sit right of the bridge.
-    # Family align can pull a dotted regulator left again — restore after align.
+    # Family align can pull a dotted composite left again — restore after align.
     col = _restore_column_invariants(
         node_specs, col, mixed_role_ids, outputs_by_net, inputs_by_net, loop_parent,
     )

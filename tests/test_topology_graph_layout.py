@@ -496,6 +496,52 @@ def test_regulator_load_sits_right_of_series_driver():
     assert cols["R_DRV"] < cols["U_REG"], cols
 
 
+def test_net_driver_sits_left_of_every_net_input():
+    """Any block that drives a net must lie left of every block that takes it."""
+    from fypa.topology.metadata.layout_bridge import (
+        _enrich_resolved_ports,
+        _ensure_loads_right_of_net_drivers,
+        assign_columns,
+        compress_column_ranks,
+    )
+
+    src = _spec(
+        "J1",
+        role="SOURCE",
+        ports=[("P", "right", 0)],
+        terms={"P": {"requested_net": "VIN", "pins": [{"net": "VIN", "pad": "1"}]}},
+    )
+    reg = _spec(
+        "U1",
+        role="REGULATOR",
+        ports=[("IN_P", "left", 0), ("OUT_P", "right", 1)],
+        terms={
+            "IN_P": {"requested_net": "VIN", "pins": [{"net": "VIN", "pad": "1"}]},
+            "OUT_P": {"requested_net": "VDD", "pins": [{"net": "VDD", "pad": "2"}]},
+        },
+    )
+    snk = _spec(
+        "J2",
+        role="SINK",
+        ports=[("P", "left", 0)],
+        terms={"P": {"requested_net": "VDD", "pins": [{"net": "VDD", "pad": "1"}]}},
+    )
+    for s in (src, reg, snk):
+        _enrich_resolved_ports(s)
+    cols = assign_columns([src, reg, snk], {})
+    assert cols["J1"] < cols["U1"] < cols["J2"], cols
+
+    # Post-compress co-location (power_board U2/J1 pattern) must be restored.
+    packed = compress_column_ranks({"J1": 0, "U1": 3, "J2": 3}, 2)
+    assert packed["U1"] == packed["J2"]
+    outputs = {"VIN": ["J1"], "VDD": ["U1"]}
+    inputs = {"VIN": ["U1"], "VDD": ["J2"]}
+    _ensure_loads_right_of_net_drivers(
+        [src, reg, snk], packed, outputs, inputs, {},
+    )
+    assert packed["J1"] < packed["U1"] < packed["J2"], packed
+
+
 def test_dotted_family_shares_leftmost_column():
     """U1.1/U1.2/U1.3 park together so a deep channel is not beside sink loads."""
     from fypa.topology.metadata.layout_bridge import (
