@@ -21,6 +21,8 @@ def _load_probe_dir(name: str):
 
 def test_topology_tooltip_only_on_elements():
     """Empty canvas areas must not produce a tooltip; wires/ports/symbols do."""
+    from fypa.topology.geometry import parse_wire_path
+
     model = build_topology_model(project_b_compact_metadata())
     assert topology_tooltip_at(model, 0.0, 0.0) is None
     j1 = next(n for n in model.nodes if n.label == "J1")
@@ -29,8 +31,11 @@ def test_topology_tooltip_only_on_elements():
     port = j1.ports[0]
     assert topology_tooltip_at(model, port.x, port.y)
     vdd_row = next(w for w in model.wires if w.routing_kind == "hub_row")
-    assert find_wire_at(model, 430.0, 75.0) is vdd_row
-    assert topology_tooltip_at(model, 430.0, 75.0)
+    pts = parse_wire_path(vdd_row.path_d)
+    hx = (pts[0][0] + pts[-1][0]) / 2
+    hy = pts[0][1]
+    assert find_wire_at(model, hx, hy) is vdd_row
+    assert topology_tooltip_at(model, hx, hy)
 
 
 def test_find_component_at_hit_test():
@@ -45,6 +50,8 @@ def test_find_component_at_hit_test():
 
 def test_topology_net_highlight_on_wire_hover():
     """Hovering a wire yields highlight SVG for the whole net, not symbols."""
+    from fypa.topology.geometry import parse_wire_path
+
     model = build_topology_model(project_b_compact_metadata())
     assert topology_net_at(model, 0.0, 0.0) is None
     j1 = next(n for n in model.nodes if n.label == "J1")
@@ -52,11 +59,15 @@ def test_topology_net_highlight_on_wire_hover():
     assert topology_net_at(model, bx + bw / 2, by + bh / 2) is None
     port = j1.ports[0]
     assert topology_net_at(model, port.x, port.y) == port.net
-    net = topology_net_at(model, 430.0, 75.0)
+    vdd_row = next(w for w in model.wires if w.routing_kind == "hub_row")
+    pts = parse_wire_path(vdd_row.path_d)
+    hx = (pts[0][0] + pts[-1][0]) / 2
+    hy = pts[0][1]
+    net = topology_net_at(model, hx, hy)
     assert net == "VDD_3V3_PWR"
     svg = render_net_highlight_svg(model, net)
     assert "stroke=" in svg
-    assert "430" not in svg or "line" in svg
+    assert "line" in svg
 
     model = build_topology_model(project_b_compact_metadata())
     j1 = next(n for n in model.nodes if n.label == "J1")
