@@ -87,7 +87,7 @@ def clear_outward_stub_x(
         if toward_dir != outward:
             toward_x = None
     step_px = MIN_PARALLEL_GAP / 2.0
-    for step in range(0, 16):
+    for step in range(0, 32):
         x = round(outward_escape_stub_x(port) + outward * step_px * step, 1)
         if toward_x is not None:
             if outward < 0 and x < toward_x - WIRE_EPS:
@@ -786,23 +786,54 @@ def hub_tap_path(
         if detoured is not None:
             return detoured
         # Connectivity last resort: never replay the long port→attach stub on a
-        # foreign-owned port row — micro stub or port-face climb only.
+        # foreign-owned port row — only a clearance-checked climb column.
         micro = outward_escape_stub_x(port)
-        micro_lo, micro_hi = min(port.x, micro), max(port.x, micro)
-        if (
-            not _foreign_horizontal_blocks_row(ctx, y, micro_lo, micro_hi, net)
-            and horizontal_segment_clear(y, micro_lo, micro_hi, obstacles, {port.node_id})
-        ):
-            ctx.reserve_horizontal(y, micro_lo, micro_hi, net)
-            ctx.reserve_vertical(micro, min(y, y_clear), max(y, y_clear), net)
-            ctx.reserve_horizontal(y_clear, min(micro, bus_x), max(micro, bus_x), net)
+        climb: float | None = None
+        if _stub_column_clear(port, micro, y, y_clear, ctx, net, obstacles):
+            climb = micro
+        elif _stub_column_clear(port, port.x, y, y_clear, ctx, net, obstacles):
+            climb = port.x
+        else:
+            # Ignore foreign H only when the climb is at the port face (no stub
+            # H). Outward climb columns must still clear foreign H on the port row.
+            outward = -1.0 if port.side == "left" else 1.0
+            step_px = MIN_PARALLEL_GAP / 2.0
+            face_v_clear = (
+                not _foreign_vertical_blocks_column(
+                    ctx, port.x, min(y, y_clear), max(y, y_clear), net,
+                )
+                and trunk_vertical_clear(
+                    port.x, min(y, y_clear), max(y, y_clear), obstacles, {port.node_id},
+                )
+            )
+            for step in range(0, 24):
+                x = round(outward_escape_stub_x(port) + outward * step_px * step, 1)
+                y_lo, y_hi = min(y, y_clear), max(y, y_clear)
+                if _foreign_vertical_blocks_column(ctx, x, y_lo, y_hi, net):
+                    continue
+                if not trunk_vertical_clear(x, y_lo, y_hi, obstacles, {port.node_id}):
+                    continue
+                if _foreign_horizontal_blocks_row(
+                    ctx, y, min(port.x, x), max(port.x, x), net,
+                ):
+                    continue
+                climb = x
+                break
+            if climb is None and face_v_clear:
+                climb = port.x
+        if climb is None:
+            # Last connectivity hook: climb at the port face even if contested.
+            climb = port.x
+        if abs(climb - port.x) > WIRE_EPS:
+            ctx.reserve_horizontal(y, min(port.x, climb), max(port.x, climb), net)
+        ctx.reserve_vertical(climb, min(y, y_clear), max(y, y_clear), net)
+        ctx.reserve_horizontal(y_clear, min(climb, bus_x), max(climb, bus_x), net)
+        if abs(climb - port.x) > WIRE_EPS:
             path = (
-                f"M {port.x:.1f},{y:.1f} H {micro:.1f} "
+                f"M {port.x:.1f},{y:.1f} H {climb:.1f} "
                 f"V {y_clear:.1f} H {bus_x:.1f}"
             )
         else:
-            ctx.reserve_vertical(port.x, min(y, y_clear), max(y, y_clear), net)
-            ctx.reserve_horizontal(y_clear, min(port.x, bus_x), max(port.x, bus_x), net)
             path = f"M {port.x:.1f},{y:.1f} V {y_clear:.1f} H {bus_x:.1f}"
         return simplify_wire_path(path), y_clear
     if foreign_vertical_covers_y(ctx, attach, y, net):
