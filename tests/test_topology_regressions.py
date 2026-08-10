@@ -366,7 +366,8 @@ def test_regression_port_horizontal_stub_before_vertical():
                 f"{wire.path_d}"
             )
             if wire.routing_kind in ("gutter", "stack_column") and bus_x is not None:
-                expected = abs(bus_x - port.x)
+                # Stub-first routing: first H is the outward stub; bus may follow.
+                expected = port_stub_length(port)
             else:
                 expected = port_stub_length(port)
             assert abs(segs[0].length - expected) < 4.0, (
@@ -436,11 +437,11 @@ def test_regression_gnd_tap_min_stub_project_b():
 
 
 def test_regression_stacked_stub_lengths():
-    """Stacked signal stubs stagger; GND stubs stay short on every edge."""
+    """Stacked signal stubs stagger by MIN_PARALLEL_GAP; GND stubs stay short."""
     from fypa.topology.constants import (
         GND_NET,
         GND_PORT_WIRE_STUB,
-        PORT_WIRE_STUB,
+        MIN_PARALLEL_GAP,
         PORT_WIRE_STUB_MIN,
     )
 
@@ -448,7 +449,7 @@ def test_regression_stacked_stub_lengths():
     d1 = next(n for n in model.nodes if n.node_id == "D1")
     right = sorted([p for p in d1.ports if p.side == "right"], key=lambda p: p.y)
     assert len(right) == 3
-    assert port_stub_length(right[0]) == PORT_WIRE_STUB
+    assert port_stub_length(right[0]) == PORT_WIRE_STUB_MIN + 2 * MIN_PARALLEL_GAP
     assert port_stub_length(right[-1]) == PORT_WIRE_STUB_MIN
 
     u4 = next(n for n in model.nodes if n.node_id == "U4")
@@ -456,8 +457,12 @@ def test_regression_stacked_stub_lengths():
     signals = [p for p in left if p.net != GND_NET]
     gnd = next(p for p in left if p.net == GND_NET)
     assert port_stub_length(gnd) == GND_PORT_WIRE_STUB
-    assert port_stub_length(signals[0]) == PORT_WIRE_STUB
     assert port_stub_length(signals[-1]) == PORT_WIRE_STUB_MIN
+    for i in range(1, len(signals)):
+        assert (
+            port_stub_length(signals[i - 1]) - port_stub_length(signals[i])
+            == MIN_PARALLEL_GAP
+        )
 
     u2 = next(n for n in model.nodes if n.node_id == "U2")
     in_pwr = next(p for p in u2.ports if p.net != GND_NET and p.side == "left")

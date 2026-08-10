@@ -193,6 +193,9 @@ def _connect_row_to_bus(
     lo, hi = min(edge_x, bus_x), max(edge_x, bus_x)
 
     def _clearance_skip(y_feed: float) -> set[str]:
+        # Endpoint bodies may sit on the row Y (port faces). Incidental touch is
+        # allowed; ``horizontal_segment_clear`` still blocks a full left↔right
+        # chord through an owner body toward an opposite-side trunk.
         if abs(y_feed - plan.y_row) <= WIRE_EPS:
             return {p.node_id for p in plan.group}
         return set()
@@ -224,13 +227,14 @@ def _connect_row_to_bus(
             f"M {edge_x:.1f},{plan.y_row:.1f} H {bus_x:.1f}",
         )
 
+    row_skip = {p.node_id for p in plan.group}
     for y_feed in obstacle_detour_y_candidates(
         ctx,
         plan.y_row,
         lo,
         hi,
         obstacles,
-        set(),
+        row_skip,
         net,
     ):
         path_d = _feed_at(y_feed)
@@ -242,7 +246,7 @@ def _connect_row_to_bus(
     # detached from the trunk is electrically wrong, so force a connection that
     # still detours physical symbol bodies. It may cross a foreign wire (a
     # validation warning), but connectivity must never be silently dropped.
-    y_forced = obstacle_detour_y(ctx, plan.y_row, lo, hi, obstacles, set(), net)
+    y_forced = obstacle_detour_y(ctx, plan.y_row, lo, hi, obstacles, row_skip, net)
     if abs(y_forced - plan.y_row) > WIRE_EPS:
         y_lo, y_hi = min(plan.y_row, y_forced), max(plan.y_row, y_forced)
         ctx.reserve_vertical(edge_x, y_lo, y_hi, net)

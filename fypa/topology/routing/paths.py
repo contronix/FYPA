@@ -17,6 +17,7 @@ from fypa.topology.routing.obstacles import (
     foreign_vertical_covers_y,
     horizontal_segment_clear,
     obstacle_detour_y,
+    shift_x_clear_of_vertical_obstacles,
 )
 from fypa.topology.types import TopologyNode, TopologyPort
 
@@ -61,14 +62,15 @@ def _start_prefix_at_row(
 ) -> tuple[str, float]:
     """Prefix at row ``y``; returns ``(prefix, column_x)`` after any horizontal legs.
 
-    Never draws port→bus horizontal through foreign symbol bodies.
+    Always leaves via the outward stub first so a left port never draws its
+    first leg rightward through the owner body (and symmetrically for right).
     """
-    s_stub = port_stub_x(start)
-    direct_lo, direct_hi = min(start.x, bus_x), max(start.x, bus_x)
-    if horizontal_segment_clear(y, direct_lo, direct_hi, obstacles, skip):
-        leg, _, _ = path_start_to_bus_x(start, bus_x)
-        return leg, bus_x
-    stub_leg, _, _ = path_from_port_stub(start)
+    stub_leg, s_stub, _ = path_from_port_stub(start)
+    if abs(s_stub - bus_x) < WIRE_EPS:
+        return stub_leg, bus_x
+    # Clearance toward the bus is checked from the stub column — the owner can
+    # stay in ``skip`` for foreign-only checks without allowing a through-body
+    # shortcut from ``port.x`` to an opposite-side ``bus_x``.
     stub_lo, stub_hi = min(s_stub, bus_x), max(s_stub, bus_x)
     if horizontal_segment_clear(y, stub_lo, stub_hi, obstacles, skip):
         return f"{stub_leg} H {bus_x:.1f}", bus_x
@@ -114,12 +116,15 @@ def _horizontal_chain_at_row(
 
 
 def path_start_to_bus_x(port: TopologyPort, bus_x: float) -> tuple[str, float, float]:
-    """First leg: port to the planned vertical bus column (no stub detour)."""
-    return (
-        f"M {port.x:.1f},{port.y:.1f} H {bus_x:.1f}",
-        bus_x,
-        port.y,
-    )
+    """First legs: outward stub, then horizontal to ``bus_x`` when distinct.
+
+    Never draws a single ``port.x → bus_x`` chord that would cross the owner body
+    when the bus sits on the opposite side of the symbol.
+    """
+    stub_leg, stub, y = path_from_port_stub(port)
+    if abs(stub - bus_x) < WIRE_EPS:
+        return stub_leg, stub, y
+    return f"{stub_leg} H {bus_x:.1f}", bus_x, y
 
 
 def path_from_port_stub(port: TopologyPort) -> tuple[str, float, float]:
@@ -171,6 +176,14 @@ def two_port_path(
         # Degenerate: both ports occupy the same point. Emit a single stub rather
         # than a self-overlapping stub-out/stub-back/stub-out double-back.
         return simplify_wire_path(path_from_port_stub(start)[0])
+
+    # Keep the vertical trunk off foreign (and own) symbol columns.
+    y_span_lo = min(start.y, end.y)
+    y_span_hi = max(start.y, end.y)
+    outward = 1.0 if bus_x >= (start.x + end.x) / 2 else -1.0
+    bus_x = shift_x_clear_of_vertical_obstacles(
+        bus_x, y_span_lo, y_span_hi, obs, set(), outward,
+    )
 
     if abs(start.y - end.y) < WIRE_EPS:
         y = start.y
@@ -531,14 +544,14 @@ def hub_tap_path(
 ) -> tuple[str, float]:
     attach = _hub_horizontal_target_x(port, bus_x)
     y = port.y
+    start_leg, attach, _ = path_from_port_stub(port)
+    outward = 1.0 if bus_x >= port.x else -1.0
+    # Clear the trunk of node bodies before committing the vertical.
+    bus_x = shift_x_clear_of_vertical_obstacles(
+        bus_x, y, y, obstacles, set(), outward,
+    )
     x_lo, x_hi = min(attach, bus_x), max(attach, bus_x)
     y_clear = obstacle_detour_y(ctx, y, x_lo, x_hi, obstacles, set(), net)
-    if abs(attach - port.x) < WIRE_EPS:
-        start_leg = f"M {port.x:.1f},{y:.1f}"
-    elif attach == bus_x and abs(bus_x - port.x) > WIRE_EPS:
-        start_leg = f"M {port.x:.1f},{y:.1f} H {bus_x:.1f}"
-    else:
-        start_leg, attach, _ = path_from_port_stub(port)
     if abs(y_clear - y) > WIRE_EPS:
         ctx.reserve_vertical(attach, min(y, y_clear), max(y, y_clear), net)
         ctx.reserve_horizontal(y_clear, x_lo, x_hi, net)

@@ -7,6 +7,7 @@ from collections import defaultdict
 from fypa.topology.constants import (
     GND_NET,
     GND_PORT_WIRE_STUB,
+    MIN_PARALLEL_GAP,
     PORT_WIRE_STUB,
     PORT_WIRE_STUB_MIN,
     WIRE_EPS,
@@ -17,11 +18,15 @@ from fypa.topology.types import TopologyPort
 
 
 def assign_stacked_stub_lengths(ports: list[TopologyPort]) -> None:
-    """Stagger horizontal stubs: shortest at the bottom, longest at the top."""
+    """Stagger horizontal stubs: shortest at the bottom, longest at the top.
+
+    Consecutive stub columns differ by at least ``MIN_PARALLEL_GAP`` so stacked
+    ports that drop vertically on their stub (bus on the far side of the body)
+    do not produce ``duplicate_vertical_x`` clashes.
+    """
     by_side: dict[str, list[TopologyPort]] = defaultdict(list)
     for port in ports:
         by_side[port.side].append(port)
-    span = PORT_WIRE_STUB - PORT_WIRE_STUB_MIN
     for side, group in by_side.items():
         del side  # length rank depends on y only; side sets stub direction in port_stub_x
         for port in group:
@@ -37,7 +42,7 @@ def assign_stacked_stub_lengths(ports: list[TopologyPort]) -> None:
         n = len(ordered)
         for i, port in enumerate(ordered):
             rank_from_bottom = (n - 1) - i
-            port.stub_length = PORT_WIRE_STUB_MIN + rank_from_bottom / max(n - 1, 1) * span
+            port.stub_length = PORT_WIRE_STUB_MIN + rank_from_bottom * MIN_PARALLEL_GAP
 
 
 def _port_vertical_bias(port: TopologyPort, role: str) -> str:

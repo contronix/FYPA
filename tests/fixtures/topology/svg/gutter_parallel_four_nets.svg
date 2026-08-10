@@ -1,18 +1,24 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="250" height="368" viewBox="0 0 250 368">
 <rect width="100%" height="100%" fill="#2b2b2b"/>
-<line x1="164" y1="111" x2="178" y2="111" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="24" y1="231" x2="178" y2="231" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="164" y1="111" x2="176" y2="111" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="176" y1="111" x2="178" y2="111" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="24" y1="146" x2="178" y2="146" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
 <line x1="24" y1="231" x2="36" y2="231" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="164" y1="93" x2="196" y2="93" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="20" y1="213" x2="196" y2="213" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="20" y1="213" x2="36" y2="213" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="164" y1="75" x2="214" y2="75" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="16" y1="195" x2="214" y2="195" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
-<line x1="16" y1="195" x2="36" y2="195" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="164" y1="93" x2="192" y2="93" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="192" y1="93" x2="196" y2="93" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="8" y1="130" x2="196" y2="130" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="8" y1="213" x2="36" y2="213" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="164" y1="75" x2="208" y2="75" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="208" y1="75" x2="214" y2="75" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="-8" y1="26" x2="214" y2="26" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
+<line x1="-8" y1="195" x2="36" y2="195" stroke="#ff3030" stroke-width="2" stroke-linecap="round"/>
 <line x1="24" y1="249" x2="36" y2="249" stroke="#088b00" stroke-width="2" stroke-linecap="round"/>
-<path d="M 178,111 V 189.5 A 5.5,5.5 0 0 1 178,200.5 V 207.5 A 5.5,5.5 0 0 1 178,218.5 V 231" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M 196,93 V 189.5 A 5.5,5.5 0 0 1 196,200.5 V 213" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M 214,75 V 195" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 178,111 V 124.5 A 5.5,5.5 0 0 1 178,135.5 V 146" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 24,146 V 189.5 A 5.5,5.5 0 0 1 24,200.5 V 207.5 A 5.5,5.5 0 0 1 24,218.5 V 231" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 196,93 V 130" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 8,130 V 189.5 A 5.5,5.5 0 0 1 8,200.5 V 213" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 214,26 V 75" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M -8,26 V 195" fill="none" stroke="#ff3030" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
 <path d="M 24,249 V 288" fill="none" stroke="#088b00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
 <line x1="24" y1="288" x2="24" y2="298" stroke="#909090" stroke-width="2" stroke-linecap="round"/>
 <line x1="10" y1="302" x2="38" y2="302" stroke="#909090" stroke-width="2" stroke-linecap="round"/>
@@ -45,10 +51,12 @@
 <text x="44" y="234" text-anchor="start" fill="#909090" font-family="Consolas,monospace" font-size="8">LED_B</text>
 <circle cx="36" cy="249" r="5" fill="#3aa8ff" stroke="#555555" stroke-width="1"/>
 <text x="44" y="252" text-anchor="start" fill="#909090" font-family="Consolas,monospace" font-size="8">GND</text>
-<rect x="172.5" y="87" width="31" height="12" fill="#2b2b2b" fill-opacity="0.5" stroke="none" rx="2"/>
-<text x="188" y="93" text-anchor="middle" dominant-baseline="middle" fill="#e6e6e6" font-family="Segoe UI,sans-serif" font-size="8">LED_G</text>
-<rect x="173.5" y="69" width="31" height="12" fill="#2b2b2b" fill-opacity="0.5" stroke="none" rx="2"/>
-<text x="189" y="75" text-anchor="middle" dominant-baseline="middle" fill="#e6e6e6" font-family="Segoe UI,sans-serif" font-size="8">LED_R</text>
+<g transform="translate(8,171.5)">
+<rect x="-8" y="-13.5" width="16" height="27" fill="#2b2b2b" fill-opacity="0.5" stroke="none" rx="2"/>
+<text transform="rotate(-90)" text-anchor="middle" dominant-baseline="middle" fill="#e6e6e6" font-family="Segoe UI,sans-serif" font-size="8">LED_G</text>
+</g>
+<rect x="177.1" y="69" width="31" height="12" fill="#2b2b2b" fill-opacity="0.5" stroke="none" rx="2"/>
+<text x="192.6" y="75" text-anchor="middle" dominant-baseline="middle" fill="#e6e6e6" font-family="Segoe UI,sans-serif" font-size="8">LED_R</text>
 <rect x="12" y="342" width="10" height="10" rx="2" fill="#ff3030"/>
 <text x="26" y="352" fill="#909090" font-family="Segoe UI,sans-serif" font-size="10">SOURCE</text>
 <rect x="90" y="342" width="10" height="10" rx="2" fill="#3aa8ff"/>

@@ -21,12 +21,12 @@ from fypa.topology.types import TopologyModel
 def build_topology_model(
     metadata: TopologyMetadata | None,
     *,
-    use_schematic_layout: bool = True,
+    use_schematic_layout: bool = False,
 ) -> TopologyModel:
     """Build a Flow diagram layout model for the PDN simulation schematic.
 
-    *use_schematic_layout* seeds column/order from Altium SchDoc placement when
-    coverage is sufficient (see ``schematic_seed_placement``).
+    Graph layout is primary. *use_schematic_layout* optionally seeds
+    within-column order from Altium SchDoc placement when coverage allows.
     """
     if metadata is None:
         return TopologyModel()

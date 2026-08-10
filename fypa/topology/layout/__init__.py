@@ -10,6 +10,7 @@ from fypa.topology.layout.stubs import assign_edge_wire_columns, assign_stacked_
 from fypa.topology.layout.vertical_align import _spec_layout_height
 from fypa.topology.layout_result import LayoutResult
 from fypa.topology.metadata.layout_bridge import (
+    orient_ports_toward_peers,
     orient_series_ports_for_columns,
     parse_topology_directives,
     specs_by_column,
@@ -36,14 +37,13 @@ __all__ = [
 def build_node_layout(
     metadata: TopologyMetadata | None,
     *,
-    use_schematic_layout: bool = True,
+    use_schematic_layout: bool = False,
 ) -> LayoutResult:
     """Parse metadata and place nodes; returns layout state for wire routing.
 
-    When *use_schematic_layout* is true and enough directives carry schematic
-    ``sch_x``/``sch_y``, column/order (and orientation-based port flips) are
-    seeded from the Altium sheet placement. Otherwise graph ``assign_columns``
-    is used unchanged.
+    Graph column packing and peer-facing ports are the primary layout path.
+    When *use_schematic_layout* is true and coverage allows, SchDoc coordinates
+    may refine within-column order (experimental hint only).
     """
     empty = LayoutResult(
         nodes=[],
@@ -87,13 +87,11 @@ def build_node_layout(
                             sec["port_defs"] = flip_port_defs(
                                 list(sec.get("port_defs") or []),
                             )
-            # Re-orient SERIES/RESISTOR faces for the seeded column map.
+            # Re-orient for the seeded column map; peer faces win over SchDoc
+            # mirror flips so flow direction stays consistent.
             orient_series_ports_for_columns(
                 node_specs, columns, parsed.net_to_rail,
             )
-            # Schematic mirror/rotation for SERIES after column-flow orient so
-            # we do not flip graph-oriented faces twice, and composites get
-            # their SERIES sections mirrored too.
             for spec in node_specs:
                 if not spec_has_series_role(spec):
                     continue
@@ -110,6 +108,7 @@ def build_node_layout(
                         sec["port_defs"] = flip_port_defs(
                             list(sec.get("port_defs") or []),
                         )
+            orient_ports_toward_peers(node_specs, columns, parsed.net_to_rail)
             heights = {s["node_id"]: _spec_layout_height(s) for s in node_specs}
             y_override = y_assign_from_orders(
                 node_specs,

@@ -144,7 +144,12 @@ def check_segment_spacing(
 
 
 def check_wires_through_foreign_nodes(model: TopologyModel) -> list[dict]:
-    """Per-wire segments must not cross foreign directive node bodies."""
+    """Per-wire segments must not cross directive node bodies.
+
+    Endpoint nodes are skipped for ordinary foreign-style checks (hub row buses
+    share a y with their ports). A separate *traverse* check still flags a
+    chord that enters one face of the owner and exits the opposite face.
+    """
     issues: list[dict] = []
     directive_nodes = [n for n in model.nodes if n.role != "GND"]
 
@@ -155,42 +160,47 @@ def check_wires_through_foreign_nodes(model: TopologyModel) -> list[dict]:
         points = parse_wire_path(wire.path_d)
         for seg in path_to_segments(wire.net, points):
             for node in directive_nodes:
-                if node.node_id in skip_nodes:
-                    continue
                 if seg.orient == "H":
                     y = seg.y1
                     x_lo, x_hi = min(seg.x1, seg.x2), max(seg.x1, seg.x2)
-                    if horizontal_crosses_node(node, y, x_lo, x_hi):
-                        issues.append(
-                            make_issue(
-                                "segment_through_foreign_node",
-                                (
-                                    f"Wire {wi} ({wire.net}) horizontal segment at "
-                                    f"y={y:.1f} crosses node {node.designator}"
-                                ),
-                                wire_id=wi,
-                                net=wire.net,
-                                node_id=node.node_id,
-                                y=round(y, 1),
-                            )
-                        )
+                    crosses = horizontal_crosses_node(node, y, x_lo, x_hi)
                 else:
                     x = seg.x1
                     y_lo, y_hi = min(seg.y1, seg.y2), max(seg.y1, seg.y2)
-                    if vertical_crosses_node(node, x, y_lo, y_hi):
-                        issues.append(
-                            make_issue(
-                                "segment_through_foreign_node",
-                                (
-                                    f"Wire {wi} ({wire.net}) vertical segment at "
-                                    f"x={x:.1f} crosses node {node.designator}"
-                                ),
-                                wire_id=wi,
-                                net=wire.net,
-                                node_id=node.node_id,
-                                x=round(x, 1),
-                            )
-                        )
+                    crosses = vertical_crosses_node(node, x, y_lo, y_hi)
+                if not crosses:
+                    continue
+                own = node.node_id in skip_nodes
+                if own:
+                    # Through-own-body: span covers both faces of the symbol.
+                    nx, ny, nw, nh = node.bounds
+                    if seg.orient == "H":
+                        traverses = x_lo < nx + WIRE_EPS and x_hi > nx + nw - WIRE_EPS
+                    else:
+                        traverses = y_lo < ny + WIRE_EPS and y_hi > ny + nh - WIRE_EPS
+                    if not traverses:
+                        continue
+                    code = "segment_through_own_node"
+                else:
+                    code = "segment_through_foreign_node"
+                payload = {
+                    "wire_id": wi,
+                    "net": wire.net,
+                    "node_id": node.node_id,
+                }
+                if seg.orient == "H":
+                    payload["y"] = round(y, 1)
+                    msg = (
+                        f"Wire {wi} ({wire.net}) horizontal segment at "
+                        f"y={y:.1f} crosses node {node.designator}"
+                    )
+                else:
+                    payload["x"] = round(x, 1)
+                    msg = (
+                        f"Wire {wi} ({wire.net}) vertical segment at "
+                        f"x={x:.1f} crosses node {node.designator}"
+                    )
+                issues.append(make_issue(code, msg, **payload))
     return issues
 
 

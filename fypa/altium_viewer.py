@@ -23668,15 +23668,16 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             btn.clicked.connect(slot)
             toolbar.addWidget(btn)
 
-        # Schematic-guided layout toggle (default on when coords exist).
-        self._topology_schematic_layout = True
+        # Schematic-guided layout toggle (experimental; graph layout is primary).
+        self._topology_schematic_layout = False
         sch_btn = QToolButton()
         sch_btn.setText("From schematic")
         sch_btn.setCheckable(True)
-        sch_btn.setChecked(True)
+        sch_btn.setChecked(False)
         sch_btn.setToolTip(
-            "When on, arrange topology columns/order from Altium schematic "
-            "placement (if available). When off, use net-graph auto layout."
+            "Experimental: arrange within-column order from Altium schematic "
+            "placement when coordinates exist. Off (default) uses net-graph "
+            "auto layout — preferred for readable PDN flow diagrams."
         )
         sch_btn.setCursor(Qt.PointingHandCursor)
         sch_btn.setStyleSheet(btn_qss)
@@ -23744,8 +23745,8 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             )
         else:
             btn.setToolTip(
-                "When on, arrange topology columns/order from Altium schematic "
-                "placement. When off, use net-graph auto layout."
+                "Experimental: arrange within-column order from Altium schematic "
+                "placement. Off (default) uses net-graph auto layout."
             )
 
     def _topology_zoom_in(self) -> None:
@@ -23796,7 +23797,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             return
 
         self._topology_update_schematic_btn(preview_md)
-        use_sch = bool(getattr(self, "_topology_schematic_layout", True))
+        use_sch = bool(getattr(self, "_topology_schematic_layout", False))
         btn = getattr(self, "_topology_schematic_btn", None)
         if btn is not None and not btn.isEnabled():
             use_sch = False

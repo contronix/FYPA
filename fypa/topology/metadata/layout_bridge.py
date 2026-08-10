@@ -67,6 +67,94 @@ def _compact_columns(col: dict[str, int]) -> dict[str, int]:
     return {nid: remap[c] for nid, c in col.items()}
 
 
+# Soft safety cap after connectivity packing. Long SERIES chains otherwise open
+# one column per hop; ranks stay ordered left→right when compressed.
+GRAPH_LAYOUT_MAX_COLUMNS = 8
+
+
+def compress_column_ranks(
+    columns: dict[str, int],
+    max_cols: int,
+) -> dict[str, int]:
+    """Bucket ordered column ranks into at most *max_cols* shared columns."""
+    if max_cols < 1 or not columns:
+        return _compact_columns(columns)
+    used = sorted(set(columns.values()))
+    if len(used) <= max_cols:
+        return _compact_columns(columns)
+    n = len(used)
+    remap = {
+        old: int(round(i / (n - 1) * (max_cols - 1)))
+        for i, old in enumerate(used)
+    }
+    return {nid: remap[c] for nid, c in columns.items()}
+
+
+def _column_roles(
+    node_specs: list[NodeSpec],
+    col: dict[str, int],
+) -> dict[int, set[str]]:
+    by_col: dict[int, set[str]] = defaultdict(set)
+    for s in node_specs:
+        by_col[col.get(s["node_id"], 0)].add(s["role"])
+    return by_col
+
+
+def _merge_adjacent_passive_columns(
+    node_specs: list[NodeSpec],
+    col: dict[str, int],
+) -> dict[str, int]:
+    """Merge consecutive columns that contain only SERIES/RESISTOR nodes.
+
+    Hop-depth assignment often isolates each fuse/ferrite in its own column;
+    sharing those columns keeps the diagram dense without SchDoc hints.
+    """
+    out = dict(col)
+    passive = {"SERIES", "RESISTOR"}
+    while True:
+        roles = _column_roles(node_specs, out)
+        used = sorted(roles)
+        merged = False
+        for i in range(1, len(used)):
+            left, right = used[i - 1], used[i]
+            if not roles[left] or not roles[right]:
+                continue
+            if roles[left] <= passive and roles[right] <= passive:
+                for nid, c in list(out.items()):
+                    if c == right:
+                        out[nid] = left
+                out = _compact_columns(out)
+                merged = True
+                break
+        if not merged:
+            break
+    return out
+
+
+def _pin_source_sink_columns(
+    node_specs: list[NodeSpec],
+    col: dict[str, int],
+    mixed_role_ids: set[str],
+) -> dict[str, int]:
+    """SOURCE → column 0; pure SINK → rightmost occupied column."""
+    out = dict(col)
+    for s in node_specs:
+        if s["role"] == "SOURCE":
+            out[s["node_id"]] = 0
+    has_source = any(s["role"] == "SOURCE" for s in node_specs)
+    has_sink = any(
+        s["role"] == "SINK" and s["node_id"] not in mixed_role_ids
+        for s in node_specs
+    )
+    sink_col = max(out.values(), default=0)
+    if has_source and has_sink and sink_col == 0:
+        sink_col = 1
+    for s in node_specs:
+        if s["role"] == "SINK" and s["node_id"] not in mixed_role_ids:
+            out[s["node_id"]] = sink_col
+    return _compact_columns(out)
+
+
 def _has_source_rail_p_input(
     spec: NodeSpec,
     source_ids: set[str],
@@ -770,6 +858,9 @@ def assign_columns(
             if s["role"] == "SINK" and s["node_id"] not in mixed_role_ids:
                 col[s["node_id"]] = sink_col
 
+    col = compress_column_ranks(col, GRAPH_LAYOUT_MAX_COLUMNS)
+    col = _pin_source_sink_columns(node_specs, col, mixed_role_ids)
+
     # Orient each SERIES/RESISTOR so the terminal carrying the downstream loads
     # faces right. Peers are keyed by *resolved physical net* (not the canonical
     # rail — 0-Ω bridges merge a resistor's two nets onto one rail, which would
@@ -778,6 +869,9 @@ def assign_columns(
     # the P side, so the default P-left is correct and must stay).
     orient_series_ports_for_columns(
         node_specs, col, net_to_rail, loop_parent, outputs_by_net, inputs_by_net,
+    )
+    orient_ports_toward_peers(
+        node_specs, col, net_to_rail, loop_parent=loop_parent,
     )
 
     return _compact_columns(col)
@@ -862,6 +956,71 @@ def orient_series_ports_for_columns(
             ]
 
 
+def orient_ports_toward_peers(
+    node_specs: list[NodeSpec],
+    col: dict[str, int],
+    net_to_rail: dict[str, str],
+    *,
+    loop_parent: dict[str, str] | None = None,
+) -> None:
+    """Face each non-GND port toward its connected peers' columns (in place).
+
+    Loop-SERIES children keep the dedicated all-on-one-face rule from
+    :func:`_orient_loop_series_ports` and are skipped here. Same-column peers
+    leave the existing side unchanged.
+    """
+    del net_to_rail  # peers keyed by resolved physical nets already on specs
+    loop_parent = loop_parent or {}
+    wnet_cols: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for s in node_specs:
+        for rp in (s.get("resolved_ports") or {}).values():
+            if rp.wnet and rp.wnet != GND_NET:
+                wnet_cols[rp.wnet].append((s["node_id"], col.get(s["node_id"], 0)))
+
+    for s in node_specs:
+        nid = s["node_id"]
+        if nid in loop_parent:
+            continue
+        self_col = col.get(nid, 0)
+        rports = s.get("resolved_ports") or {}
+        new_defs = []
+        changed = False
+        for pname, side, sort_key in s["port_defs"]:
+            rp = rports.get(pname)
+            if rp is None or not rp.wnet or rp.wnet == GND_NET:
+                new_defs.append((pname, side, sort_key))
+                continue
+            peer_cols = [c for oid, c in wnet_cols.get(rp.wnet, []) if oid != nid]
+            if not peer_cols:
+                new_defs.append((pname, side, sort_key))
+                continue
+            left_n = sum(1 for c in peer_cols if c < self_col)
+            right_n = sum(1 for c in peer_cols if c > self_col)
+            # Only commit when peers sit exclusively on one side; mixed or
+            # same-column peers keep the existing face (hub rows, taps).
+            if left_n > 0 and right_n == 0:
+                new_side = "left"
+            elif right_n > 0 and left_n == 0:
+                new_side = "right"
+            else:
+                new_defs.append((pname, side, sort_key))
+                continue
+            if new_side != side:
+                changed = True
+            new_defs.append((pname, new_side, sort_key))
+        if changed:
+            s["port_defs"] = new_defs
+            # Keep composite section faces in sync for non-SERIES sections.
+            for sec in s.get("sections") or []:
+                if sec.get("role") in ("SERIES", "RESISTOR"):
+                    continue
+                sec_defs = []
+                for pname, side, sort_key in sec.get("port_defs") or []:
+                    match = next((d for d in new_defs if d[0] == pname), None)
+                    sec_defs.append(match if match is not None else (pname, side, sort_key))
+                sec["port_defs"] = sec_defs
+
+
 def specs_by_column(
     node_specs: list[NodeSpec],
     columns: dict[str, int],
@@ -938,11 +1097,14 @@ def is_return_port_row(sort_key: int) -> bool:
 
 
 __all__ = [
+    "GRAPH_LAYOUT_MAX_COLUMNS",
     "ParsedLayoutInput",
     "ResolvedPort",
     "assign_columns",
+    "compress_column_ranks",
     "is_return_port_row",
     "jump_row_for_directive",
+    "orient_ports_toward_peers",
     "orient_series_ports_for_columns",
     "parse_topology_directives",
     "specs_by_column",

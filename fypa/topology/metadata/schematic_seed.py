@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 
+from fypa.topology.metadata.layout_bridge import compress_column_ranks
 from fypa.topology.metadata.specs import spec_has_series_role
 from fypa.topology.metadata_schema import NodeSpec, PortDef, TopologyMetadata
 
@@ -150,28 +151,6 @@ def _compact_columns(columns: dict[str, int]) -> dict[str, int]:
     return {nid: remap[c] for nid, c in columns.items()}
 
 
-def _compress_column_ranks(
-    columns: dict[str, int],
-    max_cols: int,
-) -> dict[str, int]:
-    """Bucket ordered column ranks into at most *max_cols* shared columns.
-
-    Preserves left-to-right order of the backbone ranks while eliminating the
-    sparse one-node-per-column chains that make large boards unreadably wide.
-    """
-    if max_cols < 1:
-        return _compact_columns(columns)
-    used = sorted(set(columns.values()))
-    if len(used) <= max_cols:
-        return _compact_columns(columns)
-    n = len(used)
-    remap = {
-        old: int(round(i / (n - 1) * (max_cols - 1)))
-        for i, old in enumerate(used)
-    }
-    return {nid: remap[c] for nid, c in columns.items()}
-
-
 def _apply_source_sink_columns(
     node_specs: list[NodeSpec],
     columns: dict[str, int],
@@ -300,7 +279,7 @@ def schematic_seed_placement(
         for spec in missing:
             columns[spec["node_id"]] = right
 
-    columns = _compress_column_ranks(columns, SCHEMATIC_MAX_COLUMNS)
+    columns = compress_column_ranks(columns, SCHEMATIC_MAX_COLUMNS)
     columns = _apply_source_sink_columns(node_specs, columns)
 
     # Within-column order: schematic Y (Altium Y up), then sheet rank, then id.

@@ -11,6 +11,23 @@ from fypa.topology.routing.context import RoutingContext
 from fypa.topology.types import TopologyNode
 
 
+def _horizontal_run_blocked_by_node(
+    node: TopologyNode,
+    y: float,
+    x_lo: float,
+    x_hi: float,
+    skip: set[str],
+) -> bool:
+    """True when ``node`` blocks a horizontal run (including full endpoint traversal)."""
+    lo, hi = min(x_lo, x_hi), max(x_lo, x_hi)
+    if not horizontal_crosses_node(node, y, lo, hi):
+        return False
+    if node.node_id not in skip:
+        return True
+    nx, _ny, nw, _nh = node.bounds
+    return lo < nx + WIRE_EPS and hi > nx + nw - WIRE_EPS
+
+
 def detour_y_for_horizontal(
     y_nominal: float,
     x_lo: float,
@@ -21,9 +38,7 @@ def detour_y_for_horizontal(
     blocked_bottom = y_nominal
     any_block = False
     for node in obstacles:
-        if node.node_id in skip:
-            continue
-        if horizontal_crosses_node(node, y_nominal, x_lo, x_hi):
+        if _horizontal_run_blocked_by_node(node, y_nominal, x_lo, x_hi, skip):
             any_block = True
             blocked_bottom = max(blocked_bottom, node.y + node.height)
     if not any_block:
@@ -42,9 +57,7 @@ def detour_y_for_horizontal_upward(
     blocked_top = y_nominal
     any_block = False
     for node in obstacles:
-        if node.node_id in skip:
-            continue
-        if horizontal_crosses_node(node, y_nominal, x_lo, x_hi):
+        if _horizontal_run_blocked_by_node(node, y_nominal, x_lo, x_hi, skip):
             any_block = True
             blocked_top = min(blocked_top, node.y)
     if not any_block:
@@ -59,11 +72,10 @@ def _blocking_nodes(
     obstacles: list[TopologyNode],
     skip: set[str],
 ) -> list[TopologyNode]:
-    lo, hi = min(x_lo, x_hi), max(x_lo, x_hi)
     return [
         node
         for node in obstacles
-        if node.node_id not in skip and horizontal_crosses_node(node, y_nominal, lo, hi)
+        if _horizontal_run_blocked_by_node(node, y_nominal, x_lo, x_hi, skip)
     ]
 
 
@@ -237,12 +249,15 @@ def horizontal_segment_clear(
     obstacles: list[TopologyNode],
     skip: set[str],
 ) -> bool:
-    for node in obstacles:
-        if node.node_id in skip:
-            continue
-        if horizontal_crosses_node(node, y, x_lo, x_hi):
-            return False
-    return True
+    """True when a horizontal run does not cut a blocking node body.
+
+    Nodes in ``skip`` (typically wire endpoints) may be touched at a port face,
+    but a chord that enters one face and exits the opposite face is still
+    blocked — matching ``segment_through_own_node`` validation.
+    """
+    return not any(
+        _horizontal_run_blocked_by_node(node, y, x_lo, x_hi, skip) for node in obstacles
+    )
 
 
 def trunk_vertical_clear(
