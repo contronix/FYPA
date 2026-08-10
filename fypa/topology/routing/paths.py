@@ -96,8 +96,6 @@ def clear_outward_stub_x(
                 break
         if _stub_column_clear(port, x, y, y_via, ctx, net, obstacles):
             return x
-    if _stub_column_clear(port, port.x, y, y_via, ctx, net, obstacles):
-        return port.x
     return None
 
 
@@ -146,24 +144,17 @@ def _hub_detour_via_clear_stub(
                 f"V {y_clear:.1f} H {bus_x:.1f}"
             )
         else:
-            # Port face is clear; prefer a micro stub when that H is free.
+            # Prefer a micro stub over climbing on the symbol face.
             micro = outward_escape_stub_x(port)
-            if _stub_column_clear(port, micro, y, y_clear, ctx, net, obstacles):
-                ctx.reserve_horizontal(y, min(port.x, micro), max(port.x, micro), net)
-                ctx.reserve_vertical(micro, min(y, y_clear), max(y, y_clear), net)
-                ctx.reserve_horizontal(
-                    y_clear, min(micro, bus_x), max(micro, bus_x), net,
-                )
-                path = (
-                    f"M {port.x:.1f},{y:.1f} H {micro:.1f} "
-                    f"V {y_clear:.1f} H {bus_x:.1f}"
-                )
-            else:
-                ctx.reserve_vertical(port.x, min(y, y_clear), max(y, y_clear), net)
-                ctx.reserve_horizontal(
-                    y_clear, min(port.x, bus_x), max(port.x, bus_x), net,
-                )
-                path = f"M {port.x:.1f},{y:.1f} V {y_clear:.1f} H {bus_x:.1f}"
+            ctx.reserve_horizontal(y, min(port.x, micro), max(port.x, micro), net)
+            ctx.reserve_vertical(micro, min(y, y_clear), max(y, y_clear), net)
+            ctx.reserve_horizontal(
+                y_clear, min(micro, bus_x), max(micro, bus_x), net,
+            )
+            path = (
+                f"M {port.x:.1f},{y:.1f} H {micro:.1f} "
+                f"V {y_clear:.1f} H {bus_x:.1f}"
+            )
         return simplify_wire_path(path), y_clear
     return None
 
@@ -774,25 +765,14 @@ def hub_tap_path(
             return detoured
         # Connectivity last resort: never replay the long port→attach stub on a
         # foreign-owned port row — only a clearance-checked climb column.
+        # Prefer the outward stub / gutter; never climb on the symbol face.
         micro = outward_escape_stub_x(port)
         climb: float | None = None
         if _stub_column_clear(port, micro, y, y_clear, ctx, net, obstacles):
             climb = micro
-        elif _stub_column_clear(port, port.x, y, y_clear, ctx, net, obstacles):
-            climb = port.x
         else:
-            # Ignore foreign H only when the climb is at the port face (no stub
-            # H). Outward climb columns must still clear foreign H on the port row.
             outward = -1.0 if port.side == "left" else 1.0
             step_px = MIN_PARALLEL_GAP / 2.0
-            face_v_clear = (
-                not _foreign_vertical_blocks_column(
-                    ctx, port.x, min(y, y_clear), max(y, y_clear), net,
-                )
-                and trunk_vertical_clear(
-                    port.x, min(y, y_clear), max(y, y_clear), obstacles, {port.node_id},
-                )
-            )
             for step in range(0, 24):
                 x = round(outward_escape_stub_x(port) + outward * step_px * step, 1)
                 y_lo, y_hi = min(y, y_clear), max(y, y_clear)
@@ -806,11 +786,9 @@ def hub_tap_path(
                     continue
                 climb = x
                 break
-            if climb is None and face_v_clear:
-                climb = port.x
-        if climb is None:
-            # Last connectivity hook: climb at the port face even if contested.
-            climb = port.x
+            if climb is None:
+                # Keep connectivity off the face even when corridors conflict.
+                climb = micro
         if abs(climb - port.x) > WIRE_EPS:
             ctx.reserve_horizontal(y, min(port.x, climb), max(port.x, climb), net)
         ctx.reserve_vertical(climb, min(y, y_clear), max(y, y_clear), net)

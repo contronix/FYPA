@@ -418,6 +418,53 @@ def test_multi_column_gutter_does_not_inflate_every_gap():
     assert max(gaps) < NODE_W + 2 * COL_GAP
 
 
+def test_dotted_series_chain_is_not_collapsed_by_family_align():
+    """Pure SERIES hops that share a designator stem keep driver→load order."""
+    from fypa.topology.metadata.layout_bridge import (
+        _enrich_resolved_ports,
+        assign_columns,
+    )
+
+    src = _spec(
+        "J1",
+        role="SOURCE",
+        ports=[("P", "right", 0)],
+        terms={"P": {"requested_net": "VIN", "pins": [{"net": "VIN", "pad": "1"}]}},
+    )
+    driver = _spec(
+        "R1",
+        role="RESISTOR",
+        ports=[("P", "left", 0), ("N", "right", 1)],
+        terms={
+            "P": {"requested_net": "VIN", "pins": [{"net": "VIN", "pad": "1"}]},
+            "N": {"requested_net": "VMID", "pins": [{"net": "VMID", "pad": "2"}]},
+        },
+    )
+    shallow = _spec(
+        "U1.1",
+        role="RESISTOR",
+        ports=[("P", "left", 0), ("N", "right", 1)],
+        terms={
+            "P": {"requested_net": "VMID", "pins": [{"net": "VMID", "pad": "1"}]},
+            "N": {"requested_net": "VOUT1", "pins": [{"net": "VOUT1", "pad": "2"}]},
+        },
+    )
+    deep = _spec(
+        "U1.2",
+        role="RESISTOR",
+        ports=[("P", "left", 0), ("N", "right", 1)],
+        terms={
+            "P": {"requested_net": "VOUT1", "pins": [{"net": "VOUT1", "pad": "1"}]},
+            "N": {"requested_net": "VOUT2", "pins": [{"net": "VOUT2", "pad": "2"}]},
+        },
+    )
+    specs = [src, driver, shallow, deep]
+    for s in specs:
+        _enrich_resolved_ports(s)
+    cols = assign_columns(specs, {})
+    assert cols["R1"] < cols["U1.1"] < cols["U1.2"], cols
+
+
 def test_regulator_load_sits_right_of_series_driver():
     """REGULATOR on a SERIES N-output must not share the driver's column."""
     from fypa.topology.metadata.layout_bridge import (

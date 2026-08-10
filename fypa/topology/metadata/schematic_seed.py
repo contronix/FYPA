@@ -195,13 +195,6 @@ def _apply_source_sink_columns(
         sink_col += 1
     for nid in pin_ids:
         out[nid] = sink_col
-    if has_source:
-        for s in node_specs:
-            nid = s["node_id"]
-            if nid not in exempt or s["role"] == "SOURCE":
-                continue
-            if out.get(nid, 0) == 0:
-                out[nid] = 1
     return _compact_columns(out)
 
 

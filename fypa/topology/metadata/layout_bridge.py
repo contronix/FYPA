@@ -195,15 +195,6 @@ def _pin_source_sink_columns(
         sink_col = 1
     for nid in pin_ids:
         out[nid] = sink_col
-    # Multi-section / mixed non-SOURCE nodes keep graph rank, but must not sit
-    # in the SOURCE column when a SOURCE is present.
-    if has_source:
-        for s in node_specs:
-            nid = s["node_id"]
-            if nid not in exempt or s["role"] == "SOURCE":
-                continue
-            if out.get(nid, 0) == 0:
-                out[nid] = 1
     return _compact_columns(out)
 
 
@@ -408,22 +399,25 @@ def _dotted_designator_family(designator: str) -> str | None:
 def _align_dotted_family_columns(
     node_specs: list[NodeSpec],
     col: dict[str, int],
+    align_ids: set[str],
 ) -> None:
-    """Keep dotted sub-symbols (``U27.1``/``.2``/``.3``) in one shared column.
+    """Keep dotted composite sub-symbols in one shared column.
 
     Propagation depth can push one channel further right than its siblings; the
     family then collides with last-column sink loads that need a free gutter to
     the composite's series outputs. Park the whole family at the leftmost rank
-    any member already occupies.
+    any member already occupies. Pure SERIES hop chains that share a designator
+    stem are left alone so driver→load order stays intact.
     """
     families: dict[str, list[str]] = defaultdict(list)
     for spec in node_specs:
-        fam = _dotted_designator_family(spec.get("designator") or spec["node_id"])
+        nid = spec["node_id"]
+        if nid not in align_ids or nid not in col:
+            continue
+        fam = _dotted_designator_family(spec.get("designator") or nid)
         if fam is None:
             continue
-        nid = spec["node_id"]
-        if nid in col:
-            families[fam].append(nid)
+        families[fam].append(nid)
     for ids in families.values():
         if len(ids) < 2:
             continue
@@ -479,11 +473,16 @@ def _restore_column_invariants(
     node_specs: list[NodeSpec],
     col: dict[str, int],
     mixed_role_ids: set[str],
+    outputs_by_net: dict[str, list[str]],
     inputs_by_net: dict[str, list[str]],
     loop_parent: dict[str, str],
 ) -> dict[str, int]:
-    """Family-align, then restore regulator/sink invariants that align can undo."""
-    _align_dotted_family_columns(node_specs, col)
+    """Family-align composites, then restore driver/load/sink invariants."""
+    align_ids = mixed_role_ids | _multi_section_node_ids(node_specs)
+    _align_dotted_family_columns(node_specs, col, align_ids)
+    _ensure_passives_right_of_upstream(
+        node_specs, col, outputs_by_net, loop_parent,
+    )
     _ensure_loads_right_of_series_drivers(
         node_specs, col, inputs_by_net, loop_parent,
     )
@@ -1063,7 +1062,7 @@ def assign_columns(
     # REGULATOR loads on a SERIES N-output must sit right of the bridge.
     # Family align can pull a dotted regulator left again — restore after align.
     col = _restore_column_invariants(
-        node_specs, col, mixed_role_ids, inputs_by_net, loop_parent,
+        node_specs, col, mixed_role_ids, outputs_by_net, inputs_by_net, loop_parent,
     )
 
     # Orient each SERIES/RESISTOR so the terminal carrying the downstream loads
