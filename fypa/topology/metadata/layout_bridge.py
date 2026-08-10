@@ -323,43 +323,38 @@ def _apply_passive_column_col(
         col[nid] = max(min(downstream_cols), col.get(nid, 0))
 
 
-def _bump_passives_past_active_drivers(
+def _ensure_passives_right_of_upstream(
     node_specs: list[NodeSpec],
     col: dict[str, int],
     outputs_by_net: dict[str, list[str]],
     loop_parent: dict[str, str],
-    role_by_id: dict[str, str],
 ) -> None:
-    """Ensure SERIES sit right of REGULATOR/SOURCE drivers after rank compression.
+    """After rank compression, restore driver→load order for every SERIES.
 
-    ``compress_column_ranks`` may co-locate an inductor with its switcher; that
-    must be undone. SERIES→SERIES packing from compression is left intact.
+    Compression may co-locate a SERIES driver with its SERIES load; the load's
+    left port then faces away from the driver. Iterate until every passive sits
+    strictly right of all P-side upstream drivers (any role).
     """
-    passive = {"SERIES", "RESISTOR"}
-    for s in node_specs:
-        if not spec_has_series_role(s):
-            continue
-        nid = s["node_id"]
-        if nid in loop_parent:
-            continue
-        active_up: list[int] = []
-        for pname, term in spec_series_terms(s):
-            if not term or is_ideal_return(term) or not pname.startswith("P"):
+    changed = True
+    guard = 0
+    while changed and guard < len(node_specs) * 2 + 5:
+        guard += 1
+        changed = False
+        for s in node_specs:
+            if not spec_has_series_role(s):
                 continue
-            flow_net = _column_flow_net(term)
-            if not flow_net:
+            nid = s["node_id"]
+            if nid in loop_parent:
                 continue
-            for pid in outputs_by_net.get(flow_net, []):
-                if pid == nid or loop_parent.get(pid) == nid:
-                    continue
-                if role_by_id.get(pid) in passive:
-                    continue
-                active_up.append(col.get(pid, 0))
-        if not active_up:
-            continue
-        need = max(active_up) + 1
-        if col.get(nid, 0) < need:
-            col[nid] = need
+            upstream = _passive_upstream_cols(
+                s, nid, outputs_by_net, col, loop_parent,
+            )
+            if not upstream:
+                continue
+            need = max(upstream) + 1
+            if col.get(nid, 0) < need:
+                col[nid] = need
+                changed = True
 
 
 def _dedupe_port_rows_on_same_side(
@@ -930,10 +925,10 @@ def assign_columns(
     col = _pin_source_sink_columns(node_specs, col, mixed_role_ids)
     col = _merge_adjacent_passive_columns(node_specs, col, loop_parent)
     col = _pin_source_sink_columns(node_specs, col, mixed_role_ids)
-    # Rank bucketing can co-locate a REGULATOR with its LX inductor; push only
-    # those passives past active (non-series) drivers — do not unpack SERIES chains.
-    _bump_passives_past_active_drivers(
-        node_specs, col, outputs_by_net, loop_parent, role_by_id,
+    # Rank bucketing can co-locate a driver with its SERIES load. Restore
+    # strict left→right flow for every P-side upstream.
+    _ensure_passives_right_of_upstream(
+        node_specs, col, outputs_by_net, loop_parent,
     )
     col = _compact_columns(col)
     col = _pin_source_sink_columns(node_specs, col, mixed_role_ids)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from fypa.topology.constants import WIRE_EPS
+from fypa.topology.constants import MIN_PARALLEL_GAP, WIRE_EPS
 from fypa.topology.geometry import parse_wire_path, simplify_wire_path
 from fypa.topology.placement import port_stub_x
 from fypa.topology.routing.context import RoutingContext
@@ -242,18 +242,52 @@ def _connect_row_to_bus(
             trunk_y = plan.y_row if abs(y_feed - plan.y_row) <= WIRE_EPS else y_feed
             return trunk_y, path_d
 
-    # Every clear candidate was blocked by foreign wiring. Leaving the row
-    # detached from the trunk is electrically wrong, so force a connection that
-    # still detours physical symbol bodies. It may cross a foreign wire (a
-    # validation warning), but connectivity must never be silently dropped.
+    # Every clear candidate was blocked (obstacle and/or foreign band). Never
+    # fall back onto a still-blocked nominal row — keep the obstacle/band
+    # detour even when the feed must climb before reaching the trunk.
     y_forced = obstacle_detour_y(ctx, plan.y_row, lo, hi, obstacles, row_skip, net)
     if abs(y_forced - plan.y_row) > WIRE_EPS:
         y_lo, y_hi = min(plan.y_row, y_forced), max(plan.y_row, y_forced)
-        ctx.reserve_vertical(edge_x, y_lo, y_hi, net)
-        ctx.reserve_horizontal(y_forced, lo, hi, net)
-        return y_forced, simplify_wire_path(
-            f"M {edge_x:.1f},{plan.y_row:.1f} V {y_forced:.1f} H {bus_x:.1f}",
+        if not _foreign_vertical_blocks_column(ctx, edge_x, y_lo, y_hi, net):
+            ctx.reserve_vertical(edge_x, y_lo, y_hi, net)
+            ctx.reserve_horizontal(y_forced, lo, hi, net)
+            return y_forced, simplify_wire_path(
+                f"M {edge_x:.1f},{plan.y_row:.1f} V {y_forced:.1f} H {bus_x:.1f}",
+            )
+
+    if _foreign_horizontal_blocks_row(ctx, plan.y_row, lo, hi, net):
+        # Try both directions; keep the first feed whose climb column is clear.
+        for sign in (1.0, -1.0):
+            y_seed = plan.y_row + sign * MIN_PARALLEL_GAP
+            y_nudge = obstacle_detour_y(ctx, y_seed, lo, hi, obstacles, row_skip, net)
+            if abs(y_nudge - plan.y_row) <= WIRE_EPS:
+                continue
+            if _foreign_horizontal_blocks_row(ctx, y_nudge, lo, hi, net):
+                continue
+            y_lo, y_hi = min(plan.y_row, y_nudge), max(plan.y_row, y_nudge)
+            if _foreign_vertical_blocks_column(ctx, edge_x, y_lo, y_hi, net):
+                continue
+            if not trunk_vertical_clear(edge_x, y_lo, y_hi, obstacles, set()):
+                continue
+            ctx.reserve_vertical(edge_x, y_lo, y_hi, net)
+            ctx.reserve_horizontal(y_nudge, lo, hi, net)
+            return y_nudge, simplify_wire_path(
+                f"M {edge_x:.1f},{plan.y_row:.1f} V {y_nudge:.1f} H {bus_x:.1f}",
+            )
+        # Still blocked: attach with a forced downward nudge so the net stays
+        # connected; prefer overwriting a gap rather than the foreign row itself.
+        y_nudge = obstacle_detour_y(
+            ctx, plan.y_row + MIN_PARALLEL_GAP, lo, hi, obstacles, row_skip, net,
         )
+        if abs(y_nudge - plan.y_row) <= WIRE_EPS:
+            y_nudge = plan.y_row + MIN_PARALLEL_GAP
+        y_lo, y_hi = min(plan.y_row, y_nudge), max(plan.y_row, y_nudge)
+        ctx.reserve_vertical(edge_x, y_lo, y_hi, net)
+        ctx.reserve_horizontal(y_nudge, lo, hi, net)
+        return y_nudge, simplify_wire_path(
+            f"M {edge_x:.1f},{plan.y_row:.1f} V {y_nudge:.1f} H {bus_x:.1f}",
+        )
+
     ctx.reserve_horizontal(
         plan.y_row,
         min(plan.span_lo, bus_x),

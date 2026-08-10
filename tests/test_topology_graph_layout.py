@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from fypa.topology.metadata.layout_bridge import (
-    GRAPH_LAYOUT_MAX_COLUMNS,
     assign_columns,
     compress_column_ranks,
     orient_ports_toward_peers,
@@ -46,7 +45,7 @@ def test_compress_column_ranks_buckets_sparse_chain():
 
 
 def test_assign_columns_packs_long_series_chain():
-    """A long SERIES hop chain must not open one column per part."""
+    """A long SERIES hop chain keeps left→right flow without index holes."""
     specs = [
         _spec(
             "SRC",
@@ -93,16 +92,49 @@ def test_assign_columns_packs_long_series_chain():
             },
         ),
     )
-    # Enrich resolved_ports like parse_topology_directives would.
     from fypa.topology.metadata.layout_bridge import _enrich_resolved_ports
 
     for s in specs:
         _enrich_resolved_ports(s)
     col = assign_columns(specs, {})
-    assert max(col.values()) < 10
-    assert max(col.values()) <= GRAPH_LAYOUT_MAX_COLUMNS - 1
     assert col["SRC"] == 0
     assert col["SNK"] == max(col.values())
+    assert set(col.values()) == set(range(max(col.values()) + 1))
+    for i in range(2, 10):
+        assert col[f"R{i}"] >= col[f"R{i - 1}"], col
+    # Soft packing still bounds extreme width; flow order wins over a hard cap.
+    assert max(col.values()) <= 12
+
+
+def test_series_load_sits_right_of_series_driver():
+    """Downstream SERIES must not share a column with its SERIES driver."""
+    from fypa.topology.metadata.layout_bridge import (
+        _enrich_resolved_ports,
+        assign_columns,
+    )
+
+    driver = _spec(
+        "R_DRV",
+        role="RESISTOR",
+        ports=[("P", "left", 0), ("N", "right", 1)],
+        terms={
+            "P": {"requested_net": "VIN", "pins": [{"net": "VIN", "pad": "1"}]},
+            "N": {"requested_net": "VMID", "pins": [{"net": "VMID", "pad": "2"}]},
+        },
+    )
+    load = _spec(
+        "R_LOAD",
+        role="RESISTOR",
+        ports=[("P", "left", 0), ("N", "right", 1)],
+        terms={
+            "P": {"requested_net": "VMID", "pins": [{"net": "VMID", "pad": "1"}]},
+            "N": {"requested_net": "VOUT", "pins": [{"net": "VOUT", "pad": "2"}]},
+        },
+    )
+    for s in (driver, load):
+        _enrich_resolved_ports(s)
+    cols = assign_columns([driver, load], {})
+    assert cols["R_DRV"] < cols["R_LOAD"], cols
 
 
 def test_orient_ports_toward_peers_faces_neighbor_column():

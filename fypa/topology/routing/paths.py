@@ -17,7 +17,9 @@ from fypa.topology.routing.obstacles import (
     foreign_vertical_covers_y,
     horizontal_segment_clear,
     obstacle_detour_y,
+    obstacle_detour_y_candidates,
     shift_x_clear_of_vertical_obstacles,
+    trunk_vertical_clear,
 )
 from fypa.topology.types import TopologyNode, TopologyPort
 
@@ -33,6 +35,137 @@ def outward_escape_stub_x(port: TopologyPort) -> float:
     if port.side == "left":
         return port.x - PORT_WIRE_STUB
     return port.x + PORT_WIRE_STUB
+
+
+def _stub_column_clear(
+    port: TopologyPort,
+    x: float,
+    y: float,
+    y_via: float,
+    ctx: RoutingContext,
+    net: str,
+    obstacles: list[TopologyNode],
+) -> bool:
+    """True when ``x`` may host a climb ``y↔y_via`` with a clear stub H at ``y``."""
+    skip = {port.node_id}
+    y_lo, y_hi = min(y, y_via), max(y, y_via)
+    if _foreign_vertical_blocks_column(ctx, x, y_lo, y_hi, net):
+        return False
+    if not trunk_vertical_clear(x, y_lo, y_hi, obstacles, skip):
+        return False
+    lo, hi = min(port.x, x), max(port.x, x)
+    if abs(hi - lo) > WIRE_EPS:
+        if not horizontal_segment_clear(y, lo, hi, obstacles, skip):
+            return False
+        if _foreign_horizontal_blocks_row(ctx, y, lo, hi, net):
+            return False
+    return True
+
+
+def clear_outward_stub_x(
+    port: TopologyPort,
+    y: float,
+    y_via: float,
+    ctx: RoutingContext,
+    net: str,
+    obstacles: list[TopologyNode],
+    *,
+    toward_x: float | None = None,
+) -> float | None:
+    """Stub/climb column clear for a vertical ``y↔y_via`` and stub H at ``y``.
+
+    Walks from the short outward stub further *outward* (away from the body).
+    When ``toward_x`` lies on the opposite face, it is ignored so the walk never
+    steps through the symbol body. Also accepts the port face when that column
+    itself is foreign-clear. Returns ``None`` when no safe column exists.
+    """
+    outward = -1.0 if port.side == "left" else 1.0
+    if toward_x is not None:
+        toward_dir = -1.0 if toward_x < port.x - WIRE_EPS else (
+            1.0 if toward_x > port.x + WIRE_EPS else outward
+        )
+        if toward_dir != outward:
+            toward_x = None
+    step_px = MIN_PARALLEL_GAP / 2.0
+    for step in range(0, 16):
+        x = round(outward_escape_stub_x(port) + outward * step_px * step, 1)
+        if toward_x is not None:
+            if outward < 0 and x < toward_x - WIRE_EPS:
+                break
+            if outward > 0 and x > toward_x + WIRE_EPS:
+                break
+        if _stub_column_clear(port, x, y, y_via, ctx, net, obstacles):
+            return x
+    if _stub_column_clear(port, port.x, y, y_via, ctx, net, obstacles):
+        return port.x
+    return None
+
+
+def _hub_detour_via_clear_stub(
+    port: TopologyPort,
+    bus_x: float,
+    y: float,
+    y_nominal_clear: float,
+    ctx: RoutingContext,
+    net: str,
+    obstacles: list[TopologyNode],
+    *,
+    x_span_lo: float,
+    x_span_hi: float,
+    toward_bus: bool,
+) -> tuple[str, float] | None:
+    """Detoured hub tap that leaves via a clearance-checked stub column.
+
+    Tries ``y_nominal_clear`` first, then alternate detour rows so a stub column
+    can clear foreign verticals that block the nominal climb span.
+    """
+    toward = bus_x if toward_bus else None
+    candidates = obstacle_detour_y_candidates(
+        ctx, y, x_span_lo, x_span_hi, obstacles, {port.node_id}, net,
+    )
+    ordered: list[float] = []
+    for y_try in (y_nominal_clear, *candidates):
+        if any(abs(y_try - existing) < WIRE_EPS for existing in ordered):
+            continue
+        if abs(y_try - y) < WIRE_EPS:
+            continue
+        ordered.append(y_try)
+
+    for y_clear in ordered:
+        short = clear_outward_stub_x(
+            port, y, y_clear, ctx, net, obstacles, toward_x=toward,
+        )
+        if short is None:
+            continue
+        if abs(short - port.x) > WIRE_EPS:
+            ctx.reserve_horizontal(y, min(port.x, short), max(port.x, short), net)
+            ctx.reserve_vertical(short, min(y, y_clear), max(y, y_clear), net)
+            ctx.reserve_horizontal(y_clear, min(short, bus_x), max(short, bus_x), net)
+            path = (
+                f"M {port.x:.1f},{y:.1f} H {short:.1f} "
+                f"V {y_clear:.1f} H {bus_x:.1f}"
+            )
+        else:
+            # Port face is clear; prefer a micro stub when that H is free.
+            micro = outward_escape_stub_x(port)
+            if _stub_column_clear(port, micro, y, y_clear, ctx, net, obstacles):
+                ctx.reserve_horizontal(y, min(port.x, micro), max(port.x, micro), net)
+                ctx.reserve_vertical(micro, min(y, y_clear), max(y, y_clear), net)
+                ctx.reserve_horizontal(
+                    y_clear, min(micro, bus_x), max(micro, bus_x), net,
+                )
+                path = (
+                    f"M {port.x:.1f},{y:.1f} H {micro:.1f} "
+                    f"V {y_clear:.1f} H {bus_x:.1f}"
+                )
+            else:
+                ctx.reserve_vertical(port.x, min(y, y_clear), max(y, y_clear), net)
+                ctx.reserve_horizontal(
+                    y_clear, min(port.x, bus_x), max(port.x, bus_x), net,
+                )
+                path = f"M {port.x:.1f},{y:.1f} V {y_clear:.1f} H {bus_x:.1f}"
+        return simplify_wire_path(path), y_clear
+    return None
 
 
 def away_from_symbol_x(port: TopologyPort, stub_x: float) -> float:
@@ -266,8 +399,23 @@ def two_port_path(
         obs,
         skip,
     )
+    # Re-check the destination approach with the actual trunk column: a foreign
+    # net may already own ``end.y`` across this x-span (coincident horizontals).
+    y_land = obstacle_detour_y(
+        ctx, end.y, min(col_at, e_stub), max(col_at, e_stub), obs, skip, net,
+    )
+    if abs(y_land - end.y) > WIRE_EPS:
+        path = (
+            f"{approach} V {y_land:.1f} H {e_stub:.1f} V {end.y:.1f}{end_leg}"
+        )
+        ctx.reserve_horizontal(start.y, x_lo, x_hi, net)
+        ctx.reserve_horizontal(y_land, min(col_at, e_stub), max(col_at, e_stub), net)
+        ctx.reserve_vertical(col_at, min(start.y, y_land), max(start.y, y_land), net)
+        ctx.reserve_vertical(e_stub, min(y_land, end.y), max(y_land, end.y), net)
+        return simplify_wire_path(path)
     path = f"{approach} V {end.y:.1f} H {e_stub:.1f}{end_leg}"
     ctx.reserve_horizontal(start.y, x_lo, x_hi, net)
+    ctx.reserve_horizontal(end.y, min(col_at, e_stub), max(col_at, e_stub), net)
     ctx.reserve_vertical(col_at, min(start.y, end.y), max(start.y, end.y), net)
     return simplify_wire_path(path)
 
@@ -401,11 +549,77 @@ def hub_tap_path_from_bus(
     y = port.y
     feed_x = hub_tap_feed_column(ctx, port, bus_x, obstacles, net)
     end_leg = path_into_port(port)
-    x_lo, x_hi = min(feed_x, stub), max(feed_x, stub)
+    x_lo, x_hi = min(feed_x, stub, port.x), max(feed_x, stub, port.x)
     y_clear = obstacle_detour_y(ctx, y, x_lo, x_hi, obstacles, set(), net)
     if abs(y_clear - y) > WIRE_EPS:
+        candidates = obstacle_detour_y_candidates(
+            ctx, y, x_lo, x_hi, obstacles, {port.node_id}, net,
+        )
+        ordered: list[float] = []
+        for y_try in (y_clear, *candidates):
+            if any(abs(y_try - existing) < WIRE_EPS for existing in ordered):
+                continue
+            if abs(y_try - y) < WIRE_EPS:
+                continue
+            ordered.append(y_try)
+        for y_land in ordered:
+            # Approach from the trunk side: stub column must lie toward feed/bus,
+            # never further outward past the port (avoids H backtrack).
+            short = clear_outward_stub_x(
+                port, y, y_land, ctx, net, obstacles, toward_x=feed_x,
+            )
+            if short is None:
+                continue
+            # Reject columns on the far side of the port away from the feed.
+            if (feed_x <= port.x and short > port.x + WIRE_EPS) or (
+                feed_x >= port.x and short < port.x - WIRE_EPS
+            ):
+                continue
+            climb_x = short
+            if abs(short - port.x) <= WIRE_EPS:
+                micro = outward_escape_stub_x(port)
+                # Micro stub only when it sits between feed and port.
+                between = (
+                    min(feed_x, port.x) - WIRE_EPS
+                    <= micro
+                    <= max(feed_x, port.x) + WIRE_EPS
+                )
+                if between and _stub_column_clear(
+                    port, micro, y, y_land, ctx, net, obstacles,
+                ):
+                    climb_x = micro
+            ctx.reserve_vertical(feed_x, min(y, y_land), max(y, y_land), net)
+            ctx.reserve_horizontal(
+                y_land, min(feed_x, climb_x), max(feed_x, climb_x), net,
+            )
+            if abs(climb_x - port.x) > WIRE_EPS:
+                ctx.reserve_vertical(
+                    climb_x, min(y_land, y), max(y_land, y), net,
+                )
+                ctx.reserve_horizontal(
+                    y, min(climb_x, port.x), max(climb_x, port.x), net,
+                )
+                path = (
+                    f"M {feed_x:.1f},{y_land:.1f} H {climb_x:.1f} "
+                    f"V {y:.1f} H {port.x:.1f}"
+                )
+            else:
+                ctx.reserve_vertical(port.x, min(y_land, y), max(y_land, y), net)
+                path = f"M {feed_x:.1f},{y_land:.1f} H {port.x:.1f} V {y:.1f}"
+            return simplify_wire_path(path), y_land
+        # No clear climb column: keep connectivity on a detoured row into the
+        # port face only when that face column is foreign-clear.
+        if _stub_column_clear(port, port.x, y, y_clear, ctx, net, obstacles):
+            ctx.reserve_vertical(feed_x, min(y, y_clear), max(y, y_clear), net)
+            ctx.reserve_horizontal(
+                y_clear, min(feed_x, port.x), max(feed_x, port.x), net,
+            )
+            ctx.reserve_vertical(port.x, min(y_clear, y), max(y_clear, y), net)
+            path = f"M {feed_x:.1f},{y_clear:.1f} H {port.x:.1f} V {y:.1f}"
+            return simplify_wire_path(path), y_clear
+        # Last resort: still attach on the detoured row via stub (may warn).
         ctx.reserve_vertical(feed_x, min(y, y_clear), max(y, y_clear), net)
-        ctx.reserve_horizontal(y_clear, x_lo, x_hi, net)
+        ctx.reserve_horizontal(y_clear, min(feed_x, stub), max(feed_x, stub), net)
         path = f"M {feed_x:.1f},{y_clear:.1f} H {stub:.1f} V {y:.1f}{end_leg}"
         return simplify_wire_path(path), y_clear
     ctx.reserve_horizontal(y, x_lo, x_hi, net)
@@ -438,10 +652,12 @@ def _foreign_horizontal_blocks_row(
     x_hi: float,
     net: str,
 ) -> bool:
-    """True when a foreign reserved horizontal occupies the same row across ``x_lo..x_hi``."""
+    """True when a foreign reserved horizontal shares this corridor across ``x_lo..x_hi``."""
+    from fypa.topology.validate.util import parallel_corridors_too_close
+
     lo, hi = min(x_lo, x_hi), max(x_lo, x_hi)
     for by, blo, bhi, bnet in ctx.horizontal_bands:
-        if bnet == net or abs(by - y) > WIRE_EPS:
+        if bnet == net or not parallel_corridors_too_close(by, y):
             continue
         if hi <= blo + WIRE_EPS or lo >= bhi - WIRE_EPS:
             continue
@@ -550,29 +766,57 @@ def hub_tap_path(
     bus_x = shift_x_clear_of_vertical_obstacles(
         bus_x, y, y, obstacles, set(), outward,
     )
-    x_lo, x_hi = min(attach, bus_x), max(attach, bus_x)
+    # Include the port→stub leg: long multi-port stubs can already sit on a
+    # foreign horizontal before the stub→bus span is considered.
+    x_lo, x_hi = min(port.x, attach, bus_x), max(port.x, attach, bus_x)
     y_clear = obstacle_detour_y(ctx, y, x_lo, x_hi, obstacles, set(), net)
     if abs(y_clear - y) > WIRE_EPS:
+        detoured = _hub_detour_via_clear_stub(
+            port,
+            bus_x,
+            y,
+            y_clear,
+            ctx,
+            net,
+            obstacles,
+            x_span_lo=x_lo,
+            x_span_hi=x_hi,
+            toward_bus=True,
+        )
+        if detoured is not None:
+            return detoured
+        # Connectivity last resort: detour row into bus without claiming a
+        # blocked stub column (validation may still flag crossings).
         ctx.reserve_vertical(attach, min(y, y_clear), max(y, y_clear), net)
-        ctx.reserve_horizontal(y_clear, x_lo, x_hi, net)
+        ctx.reserve_horizontal(y_clear, min(attach, bus_x), max(attach, bus_x), net)
         path = f"{start_leg} V {y_clear:.1f} H {bus_x:.1f}"
         return simplify_wire_path(path), y_clear
     if foreign_vertical_covers_y(ctx, attach, y, net):
-        escape = outward_escape_stub_x(port)
-        ctx.reserve_horizontal(
-            y,
-            min(port.x, escape),
-            max(port.x, escape),
-            net,
+        escape = clear_outward_stub_x(
+            port, y, y, ctx, net, obstacles, toward_x=bus_x,
         )
-        ctx.reserve_horizontal(
+        if escape is not None and abs(escape - port.x) > WIRE_EPS:
+            ctx.reserve_horizontal(y, min(port.x, escape), max(port.x, escape), net)
+            ctx.reserve_horizontal(y, min(escape, bus_x), max(escape, bus_x), net)
+            path = f"M {port.x:.1f},{y:.1f} H {escape:.1f} H {bus_x:.1f}"
+            return simplify_wire_path(path), y
+        # Stub column blocked: climb to a clear row instead of painting over.
+        detoured = _hub_detour_via_clear_stub(
+            port,
+            bus_x,
             y,
-            min(escape, bus_x),
-            max(escape, bus_x),
+            obstacle_detour_y(ctx, y + MIN_PARALLEL_GAP, x_lo, x_hi, obstacles, set(), net),
+            ctx,
             net,
+            obstacles,
+            x_span_lo=x_lo,
+            x_span_hi=x_hi,
+            toward_bus=True,
         )
-        path = f"M {port.x:.1f},{y:.1f} H {escape:.1f} H {bus_x:.1f}"
-        return simplify_wire_path(path), y
+        if detoured is not None:
+            return detoured
+        ctx.reserve_horizontal(y, x_lo, x_hi, net)
+        return simplify_wire_path(f"{start_leg} H {bus_x:.1f}"), y
     ctx.reserve_horizontal(y, x_lo, x_hi, net)
     if abs(attach - bus_x) < WIRE_EPS:
         return simplify_wire_path(start_leg), y

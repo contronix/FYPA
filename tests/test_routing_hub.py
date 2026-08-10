@@ -378,19 +378,19 @@ def test_hub_eastward_tap_uses_upstream_vertical_before_bus():
         ),
     ]
 
-    def _node(node_id: str, y: float) -> TopologyNode:
+    def _node(node_id: str, y: float, x: float = 264.0) -> TopologyNode:
         return TopologyNode(
             node_id=node_id,
             label=node_id,
             designator=node_id,
             role="SINK",
-            x=264.0,
+            x=x,
             y=y,
             width=NODE_W,
             height=80.0,
             config_label="",
             has_error=False,
-            bounds=(264.0, y, NODE_W, 80.0),
+            bounds=(x, y, NODE_W, 80.0),
             ports=[],
         )
 
@@ -398,7 +398,7 @@ def test_hub_eastward_tap_uses_upstream_vertical_before_bus():
         "VDD",
         ports,
         bus_x,
-        obstacles=[blocker, _node("U4", 75.0), _node("U1", 279.0)],
+        obstacles=[blocker, _node("U4", 75.0), _node("U1", 279.0, x=732.0)],
         ctx=RoutingContext(),
     )
     u1_tap = next(w for w in wires if w.src_node == "U1")
@@ -1186,3 +1186,164 @@ def test_coincident_ports_do_not_produce_a_double_back_wire():
     )
     path = two_port_path(p, q, bus_x=120.0, net="N")
     assert _xs_monotonic(path), f"coincident-port wire doubles back: {path!r}"
+
+
+def test_hub_tap_detours_long_stub_off_foreign_horizontal():
+    """Long port→stub H must not stay on a foreign horizontal after Y-detour."""
+    from fypa.topology.constants import MIN_PARALLEL_GAP
+    from fypa.topology.geometry import parse_wire_path
+    from fypa.topology.routing.paths import hub_tap_path
+
+    # Left port with a long stub that would otherwise H across a foreign row.
+    port = TopologyPort(
+        terminal="P1",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=200.0,
+        y=100.0,
+        node_id="U1",
+        stub_length=80.0,
+    )
+    ctx = RoutingContext()
+    ctx.reserve_horizontal(100.0, 120.0, 180.0, "OTHER")
+    path, y_tap = hub_tap_path(port, bus_x=300.0, obstacles=[], ctx=ctx, net="VDD")
+    pts = parse_wire_path(path)
+    # Any horizontal that overlaps the foreign x-span must not sit on y=100.
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if abs(y0 - y1) > 0.5:
+            continue
+        lo, hi = min(x0, x1), max(x0, x1)
+        if hi <= 120.0 + 0.5 or lo >= 180.0 - 0.5:
+            continue
+        assert abs(y0 - 100.0) >= MIN_PARALLEL_GAP - 0.5, path
+    assert abs(y_tap - 100.0) >= MIN_PARALLEL_GAP - 0.5 or abs(y_tap - 100.0) < 0.5
+
+
+def test_clear_outward_stub_skips_foreign_vertical_column():
+    """``clear_outward_stub_x`` must not return a column owned by another net."""
+    from fypa.topology.constants import MIN_PARALLEL_GAP, PORT_WIRE_STUB
+    from fypa.topology.routing.paths import clear_outward_stub_x, outward_escape_stub_x
+
+    port = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=200.0,
+        y=100.0,
+        node_id="U1",
+    )
+    short = outward_escape_stub_x(port)
+    assert abs(short - (200.0 - PORT_WIRE_STUB)) < 0.5
+    ctx = RoutingContext()
+    ctx.reserve_vertical(short, 80.0, 120.0, "OTHER")
+    # Neighbor column 8px further out is also blocked.
+    ctx.reserve_vertical(short - 8.0, 80.0, 120.0, "OTHER2")
+    chosen = clear_outward_stub_x(port, 100.0, 60.0, ctx, "VDD", [])
+    assert chosen is not None
+    assert abs(chosen - short) >= MIN_PARALLEL_GAP - 0.5
+    assert abs(chosen - (short - 8.0)) >= MIN_PARALLEL_GAP - 0.5
+
+
+def test_foreign_horizontal_blocks_row_uses_parallel_gap():
+    """Corridors within ``MIN_PARALLEL_GAP`` count as blocked, not only exact Y."""
+    from fypa.topology.constants import MIN_PARALLEL_GAP
+    from fypa.topology.routing.paths import _foreign_horizontal_blocks_row
+
+    ctx = RoutingContext()
+    ctx.reserve_horizontal(100.0, 0.0, 200.0, "OTHER")
+    assert _foreign_horizontal_blocks_row(ctx, 100.0, 50.0, 150.0, "VDD")
+    assert _foreign_horizontal_blocks_row(
+        ctx, 100.0 + MIN_PARALLEL_GAP / 2, 50.0, 150.0, "VDD",
+    )
+    assert not _foreign_horizontal_blocks_row(
+        ctx, 100.0 + MIN_PARALLEL_GAP, 50.0, 150.0, "VDD",
+    )
+
+
+def test_connect_row_to_bus_does_not_paint_foreign_nominal_row():
+    """When the hub row Y is foreign-owned, the feed must leave that row."""
+    from fypa.topology.constants import MIN_PARALLEL_GAP
+    from fypa.topology.routing.hub import _HubRowPlan, _connect_row_to_bus
+
+    port_a = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="right",
+        x=100.0,
+        y=200.0,
+        node_id="A",
+        wire_x=120.0,
+    )
+    port_b = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=220.0,
+        y=200.0,
+        node_id="B",
+        wire_x=200.0,
+    )
+    plan = _HubRowPlan(
+        group=[port_a, port_b],
+        y_row=200.0,
+        span_lo=100.0,
+        span_hi=220.0,
+        row_lo=120.0,
+        row_hi=200.0,
+        detoured=False,
+    )
+    ctx = RoutingContext()
+    ctx.reserve_horizontal(200.0, 150.0, 400.0, "OTHER")
+    trunk_y, path_d = _connect_row_to_bus(plan, 360.0, ctx, "VDD", [])
+    assert path_d is not None
+    assert trunk_y is not None
+    assert abs(trunk_y - 200.0) >= MIN_PARALLEL_GAP - 0.5, (trunk_y, path_d)
+
+
+def test_two_port_end_approach_detours_foreign_row():
+    """Destination approach must leave a foreign-owned end-port row."""
+    from fypa.topology.constants import MIN_PARALLEL_GAP
+    from fypa.topology.geometry import parse_wire_path
+    from fypa.topology.routing.paths import two_port_path
+
+    start = TopologyPort(
+        terminal="N",
+        net="VDD",
+        label="VDD",
+        side="right",
+        x=100.0,
+        y=50.0,
+        node_id="A",
+    )
+    end = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=300.0,
+        y=120.0,
+        node_id="B",
+    )
+    ctx = RoutingContext()
+    # Foreign net already owns the destination approach row near the end stub.
+    ctx.reserve_horizontal(120.0, 200.0, 280.0, "OTHER")
+    path = two_port_path(
+        start, end, bus_x=200.0, net="VDD", obstacles=[], ctx=ctx,
+    )
+    pts = parse_wire_path(path)
+    # Trunk→stub horizontals that overlap the foreign x-span must leave y=120.
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if abs(y0 - y1) > 0.5:
+            continue
+        lo, hi = min(x0, x1), max(x0, x1)
+        overlaps_foreign = not (hi <= 200.0 + 0.5 or lo >= 280.0 - 0.5)
+        if not overlaps_foreign:
+            continue
+        near_port = min(abs(x0 - 300.0), abs(x1 - 300.0)) < 25.0
+        if near_port:
+            continue
+        assert abs(y0 - 120.0) >= MIN_PARALLEL_GAP - 0.5, path
