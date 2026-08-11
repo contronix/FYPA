@@ -77,7 +77,8 @@ def test_corridor_cost_prefers_reusing_same_net_band():
     twin = corridor_cost(
         208.0, 205.0, 80.0, 300.0, [], set(), bends=0, ctx=ctx, net="VDD"
     )
-    assert reuse < twin
+    assert reuse < float("inf")
+    assert twin == float("inf")
 
 
 def test_obstacle_detour_y_snaps_to_existing_same_net_band():

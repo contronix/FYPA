@@ -8,7 +8,6 @@ from fypa.topology.constants import (
     CORRIDOR_BEND_PENALTY,
     CORRIDOR_CROSSING_PENALTY,
     CORRIDOR_GRAZE_PENALTY,
-    CORRIDOR_PARALLEL_SAME_NET_PENALTY,
     CORRIDOR_REUSE_BAND_BONUS,
     MIN_PARALLEL_GAP,
     OBSTACLE_CLEAR,
@@ -75,20 +74,24 @@ def _same_net_h_band_adjustment(
     ctx: RoutingContext,
     net: str,
 ) -> float:
-    """Bonus for reusing a same-net H band; penalty for a near-parallel twin."""
+    """Bonus for reusing a same-net H band; ``inf`` for a near-parallel twin.
+
+    Near-twins are hard-illegal (`redundant_parallel_run`), so the cost must not
+    trade them against a longer legal detour.
+    """
     lo, hi = min(x_lo, x_hi), max(x_lo, x_hi)
     adjust = 0.0
     for by, blo, bhi, bnet in ctx.horizontal_bands:
         if bnet != net:
             continue
-        # Span overlap required for either bonus or parallel penalty.
+        # Span overlap required for either bonus or hard reject.
         if hi <= blo + WIRE_EPS or lo >= bhi - WIRE_EPS:
             continue
         gap = abs(by - y)
         if gap <= WIRE_EPS:
             adjust -= CORRIDOR_REUSE_BAND_BONUS
         elif gap < MIN_PARALLEL_GAP - WIRE_EPS:
-            adjust += CORRIDOR_PARALLEL_SAME_NET_PENALTY
+            return math.inf
     return adjust
 
 
@@ -106,9 +109,10 @@ def corridor_cost(
 ) -> float:
     """Cost of a horizontal corridor at ``y`` between ``x_lo`` and ``x_hi``.
 
-    Through-body → ``inf``. Otherwise length + bend penalty + graze soft-cost
-    when closer than ``WIRE_GRAZE_BAND`` to a body, plus optional crossing /
-    same-net parallel soft terms when ``ctx`` and ``net`` are set.
+    Through-body → ``inf``. Near-parallel same-net H → ``inf`` (RULES.md §21).
+    Otherwise length + bend penalty + graze soft-cost when closer than
+    ``WIRE_GRAZE_BAND`` to a body, plus optional crossing / reuse soft terms
+    when ``ctx`` and ``net`` are set.
     """
     lo, hi = min(x_lo, x_hi), max(x_lo, x_hi)
     for node in obstacles:
@@ -131,7 +135,10 @@ def corridor_cost(
         cost += (
             _foreign_crossing_count(y, lo, hi, ctx, net) * CORRIDOR_CROSSING_PENALTY
         )
-        cost += _same_net_h_band_adjustment(y, lo, hi, ctx, net)
+        band_adj = _same_net_h_band_adjustment(y, lo, hi, ctx, net)
+        if band_adj == math.inf:
+            return math.inf
+        cost += band_adj
     return cost
 
 

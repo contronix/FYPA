@@ -74,8 +74,6 @@ MAX_DETOUR_RATIO = 3.0
 MAX_EXTRA_BENDS = 2
 # Soft bonus (cost reduction) when reusing an existing same-net H band.
 CORRIDOR_REUSE_BAND_BONUS = 120.0
-# Soft penalty when opening a parallel same-net H within MIN_PARALLEL_GAP.
-CORRIDOR_PARALLEL_SAME_NET_PENALTY = 200.0
 MAX_CANVAS_WIDTH = 2400.0
 MAX_LABEL_DISTANCE = LABEL_WIRE_OFFSET + 36.0
 CANVAS_HEIGHT_PAD_GND = 16.0
