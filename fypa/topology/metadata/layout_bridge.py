@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from fypa.topology.constants import GND_NET, RETURN_PORT_SORT_BASE
 from fypa.topology.metadata.nets import (
@@ -44,6 +44,8 @@ class ParsedLayoutInput:
     driven_nets: set[str]
     needs_gnd: bool
     columns: dict[str, int]
+    loop_return_nets: frozenset[str] = frozenset()
+    loop_parent: dict[str, str] = field(default_factory=dict)
 
 
 def _column_flow_net(term: TerminalDict | None) -> str | None:
@@ -304,22 +306,76 @@ def _assign_face_port_rows(
 
 
 def _normalize_series_port_faces(node_specs: list[NodeSpec]) -> None:
-    """SERIES/RESISTOR power ports: P* left (in), N* right (out). See RULES.md."""
+    """SERIES/RESISTOR power ports: P* left (in), N* right (out). See RULES.md.
+
+    Multi-role composites only rewrite terminals whose port role is SERIES /
+    RESISTOR — a stacked SINK return ``N`` must stay on the left face.
+    """
     for s in node_specs:
         if not spec_has_series_role(s):
             continue
+
+        def _face(pname: str, side: str) -> str:
+            role = spec_port_role(s, pname)
+            if role not in ("SERIES", "RESISTOR"):
+                return side
+            if pname.startswith("P"):
+                return "left"
+            if pname.startswith("N"):
+                return "right"
+            return side
+
         s["port_defs"] = [
-            (
-                pname,
-                "left"
-                if pname.startswith("P")
-                else "right"
-                if pname.startswith("N")
-                else side,
-                sort_key,
-            )
+            (pname, _face(pname, side), sort_key)
             for pname, side, sort_key in s["port_defs"]
         ]
+        for sec in s.get("sections") or []:
+            if sec.get("role") not in ("SERIES", "RESISTOR"):
+                continue
+            sec["port_defs"] = [
+                (
+                    pname,
+                    "left"
+                    if pname.startswith("P")
+                    else "right"
+                    if pname.startswith("N")
+                    else side,
+                    sort_key,
+                )
+                for pname, side, sort_key in sec.get("port_defs") or []
+            ]
+
+
+def _loop_return_nets(
+    loop_parent: dict[str, str],
+    outputs_by_net: dict[str, list[str]],
+    inputs_by_net: dict[str, list[str]],
+) -> set[str]:
+    """Nets where a loop child drives its parent (return path of the pair)."""
+    returns: set[str] = set()
+    for child, parent in loop_parent.items():
+        for net, drivers in outputs_by_net.items():
+            if child not in drivers:
+                continue
+            if parent in inputs_by_net.get(net, []):
+                returns.add(net)
+    return returns
+
+
+def _rewrite_port_faces(
+    port_defs: list[tuple[str, str, int]],
+    flip_to_left: set[str],
+    flip_to_right: set[str],
+) -> list[tuple[str, str, int]]:
+    out: list[tuple[str, str, int]] = []
+    for pname, side, sk in port_defs:
+        if pname in flip_to_left:
+            out.append((pname, "left", sk))
+        elif pname in flip_to_right:
+            out.append((pname, "right", sk))
+        else:
+            out.append((pname, side, sk))
+    return out
 
 
 def _orient_loop_series_ports(
@@ -328,14 +384,81 @@ def _orient_loop_series_ports(
     loop_parent: dict[str, str],
     outputs_by_net: dict[str, list[str]],
     inputs_by_net: dict[str, list[str]],
-) -> None:
-    """Loop SERIES keep fixed In=left / Out=right faces (no peer-facing).
+) -> set[str]:
+    """Fixed In=L / Out=R, then loop-return faces toward the peer (RULES.md §19).
 
-    Column placement still uses ``loop_parent``; face rewrite toward the parent
-    is intentionally not applied (RULES.md ports).
+    Only nets where the child drives the parent are rewritten: child ``N*`` →
+    left, parent ``P*`` → right. Forward nets keep the default faces so all
+    pair nets share the gutter between the two columns.
     """
-    del col, loop_parent, outputs_by_net, inputs_by_net
+    del col
     _normalize_series_port_faces(node_specs)
+    return_nets = _loop_return_nets(loop_parent, outputs_by_net, inputs_by_net)
+    if not return_nets or not loop_parent:
+        return return_nets
+
+    spec_by_id = {s["node_id"]: s for s in node_specs}
+    for child_id, parent_id in loop_parent.items():
+        child = spec_by_id.get(child_id)
+        parent = spec_by_id.get(parent_id)
+        if child is None or parent is None:
+            continue
+        child_flip: set[str] = set()
+        parent_flip: set[str] = set()
+        for pname, term in spec_series_terms(child):
+            net = _column_flow_net(term)
+            if net in return_nets and pname.startswith("N"):
+                child_flip.add(pname)
+        for pname, term in spec_series_terms(parent):
+            net = _column_flow_net(term)
+            if net in return_nets and pname.startswith("P"):
+                parent_flip.add(pname)
+        if not child_flip and not parent_flip:
+            continue
+        child["port_defs"] = _rewrite_port_faces(child["port_defs"], child_flip, set())
+        parent["port_defs"] = _rewrite_port_faces(parent["port_defs"], set(), parent_flip)
+        # Multi-role composites place from section port_defs — keep them in sync.
+        for sec in child.get("sections") or []:
+            sec["port_defs"] = _rewrite_port_faces(
+                list(sec.get("port_defs") or []), child_flip, set()
+            )
+        for sec in parent.get("sections") or []:
+            sec["port_defs"] = _rewrite_port_faces(
+                list(sec.get("port_defs") or []), set(), parent_flip
+            )
+        # Align shared-gutter faces so forward/return channels share row order.
+        child_hints = _child_facing_net_rows(child, "left")
+        parent["port_defs"] = _assign_face_port_rows(
+            parent["port_defs"],
+            parent.get("terms") or {},
+            "right",
+            child_hints,
+        )
+        parent_hints = _child_facing_net_rows(parent, "right")
+        child["port_defs"] = _assign_face_port_rows(
+            child["port_defs"],
+            child.get("terms") or {},
+            "left",
+            parent_hints,
+        )
+        child["port_defs"] = _dedupe_port_rows_on_same_side(child["port_defs"])
+        parent["port_defs"] = _dedupe_port_rows_on_same_side(parent["port_defs"])
+        # Mirror top-level row/side onto sections for the rewritten terminals.
+        side_by_name = {pname: side for pname, side, _ in child["port_defs"]}
+        row_by_name = {pname: sk for pname, _, sk in child["port_defs"]}
+        for sec in child.get("sections") or []:
+            sec["port_defs"] = [
+                (pname, side_by_name.get(pname, side), row_by_name.get(pname, sk))
+                for pname, side, sk in sec.get("port_defs") or []
+            ]
+        side_by_name = {pname: side for pname, side, _ in parent["port_defs"]}
+        row_by_name = {pname: sk for pname, _, sk in parent["port_defs"]}
+        for sec in parent.get("sections") or []:
+            sec["port_defs"] = [
+                (pname, side_by_name.get(pname, side), row_by_name.get(pname, sk))
+                for pname, side, sk in sec.get("port_defs") or []
+            ]
+    return return_nets
 
 
 def _column_net(
@@ -528,8 +651,11 @@ def _ensure_loads_right_of_net_drivers(
 def assign_columns(
     node_specs: list[NodeSpec],
     net_to_rail: dict[str, str],
-) -> dict[str, int]:
-    """Place nodes in columns by propagating from SOURCE outputs along nets."""
+) -> tuple[dict[str, int], frozenset[str], dict[str, str]]:
+    """Place nodes in columns by propagating from SOURCE outputs along nets.
+
+    Returns ``(columns, loop_return_nets, loop_parent)``.
+    """
     col: dict[str, int] = {}
     role_by_id = {s["node_id"]: s["role"] for s in node_specs}
     mixed_role_ids = _mixed_role_node_ids(node_specs)
@@ -736,10 +862,10 @@ def assign_columns(
     for child_id, parent_id in loop_parent.items():
         col[child_id] = max(col.get(child_id, 0), col.get(parent_id, 0) + 1)
 
-    # Fixed SERIES/RESISTOR faces: P* left (in), N* right (out). No peer flip.
-    _orient_loop_series_ports(node_specs, col, loop_parent, outputs_by_net, inputs_by_net)
-
-    return _compact_columns(col)
+    loop_return_nets = _orient_loop_series_ports(
+        node_specs, col, loop_parent, outputs_by_net, inputs_by_net
+    )
+    return _compact_columns(col), frozenset(loop_return_nets), dict(loop_parent)
 
 
 def specs_by_column(
@@ -803,13 +929,15 @@ def parse_topology_directives(metadata: TopologyMetadata) -> ParsedLayoutInput:
             term = (spec["terms"] or {}).get(pname)
             if canonical_net(terminal_net(term), net_to_rail) == GND_NET:
                 needs_gnd = True
-    columns = assign_columns(node_specs, net_to_rail)
+    columns, loop_return_nets, loop_parent = assign_columns(node_specs, net_to_rail)
     return ParsedLayoutInput(
         node_specs=node_specs,
         net_to_rail=net_to_rail,
         driven_nets=driven_power_nets(node_specs, net_to_rail),
         needs_gnd=needs_gnd,
         columns=columns,
+        loop_return_nets=loop_return_nets,
+        loop_parent=loop_parent,
     )
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from fypa.topology.metadata_schema import NodeSpec
 from fypa.topology.placement import BusPlan
@@ -22,3 +22,5 @@ class LayoutResult:
     net_to_rail: dict[str, str]
     driven_nets: set[str]
     bus_plan: BusPlan
+    loop_return_nets: frozenset[str] = frozenset()
+    loop_parent: dict[str, str] = field(default_factory=dict)

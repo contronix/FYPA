@@ -287,7 +287,12 @@ def test_two_port_same_row_detour_returns_to_destination_port():
 
 def test_hub_row_feed_fail_closed_when_all_candidates_blocked():
     """When every corridor is blocked, leave the row unattached (fail-closed)."""
-    from fypa.topology.routing.hub import _HubRowPlan, _connect_row_to_bus
+    from fypa.topology.routing.hub import (
+        _HubRowPlan,
+        _connect_row_to_bus,
+        _hub_wires_connect_ports,
+        route_hub,
+    )
 
     port = _port("U1", y=100.0, wire_x=100.0)
     plan = _HubRowPlan(
@@ -308,6 +313,12 @@ def test_hub_row_feed_fail_closed_when_all_candidates_blocked():
 
     assert trunk_y is None
     assert bus_leg is None
+
+    # Full hub with a disconnected feed must emit no wires (not a partial draw).
+    other = _port("U2", y=300.0, wire_x=500.0)
+    wires = route_hub("VDD", [port, other], bus_x, [], RoutingContext())
+    if wires:
+        assert _hub_wires_connect_ports([port, other], wires)
 
 
 def test_hub_eastward_tap_uses_upstream_vertical_before_bus():

@@ -184,7 +184,10 @@ def _connect_row_to_bus(
 
     Returns ``(trunk_y on bus column, optional feed wire)``. When the row can
     reach ``bus_x``, emit a feed wire and the Y where it meets the trunk.
+    Picks the lowest-cost legal feed Y (RULES.md §20), not first-fit.
     """
+    from fypa.topology.routing.cost import corridor_cost
+
     edge_x = hub_row_edge_x(plan.row_lo, plan.row_hi, bus_x)
     if plan.row_lo - WIRE_EPS <= bus_x <= plan.row_hi + WIRE_EPS:
         return plan.y_row, None
@@ -197,23 +200,30 @@ def _connect_row_to_bus(
             return {p.node_id for p in plan.group}
         return set()
 
-    def _feed_at(y_feed: float) -> str | None:
+    def _feed_ok(y_feed: float) -> bool:
         skip = _clearance_skip(y_feed)
         if not horizontal_segment_clear(y_feed, lo, hi, obstacles, skip):
-            return None
+            return False
         if _foreign_horizontal_blocks_row(ctx, y_feed, lo, hi, net):
-            return None
+            return False
         if abs(y_feed - plan.y_row) > WIRE_EPS:
             y_lo, y_hi = min(plan.y_row, y_feed), max(plan.y_row, y_feed)
             if not trunk_vertical_clear(edge_x, y_lo, y_hi, obstacles, set()):
-                return None
+                return False
             if _foreign_vertical_blocks_column(ctx, edge_x, y_lo, y_hi, net):
-                return None
+                return False
+        return True
+
+    def _emit_feed(y_feed: float) -> str:
+        skip = _clearance_skip(y_feed)
+        if abs(y_feed - plan.y_row) > WIRE_EPS:
+            y_lo, y_hi = min(plan.y_row, y_feed), max(plan.y_row, y_feed)
             ctx.reserve_vertical(edge_x, y_lo, y_hi, net)
             ctx.reserve_horizontal(y_feed, lo, hi, net)
             return simplify_wire_path(
                 f"M {edge_x:.1f},{plan.y_row:.1f} V {y_feed:.1f} H {bus_x:.1f}",
             )
+        del skip
         ctx.reserve_horizontal(
             y_feed,
             min(plan.span_lo, bus_x),
@@ -224,6 +234,7 @@ def _connect_row_to_bus(
             f"M {edge_x:.1f},{plan.y_row:.1f} H {bus_x:.1f}",
         )
 
+    best: tuple[float, float] | None = None  # (cost, y_feed)
     for y_feed in obstacle_detour_y_candidates(
         ctx,
         plan.y_row,
@@ -233,14 +244,21 @@ def _connect_row_to_bus(
         set(),
         net,
     ):
-        path_d = _feed_at(y_feed)
-        if path_d is not None:
-            trunk_y = plan.y_row if abs(y_feed - plan.y_row) <= WIRE_EPS else y_feed
-            return trunk_y, path_d
+        if not _feed_ok(y_feed):
+            continue
+        bends = 0 if abs(y_feed - plan.y_row) <= WIRE_EPS else 1
+        cost = corridor_cost(
+            y_feed, plan.y_row, lo, hi, obstacles, _clearance_skip(y_feed), bends=bends
+        )
+        if best is None or cost < best[0] - WIRE_EPS:
+            best = (cost, y_feed)
 
-    # Fail-closed: no legal channel feed to the trunk (RULES.md).
-    return None, None
-
+    if best is None:
+        # Fail-closed: no legal channel feed to the trunk (RULES.md).
+        return None, None
+    y_feed = best[1]
+    trunk_y = plan.y_row if abs(y_feed - plan.y_row) <= WIRE_EPS else y_feed
+    return trunk_y, _emit_feed(y_feed)
 
 def _route_hub_tap(
     port: TopologyPort,
@@ -475,6 +493,67 @@ def _connect_row_plans(state: _HubRouteState, row_plans: list[_HubRowPlan]) -> N
             _emit_row_bus_feed(state, plan)
 
 
+def _hub_wires_connect_ports(
+    ports: list[TopologyPort],
+    wires: list[TopologyWire],
+) -> bool:
+    """True when every port lies in one connected component of the hub wires."""
+    if len(ports) <= 1:
+        return True
+
+    parent: dict[tuple[float, float], tuple[float, float]] = {}
+
+    def find(pt: tuple[float, float]) -> tuple[float, float]:
+        parent.setdefault(pt, pt)
+        if parent[pt] != pt:
+            parent[pt] = find(parent[pt])
+        return parent[pt]
+
+    def union(a: tuple[float, float], b: tuple[float, float]) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    def on_seg(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> bool:
+        if abs(y1 - y2) <= WIRE_EPS and abs(py - y1) <= WIRE_EPS:
+            return min(x1, x2) - WIRE_EPS <= px <= max(x1, x2) + WIRE_EPS
+        if abs(x1 - x2) <= WIRE_EPS and abs(px - x1) <= WIRE_EPS:
+            return min(y1, y2) - WIRE_EPS <= py <= max(y1, y2) + WIRE_EPS
+        return False
+
+    anchors: list[tuple[float, float]] = []
+    for port in ports:
+        body = (round(port.x, 1), round(port.y, 1))
+        stub = (round(port_stub_x(port), 1), round(port.y, 1))
+        anchors.append(body)
+        union(body, stub)
+
+    segs: list[tuple[float, float, float, float]] = []
+    for wire in wires:
+        pts = parse_wire_path(wire.path_d)
+        for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+            a = (round(x1, 1), round(y1, 1))
+            b = (round(x2, 1), round(y2, 1))
+            union(a, b)
+            segs.append((a[0], a[1], b[0], b[1]))
+
+    endpoints = {(s[0], s[1]) for s in segs} | {(s[2], s[3]) for s in segs}
+    for ex, ey in endpoints:
+        for x1, y1, x2, y2 in segs:
+            if on_seg(ex, ey, x1, y1, x2, y2):
+                union((ex, ey), (x1, y1))
+
+    for port in ports:
+        body = (round(port.x, 1), round(port.y, 1))
+        stub = (round(port_stub_x(port), 1), round(port.y, 1))
+        for x1, y1, x2, y2 in segs:
+            for px, py in (body, stub):
+                if on_seg(px, py, x1, y1, x2, y2):
+                    union((px, py), (x1, y1))
+
+    return len({find(a) for a in anchors}) == 1
+
+
 def _assemble_hub_wires(
     label: str,
     net: str,
@@ -483,6 +562,7 @@ def _assemble_hub_wires(
     row_wires: list[TopologyWire],
     tap_wires: list[TopologyWire],
     tap_ys: list[float],
+    ports: list[TopologyPort],
 ) -> list[TopologyWire]:
     wires: list[TopologyWire] = []
     if tap_ys and (y_hi := max(tap_ys)) - (y_lo := min(tap_ys)) > WIRE_EPS:
@@ -502,6 +582,9 @@ def _assemble_hub_wires(
         tap_wires[0].label = label
     wires.extend(row_wires)
     wires.extend(tap_wires)
+    # Fail-closed: never emit a disconnected hub drawing (RULES.md §18).
+    if ports and wires and not _hub_wires_connect_ports(ports, wires):
+        return []
     return wires
 
 
@@ -548,4 +631,5 @@ def route_hub(
         state.row_wires,
         state.tap_wires,
         state.tap_ys,
+        ordered,
     )

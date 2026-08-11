@@ -42,6 +42,7 @@ def plan_stack_hub_buses(
             y_hi = max(p.y for p in ports)
             outward = 1.0 if side == "right" else -1.0
             try:
+                attach = [port_stub_x(p) for p in ports]
                 bus_x = allocate_bus_x(
                     bus_x,
                     y_lo,
@@ -51,6 +52,7 @@ def plan_stack_hub_buses(
                     reserved,
                     net,
                     outward=outward,
+                    attach_xs=attach,
                 )
             except BusCorridorFull:
                 continue
@@ -123,6 +125,7 @@ def plan_gutter_hub_buses(
                     outward=outward,
                     reserved=reserved,
                     assigned_in_group=assigned_bus,
+                    attach_xs=[port_stub_x(p) for p in ports],
                 )
                 corridor = resolve_gutter_corridor(
                     bus_lo,
@@ -152,6 +155,7 @@ def plan_gutter_hub_buses(
                     net,
                     outward=outward,
                     assigned_in_group=assigned_bus,
+                    attach_xs=[port_stub_x(p) for p in ports],
                 )
         except BusCorridorFull:
             continue

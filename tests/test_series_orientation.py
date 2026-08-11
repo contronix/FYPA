@@ -1,6 +1,6 @@
-"""SERIES/RESISTOR port faces are fixed: P left (in), N right (out).
+"""SERIES/RESISTOR port faces: P left / N right; loop returns peer-facing.
 
-See ``fypa/topology/RULES.md``. Peer-facing flips are not applied.
+See ``fypa/topology/RULES.md`` rules 12–13 and 19.
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ def test_mid_rail_tap_keeps_default_orientation():
                 "designator": "U1",
                 "label": "U1",
                 "value_str": "10 mA",
-                "terminals": {"P": _term("RAIL", "1"), "N": _term("GND", "2")},
+                "terminals": {"P": _term("PRE", "1"), "N": _term("GND", "2")},
             },
         ]
     }
@@ -93,15 +93,20 @@ def test_mid_rail_tap_keeps_default_orientation():
     assert sides["N"] == "right"
 
 
-def test_loop_series_ports_keep_fixed_faces():
-    """Loop SERIES also keep P left / N right (no all-ports-face-parent)."""
+def test_loop_series_return_ports_face_peer():
+    """Loop return nets: parent P* → right, child N* → left (RULES.md §19)."""
     from tests.topology_fixtures import load_topology_fixture
 
     model = build_topology_model(load_topology_fixture("project_a_stepper_loop_rails"))
+    assert "AY" in model.loop_return_nets
+    assert "BY" in model.loop_return_nets
+    assert model.loop_parent.get("J7") == "U1"
     sides = _resistor_sides(model)
-    for _des, face_map in sides.items():
-        for term, side in face_map.items():
-            if term.startswith("P"):
-                assert side == "left", f"{_des}.{term} should be left"
-            elif term.startswith("N"):
-                assert side == "right", f"{_des}.{term} should be right"
+    # Forward nets keep default faces.
+    assert sides["U1"]["N1"] == "right"  # AX out
+    assert sides["J7"]["P1"] == "left"  # AX in
+    # Return nets face the peer gutter.
+    assert sides["U1"]["P2"] == "right"  # AY in on parent
+    assert sides["J7"]["N1"] == "left"  # AY out on child
+    assert sides["U1"]["P4"] == "right"  # BY in on parent
+    assert sides["J7"]["N2"] == "left"  # BY out on child

@@ -18,6 +18,7 @@ from fypa.topology.placement.hub_planning import (
 from fypa.topology.placement.gutter_corridors import (
     bus_x_in_column_gaps,
     column_gaps_from_nodes,
+    row_gaps_from_nodes,
 )
 from fypa.topology.placement.plan import BusPlan, gutter_bus_span_from_plan, plan_signal_buses
 from fypa.topology.placement.pair_slots import (
@@ -54,6 +55,7 @@ __all__ = [
     "classify_signal_nets",
     "column_bus_x",
     "column_gaps_from_nodes",
+    "row_gaps_from_nodes",
     "gnd_column_trunk_x",
     "group_two_port_pairs",
     "gutter_approach_side",

@@ -470,7 +470,14 @@ def hub_tap_vertical_to_row(
     start_leg, col_x, _ = path_from_port_stub(port)
     if bus_x is not None and abs(col_x - bus_x) > WIRE_EPS:
         obs = obstacles or []
-        sk = skip or {port.node_id}
+        # Skip the own symbol only when the bus stays on the stub side of the
+        # port. Crossing through the body toward the opposite face is illegal.
+        if port.side == "left":
+            sk = {port.node_id} if bus_x <= port.x + WIRE_EPS else set()
+        elif port.side == "right":
+            sk = {port.node_id} if bus_x >= port.x - WIRE_EPS else set()
+        else:
+            sk = skip or {port.node_id}
         lo, hi = min(col_x, bus_x), max(col_x, bus_x)
         if horizontal_segment_clear(port.y, lo, hi, obs, sk):
             if ctx is not None and net is not None:

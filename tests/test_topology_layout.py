@@ -298,13 +298,13 @@ def test_regulator_mutual_feed_columns_are_deterministic() -> None:
               {"IN_P": term("RAIL_X"), "OUT_P": term("RAIL_Y"), "OUT_N": ideal},
               [("IN_P", "left", 2), ("OUT_P", "right", 0), ("OUT_N", "right", 1)])
 
-    cols = assign_columns([v1, u1, u2], {})
+    cols, _returns, _parents = assign_columns([v1, u1, u2], {})
     assert cols["V1"] < cols["U1"] < cols["U2"]
     # No guard-limited inflation: the cycle-broken DAG's longest path is
     # V1 -> U1 -> U2, so columns compact to 0..2.
     assert max(cols.values()) <= len(cols) - 1
     # Deterministic regardless of spec order.
-    assert assign_columns([u2, u1, v1], {}) == cols
+    assert assign_columns([u2, u1, v1], {}) == (cols, _returns, _parents)
 
 
 def test_hub_tap_escape_stays_outward_of_symbol_body() -> None:

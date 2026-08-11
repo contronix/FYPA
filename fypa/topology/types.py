@@ -81,6 +81,10 @@ class TopologyModel:
     height: float = 200.0
     gnd_bus_y: float | None = None
     gnd_symbol_x: float | None = None
+    # Loop SERIES return nets (child→parent); see RULES.md rule 19.
+    loop_return_nets: frozenset[str] = field(default_factory=frozenset)
+    # Loop child node_id → parent node_id.
+    loop_parent: dict[str, str] = field(default_factory=dict)
 
     @property
     def components(self) -> list[TopologyNode]:

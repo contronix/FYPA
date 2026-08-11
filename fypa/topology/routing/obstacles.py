@@ -144,7 +144,12 @@ def obstacle_detour_y(
     skip_node_ids: set[str],
     net: str | None = None,
 ) -> float:
-    """Return a Y that clears obstacles and reserved horizontal bands."""
+    """Return a Y that clears obstacles and reserved horizontal bands.
+
+    Chooses the lower-cost of upward vs downward when both clear (RULES.md §20).
+    """
+    from fypa.topology.routing.cost import corridor_cost
+
     lo, hi = min(x_lo, x_hi), max(x_lo, x_hi)
     y_down = _obstacle_detour_y_direction(
         ctx,
@@ -170,15 +175,18 @@ def obstacle_detour_y(
         return y_down
     if abs(y_up - y_nominal) < WIRE_EPS:
         return y_up
-    if _prefer_upward_detour(
-        y_nominal,
-        y_up,
-        y_down,
-        obstacles,
-        lo,
-        hi,
-        skip_node_ids,
-    ):
+    cost_down = corridor_cost(
+        y_down, y_nominal, lo, hi, obstacles, skip_node_ids, bends=1
+    )
+    cost_up = corridor_cost(
+        y_up, y_nominal, lo, hi, obstacles, skip_node_ids, bends=1
+    )
+    if cost_up < cost_down - WIRE_EPS:
+        return y_up
+    if cost_down < cost_up - WIRE_EPS:
+        return y_down
+    # Tie: prefer the smaller absolute detour.
+    if abs(y_up - y_nominal) < abs(y_down - y_nominal) - WIRE_EPS:
         return y_up
     return y_down
 
@@ -192,7 +200,9 @@ def obstacle_detour_y_candidates(
     skip_node_ids: set[str],
     net: str | None = None,
 ) -> list[float]:
-    """Distinct Y values to try for a horizontal feed, best-first."""
+    """Distinct Y values to try for a horizontal feed, best-cost first."""
+    from fypa.topology.routing.cost import corridor_cost
+
     lo, hi = min(x_lo, x_hi), max(x_lo, x_hi)
     order: list[float] = []
 
@@ -225,6 +235,20 @@ def obstacle_detour_y_candidates(
             skip_node_ids,
             net,
             downward=False,
+        )
+    )
+    order.sort(
+        key=lambda y: (
+            corridor_cost(
+                y,
+                y_nominal,
+                lo,
+                hi,
+                obstacles,
+                skip_node_ids,
+                bends=0 if abs(y - y_nominal) < WIRE_EPS else 1,
+            ),
+            abs(y - y_nominal),
         )
     )
     return order

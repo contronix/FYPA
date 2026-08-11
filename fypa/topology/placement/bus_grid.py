@@ -174,10 +174,13 @@ def allocate_bus_x(
     *,
     outward: float,
     assigned_in_group: list[float] | None = None,
+    attach_xs: list[float] | None = None,
 ) -> float:
-    """Pick the first valid bus x on the MIN_PARALLEL_GAP grid inside [bus_lo, bus_hi].
+    """Pick the lowest-attachment-cost valid bus x inside [bus_lo, bus_hi].
 
-    Raises :class:`BusCorridorFull` when every candidate collides (no silent clamp).
+    Candidates are ordered by sum of distances to ``attach_xs`` (port stubs),
+    falling back to ``abs(c - nominal)``. Raises :class:`BusCorridorFull` when
+    every candidate collides (no silent clamp).
     """
     assigned = assigned_in_group or []
     n_slots = max(
@@ -196,7 +199,13 @@ def allocate_bus_x(
         if r not in seen:
             seen.add(r)
             ordered.append(c)
-    ordered.sort(key=lambda c: abs(c - nominal))
+
+    def _attach_cost(c: float) -> float:
+        if attach_xs:
+            return sum(abs(c - ax) for ax in attach_xs)
+        return abs(c - nominal)
+
+    ordered.sort(key=lambda c: (_attach_cost(c), abs(c - nominal)))
 
     for candidate in ordered:
         x = max(bus_lo, min(bus_hi, candidate))

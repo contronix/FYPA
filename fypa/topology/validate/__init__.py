@@ -20,10 +20,13 @@ from fypa.topology.validate.segments import (
 from fypa.topology.validate.hub import check_hub_net_disconnected
 from fypa.topology.validate.rules import (
     check_driver_left_of_load,
+    check_hub_net_unrouted,
+    check_loop_return_in_pair_gutter,
     check_port_sides,
     check_ports_overlapping,
     check_right_to_left_wires,
     check_source_sink_columns,
+    check_wire_detour_excessive,
     check_wire_outside_channel,
 )
 from fypa.topology.validate.stubs import check_open_stub_ends
@@ -34,12 +37,15 @@ __all__ = [
     "check_conditional_gnd_names",
     "check_dangling_wire_endpoints",
     "check_driver_left_of_load",
+    "check_hub_net_unrouted",
+    "check_loop_return_in_pair_gutter",
     "check_open_stub_ends",
     "check_port_sides",
     "check_ports_overlapping",
     "check_right_to_left_wires",
     "check_segment_spacing",
     "check_source_sink_columns",
+    "check_wire_detour_excessive",
     "check_wire_outside_channel",
     "merge_validation_issues",
     "validate_topology",
@@ -70,6 +76,9 @@ def validate_topology(
     issues.extend(check_right_to_left_wires(model))
     issues.extend(check_driver_left_of_load(model))
     issues.extend(check_source_sink_columns(model))
+    issues.extend(check_loop_return_in_pair_gutter(model))
+    issues.extend(check_wire_detour_excessive(model))
+    issues.extend(check_hub_net_unrouted(model))
 
     if geo is None:
         geo = compute_schematic_geometry(

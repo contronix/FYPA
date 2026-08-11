@@ -35,6 +35,8 @@ def build_node_layout(
         net_to_rail={},
         driven_nets=set(),
         bus_plan=BusPlan(),
+        loop_return_nets=frozenset(),
+        loop_parent={},
     )
     if metadata is None:
         return empty
@@ -75,4 +77,6 @@ def build_node_layout(
         net_to_rail=parsed.net_to_rail,
         driven_nets=parsed.driven_nets,
         bus_plan=bus_plan,
+        loop_return_nets=parsed.loop_return_nets,
+        loop_parent=parsed.loop_parent,
     )

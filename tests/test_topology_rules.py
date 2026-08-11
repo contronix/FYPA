@@ -202,23 +202,68 @@ def test_sink_not_rightmost_when_all_sinks_offset():
     assert any(i["code"] == "sink_not_rightmost" for i in issues)
 
 
-def test_loop_series_fixed_faces_fail_closed_not_peer_facing():
-    """Loop SERIES keep P/N faces; routing issues surface as validate errors."""
+def test_loop_pair_return_faces_and_gutter():
+    """Loop return ports face the peer; returns stay in the pair gutter."""
     from fypa.topology import build_topology_model, validate_topology
+    from fypa.topology.validate import check_loop_return_in_pair_gutter
     from tests.topology_fixtures import load_topology_fixture
 
     model = build_topology_model(load_topology_fixture("project_a_stepper_loop_rails"))
-    for node in model.nodes:
-        if node.role not in ("SERIES", "RESISTOR"):
-            continue
-        for port in node.ports:
-            if port.terminal.startswith("P"):
-                assert port.side == "left"
-            elif port.terminal.startswith("N"):
-                assert port.side == "right"
-    # Peer-facing was removed; cycle/channel gaps must fail closed, not silently
-    # look clean with illegal faces.
-    assert validate_topology(model)  # non-empty until channel router covers loops
+    assert model.loop_parent.get("J7") == "U1"
+    assert model.loop_return_nets >= frozenset({"AY", "BY"})
+    u1 = next(n for n in model.nodes if n.designator == "U1")
+    j7 = next(n for n in model.nodes if n.designator == "J7")
+    u1_ports = {p.terminal: p for p in u1.ports}
+    j7_ports = {p.terminal: p for p in j7.ports}
+    assert u1_ports["P2"].side == "right"
+    assert j7_ports["N1"].side == "left"
+    assert check_loop_return_in_pair_gutter(model) == []
+    # No RTL / driver≺load / open stubs on the return nets.
+    bad = {
+        i["code"]
+        for i in validate_topology(model)
+        if i.get("net") in model.loop_return_nets
+    }
+    assert "right_to_left_wire" not in bad
+    assert "driver_not_left_of_load" not in bad
+    assert "open_signal_stub" not in bad
+
+
+def test_wire_detour_excessive():
+    from fypa.topology.validate import check_wire_detour_excessive
+
+    # Ends 100 apart; path wanders to length 500 (> 3×).
+    wire = TopologyWire(
+        net="VIN",
+        path_d="M 0.0,0.0 H 100.0 V 200.0 H 0.0 V 0.0 H 100.0",
+    )
+    issues = check_wire_detour_excessive(TopologyModel(wires=[wire]))
+    assert any(i["code"] == "wire_detour_excessive" for i in issues)
+
+
+def test_hub_net_unrouted():
+    from fypa.topology.validate import check_hub_net_unrouted
+
+    ports = [
+        TopologyPort("P", "VIN", "VIN", "right", 100.0, 50.0, "J1", role="SOURCE"),
+        TopologyPort("P", "VIN", "VIN", "left", 300.0, 50.0, "U1", role="SINK"),
+        TopologyPort("P", "VIN", "VIN", "left", 300.0, 150.0, "U2", role="SINK"),
+    ]
+    model = TopologyModel(
+        nodes=[
+            _node("J1", role="SOURCE", x=36.0, ports=[ports[0]]),
+            _node("U1", role="SINK", x=200.0, ports=[ports[1]]),
+            _node("U2", role="SINK", x=200.0, y=140.0, ports=[ports[2]]),
+        ]
+    )
+    issues = check_hub_net_unrouted(model)
+    assert any(i["code"] == "hub_net_unrouted" for i in issues)
+
+
+def test_loop_return_rtl_exempt():
+    wire = TopologyWire(net="RETA", path_d="M 200.0,50.0 H 100.0")
+    model = TopologyModel(wires=[wire], loop_return_nets=frozenset({"RETA"}))
+    assert check_right_to_left_wires(model) == []
 
 
 def test_validate_topology_includes_rule_codes():
