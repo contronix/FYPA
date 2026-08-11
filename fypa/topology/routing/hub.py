@@ -156,21 +156,39 @@ def _trunk_y_at_bus(path_d: str, bus_x: float) -> float | None:
     return on_trunk[-1]
 
 
-def _row_meets_net_vertical(
+def _row_meets_bus_column(
     ctx: RoutingContext,
     plan: _HubRowPlan,
     net: str,
+    bus_x: float,
 ) -> bool:
-    """True when the row span already crosses a same-net vertical at ``plan.y_row``."""
+    """True when a same-net horizontal at the row already reaches ``bus_x``.
+
+    Planned bus verticals are pre-reserved into ``ctx`` for collision avoidance
+    and must not count as a live trunk attachment. Row-local drops (upstream
+    singleton verticals inside the row span) also do not attach to the bus.
+    """
     y = plan.y_row
-    for vx, vy_lo, vy_hi, vnet in ctx.vertical_bands:
-        if vnet != net:
+    for by, blo, bhi, bnet in ctx.horizontal_bands:
+        if bnet != net or abs(by - y) > WIRE_EPS:
             continue
-        if vy_lo > y + WIRE_EPS or vy_hi < y - WIRE_EPS:
-            continue
-        if plan.span_lo - WIRE_EPS <= vx <= plan.span_hi + WIRE_EPS:
+        if min(blo, bhi) - WIRE_EPS <= bus_x <= max(blo, bhi) + WIRE_EPS and (
+            min(blo, bhi) - WIRE_EPS <= plan.span_hi + WIRE_EPS
+            and max(blo, bhi) + WIRE_EPS >= plan.span_lo - WIRE_EPS
+        ):
             return True
     return False
+
+
+def _hub_feed_drop_columns(edge_x: float, bus_x: float) -> list[float]:
+    """Row-edge first, then columns stepped toward the bus (escape GND stubs)."""
+    from fypa.topology.constants import MIN_PARALLEL_GAP
+
+    cols = [edge_x]
+    step = MIN_PARALLEL_GAP if bus_x >= edge_x - WIRE_EPS else -MIN_PARALLEL_GAP
+    for k in range(1, 8):
+        cols.append(round(edge_x + step * k, 1))
+    return cols
 
 
 def _connect_row_to_bus(
@@ -191,39 +209,52 @@ def _connect_row_to_bus(
     edge_x = hub_row_edge_x(plan.row_lo, plan.row_hi, bus_x)
     if plan.row_lo - WIRE_EPS <= bus_x <= plan.row_hi + WIRE_EPS:
         return plan.y_row, None
-    if _row_meets_net_vertical(ctx, plan, net):
+    if _row_meets_bus_column(ctx, plan, net, bus_x):
         return None, None
-    lo, hi = min(edge_x, bus_x), max(edge_x, bus_x)
 
     def _clearance_skip(y_feed: float) -> set[str]:
         if abs(y_feed - plan.y_row) <= WIRE_EPS:
             return {p.node_id for p in plan.group}
         return set()
 
-    def _feed_ok(y_feed: float) -> bool:
+    def _feed_ok(y_feed: float, drop_x: float) -> bool:
         skip = _clearance_skip(y_feed)
-        if not horizontal_segment_clear(y_feed, lo, hi, obstacles, skip):
+        feed_lo, feed_hi = min(drop_x, bus_x), max(drop_x, bus_x)
+        if not horizontal_segment_clear(y_feed, feed_lo, feed_hi, obstacles, skip):
             return False
-        if _foreign_horizontal_blocks_row(ctx, y_feed, lo, hi, net):
+        if _foreign_horizontal_blocks_row(ctx, y_feed, feed_lo, feed_hi, net):
             return False
+        if abs(drop_x - edge_x) > WIRE_EPS:
+            stub_lo, stub_hi = min(edge_x, drop_x), max(edge_x, drop_x)
+            if not horizontal_segment_clear(
+                plan.y_row, stub_lo, stub_hi, obstacles, {p.node_id for p in plan.group}
+            ):
+                return False
+            if _foreign_horizontal_blocks_row(ctx, plan.y_row, stub_lo, stub_hi, net):
+                return False
         if abs(y_feed - plan.y_row) > WIRE_EPS:
             y_lo, y_hi = min(plan.y_row, y_feed), max(plan.y_row, y_feed)
-            if not trunk_vertical_clear(edge_x, y_lo, y_hi, obstacles, set()):
+            if not trunk_vertical_clear(drop_x, y_lo, y_hi, obstacles, set()):
                 return False
-            if _foreign_vertical_blocks_column(ctx, edge_x, y_lo, y_hi, net):
+            if _foreign_vertical_blocks_column(ctx, drop_x, y_lo, y_hi, net):
                 return False
         return True
 
-    def _emit_feed(y_feed: float) -> str:
-        skip = _clearance_skip(y_feed)
+    def _emit_feed(y_feed: float, drop_x: float) -> str:
         if abs(y_feed - plan.y_row) > WIRE_EPS:
             y_lo, y_hi = min(plan.y_row, y_feed), max(plan.y_row, y_feed)
-            ctx.reserve_vertical(edge_x, y_lo, y_hi, net)
-            ctx.reserve_horizontal(y_feed, lo, hi, net)
+            if abs(drop_x - edge_x) > WIRE_EPS:
+                ctx.reserve_horizontal(
+                    plan.y_row, min(edge_x, drop_x), max(edge_x, drop_x), net
+                )
+            ctx.reserve_vertical(drop_x, y_lo, y_hi, net)
+            ctx.reserve_horizontal(y_feed, min(drop_x, bus_x), max(drop_x, bus_x), net)
+            prefix = f"M {edge_x:.1f},{plan.y_row:.1f}"
+            if abs(drop_x - edge_x) > WIRE_EPS:
+                prefix = f"{prefix} H {drop_x:.1f}"
             return simplify_wire_path(
-                f"M {edge_x:.1f},{plan.y_row:.1f} V {y_feed:.1f} H {bus_x:.1f}",
+                f"{prefix} V {y_feed:.1f} H {bus_x:.1f}",
             )
-        del skip
         ctx.reserve_horizontal(
             y_feed,
             min(plan.span_lo, bus_x),
@@ -234,31 +265,42 @@ def _connect_row_to_bus(
             f"M {edge_x:.1f},{plan.y_row:.1f} H {bus_x:.1f}",
         )
 
-    best: tuple[float, float] | None = None  # (cost, y_feed)
+    probe_lo = min(edge_x, bus_x)
+    probe_hi = max(edge_x, bus_x)
+    best: tuple[float, float, float] | None = None  # cost, y_feed, drop_x
     for y_feed in obstacle_detour_y_candidates(
         ctx,
         plan.y_row,
-        lo,
-        hi,
+        probe_lo,
+        probe_hi,
         obstacles,
         set(),
         net,
     ):
-        if not _feed_ok(y_feed):
-            continue
-        bends = 0 if abs(y_feed - plan.y_row) <= WIRE_EPS else 1
-        cost = corridor_cost(
-            y_feed, plan.y_row, lo, hi, obstacles, _clearance_skip(y_feed), bends=bends
-        )
-        if best is None or cost < best[0] - WIRE_EPS:
-            best = (cost, y_feed)
+        for drop_x in _hub_feed_drop_columns(edge_x, bus_x):
+            if not _feed_ok(y_feed, drop_x):
+                continue
+            bends = 0 if abs(y_feed - plan.y_row) <= WIRE_EPS else 1
+            if abs(drop_x - edge_x) > WIRE_EPS:
+                bends += 1
+            cost = corridor_cost(
+                y_feed,
+                plan.y_row,
+                min(drop_x, bus_x),
+                max(drop_x, bus_x),
+                obstacles,
+                _clearance_skip(y_feed),
+                bends=bends,
+            )
+            if best is None or cost < best[0] - WIRE_EPS:
+                best = (cost, y_feed, drop_x)
 
     if best is None:
         # Fail-closed: no legal channel feed to the trunk (RULES.md).
         return None, None
-    y_feed = best[1]
+    _cost, y_feed, drop_x = best
     trunk_y = plan.y_row if abs(y_feed - plan.y_row) <= WIRE_EPS else y_feed
-    return trunk_y, _emit_feed(y_feed)
+    return trunk_y, _emit_feed(y_feed, drop_x)
 
 def _route_hub_tap(
     port: TopologyPort,
@@ -300,7 +342,7 @@ def _route_hub_tap(
                 if horizontal_segment_clear(
                     port.y, lo, hi, obstacles, skip
                 ) and not _foreign_horizontal_blocks_row(ctx, port.y, lo, hi, net):
-                    return hub_tap_vertical_to_row(
+                    via_bus = hub_tap_vertical_to_row(
                         port,
                         row_y,
                         bus_x=bus_x,
@@ -309,6 +351,8 @@ def _route_hub_tap(
                         ctx=ctx,
                         net=net,
                     )
+                    if via_bus[0]:
+                        return via_bus
             escaped = hub_row_tap_via_escape_column(
                 port,
                 row_y,

@@ -47,6 +47,7 @@ def test_hub_fixture_passes_topology_validation(fixture_name: str) -> None:
         "ports_overlapping",
         "source_not_leftmost",
         "sink_not_rightmost",
+        "non_sink_in_rightmost",
         "hub_net_disconnected",
         "hub_net_unrouted",
         "open_signal_stub",

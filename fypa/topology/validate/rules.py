@@ -315,7 +315,7 @@ def check_wire_outside_channel(
 
 
 def check_source_sink_columns(model: TopologyModel) -> list[dict]:
-    """SOURCE in leftmost occupied column band; pure SINK in rightmost."""
+    """SOURCE leftmost; rightmost column is SINK-only (pure or multi-role with SINK)."""
     directive = [n for n in model.nodes if n.role != "GND"]
     if not directive:
         return []
@@ -338,9 +338,18 @@ def check_source_sink_columns(model: TopologyModel) -> list[dict]:
                         node_id=s.node_id,
                     )
                 )
-    sinks = [n for n in directive if n.role == "SINK"]
-    # Pure sink: only SINK role (composites may be mid)
-    for s in sinks:
+
+    def _roles_of(n: TopologyNode) -> set[str]:
+        if n.sections:
+            return {sec.role for sec in n.sections}
+        return {n.role}
+
+    def _has_sink_role(n: TopologyNode) -> bool:
+        return "SINK" in _roles_of(n)
+
+    sinks = [n for n in directive if _has_sink_role(n)]
+    pure_sinks = [n for n in sinks if _roles_of(n) == {"SINK"}]
+    for s in pure_sinks:
         if round(s.x, 1) < rightmost - WIRE_EPS:
             # Only flag when *no* sink sits on the rightmost column
             if not any(round(n.x, 1) >= rightmost - WIRE_EPS for n in sinks):
@@ -351,6 +360,17 @@ def check_source_sink_columns(model: TopologyModel) -> list[dict]:
                         node_id=s.node_id,
                     )
                 )
+    for n in by_x[rightmost]:
+        if not _has_sink_role(n):
+            issues.append(
+                make_issue(
+                    "non_sink_in_rightmost",
+                    f"{n.designator} ({n.role}) must not share the rightmost "
+                    "column with SINKs",
+                    node_id=n.node_id,
+                    role=n.role,
+                )
+            )
     return issues
 
 

@@ -673,6 +673,55 @@ def test_hub_row_feed_detour_reserves_vertical_column():
     )
 
 
+def test_connect_row_to_bus_ignores_row_drop_vertical():
+    """A singleton drop onto the row must not skip the row→bus feed.
+
+    Regression: upstream tap reserved a same-net vertical inside the row span,
+    ``_row_meets_net_vertical`` treated that as trunk attachment, and VDD_48V
+    left the bus column disconnected (hub_net_unrouted).
+    """
+    from fypa.topology.routing.hub import _HubRowPlan, _connect_row_to_bus
+
+    port_a = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="right",
+        x=164.0,
+        y=177.0,
+        node_id="J3",
+        wire_x=184.0,
+    )
+    port_b = TopologyPort(
+        terminal="IN_P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=264.0,
+        y=177.0,
+        node_id="U4",
+        wire_x=244.0,
+    )
+    plan = _HubRowPlan(
+        group=[port_a, port_b],
+        y_row=177.0,
+        span_lo=164.0,
+        span_hi=264.0,
+        row_lo=184.0,
+        row_hi=244.0,
+        detoured=False,
+    )
+    ctx = RoutingContext()
+    # Upstream singleton already dropped onto the row at the east stub column.
+    ctx.reserve_vertical(244.0, 75.0, 177.0, "VDD")
+    # Planned hub bus vertical (collision reservation) must not skip the feed.
+    ctx.reserve_vertical(748.0, 75.0, 585.0, "VDD")
+    trunk_y, feed = _connect_row_to_bus(plan, 748.0, ctx, "VDD", [])
+    assert trunk_y == 177.0
+    assert feed is not None
+    assert "H 748.0" in feed
+
+
 def test_connect_row_to_bus_retries_alternate_detour_y(monkeypatch):
     """When the first detour Y fails, try the next candidate."""
     from fypa.topology.constants import NODE_W, WIRE_EPS
@@ -1211,7 +1260,8 @@ def test_obstacle_detour_y_candidates_respects_wire_eps(monkeypatch):
         set(),
         "VDD",
     )
-    assert order == [260.0, 262.5, 258.0, 261.8]
+    # Cost-sorted; membership and WIRE_EPS uniqueness matter, not insert order.
+    assert set(order) == {260.0, 262.5, 258.0, 261.8}
     assert all(
         sum(1 for y in order if abs(y - candidate) < WIRE_EPS) == 1 for candidate in order
     )

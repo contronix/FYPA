@@ -492,11 +492,20 @@ def hub_tap_vertical_to_row(
                 simplify_wire_path(f"{start_leg} H {bus_x:.1f} V {row_y:.1f}"),
                 row_y,
             )
+        # Bus column unreachable on this row — do not fall through onto a
+        # foreign-occupied stub column (e.g. column GND trunk).
+        if ctx is not None and net is not None:
+            y_lo, y_hi = min(port.y, row_y), max(port.y, row_y)
+            if _foreign_vertical_blocks_column(ctx, col_x, y_lo, y_hi, net):
+                return "", row_y
     if ctx is not None and net is not None:
+        y_lo, y_hi = min(port.y, row_y), max(port.y, row_y)
+        if _foreign_vertical_blocks_column(ctx, col_x, y_lo, y_hi, net):
+            return "", row_y
         ctx.reserve_vertical(
             col_x,
-            min(port.y, row_y),
-            max(port.y, row_y),
+            y_lo,
+            y_hi,
             net,
         )
     return simplify_wire_path(f"{start_leg} V {row_y:.1f}"), row_y

@@ -151,6 +151,25 @@ def test_all_sinks_share_rightmost_column():
     assert sink_cols == {max_col}
 
 
+def test_rightmost_column_excludes_non_sink_loop_child():
+    """Loop-series child must not share the rightmost column with pure SINKs."""
+    from fypa.topology.metadata.layout_bridge import (
+        _mixed_role_node_ids,
+        parse_topology_directives,
+        specs_by_column,
+    )
+
+    parsed = parse_topology_directives(load_topology_fixture("project_a_stepper_loop_rails"))
+    by_col, max_col = specs_by_column(parsed.node_specs, parsed.columns)
+    mixed = _mixed_role_node_ids(parsed.node_specs)
+    for s in by_col[max_col]:
+        roles = {sec["role"] for sec in (s.get("sections") or [])} or {s["role"]}
+        if s["node_id"] in mixed:
+            assert "SINK" in roles
+        else:
+            assert s["role"] == "SINK", s
+
+
 def test_mixed_role_series_sink_keeps_bridge_before_pure_sink():
     """SERIES+SINK on one part: bridge column from propagation, not sink push."""
     from fypa.topology.metadata.layout_bridge import parse_topology_directives, specs_by_column

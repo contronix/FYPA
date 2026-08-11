@@ -200,6 +200,25 @@ def test_sink_not_rightmost_when_all_sinks_offset():
 
     issues = check_source_sink_columns(model)
     assert any(i["code"] == "sink_not_rightmost" for i in issues)
+    assert any(i["code"] == "non_sink_in_rightmost" for i in issues)
+
+
+def test_non_sink_in_rightmost_flags_series_peer():
+    from fypa.topology.validate import check_source_sink_columns
+
+    snk = TopologyPort("P", "VIN", "VIN", "left", 300.0, 50.0, "U2", role="SINK")
+    series = TopologyPort("P", "OUT", "OUT", "left", 300.0, 150.0, "J1", role="RESISTOR")
+    model = TopologyModel(
+        nodes=[
+            _node("U2", role="SINK", x=200.0, ports=[snk]),
+            _node("J1", role="RESISTOR", x=200.0, y=140.0, ports=[series]),
+        ]
+    )
+    issues = check_source_sink_columns(model)
+    assert any(
+        i["code"] == "non_sink_in_rightmost" and i.get("node_id") == "J1"
+        for i in issues
+    )
 
 
 def test_loop_pair_return_faces_and_gutter():

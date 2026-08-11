@@ -9,7 +9,10 @@ Generic designators (`J1`, `U1`, `R1`) and nets (`VIN`, `VOUT`, `GND`, `OUTA`, `
 
 1. **Grid** — Components sit on a **column / row** grid.
 2. **SOURCE left** — SOURCE symbols as far **left** as possible (`source_not_leftmost` when a non-SOURCE shares column 0 while a SOURCE is further right — layout invariant).
-3. **SINK right** — SINK symbols as far **right** as possible (`sink_not_rightmost` for pure SINKs left of the rightmost column).
+3. **SINK right** — Pure SINK symbols occupy the **rightmost** column alone
+   (with multi-role parts that include SINK also allowed there). Non-SINK
+   symbols must not share that column (`sink_not_rightmost`,
+   `non_sink_in_rightmost`).
 
 ## Current flow
 
@@ -129,3 +132,5 @@ Path length > MAX_DETOUR_RATIO × Manhattan(ends)  → wire_detour_excessive
 | Hub partial | Row/tap drawn without trunk feed | No wires + `hub_net_unrouted` |
 | Corridor pick | First-fit / nearest Δy | Cost (length + bends + graze) |
 | Detour length | Unbounded legal detours | Cap via `wire_detour_excessive` |
+| Rightmost col | Loop child could share SINK column | Pure SINKs alone rightmost (`non_sink_in_rightmost`) |
+| Row→bus skip | Any same-net V in row span skipped feed | Only skip when trunk/bus already met |

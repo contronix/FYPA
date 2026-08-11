@@ -852,15 +852,19 @@ def assign_columns(
     for child_id, parent_id in loop_parent.items():
         col[child_id] = max(col.get(child_id, 0), col.get(parent_id, 0) + 1)
 
+    # Pure SINKs occupy a dedicated rightmost column *after* loop children and
+    # other non-sinks are placed, so the last column holds only SINK (or
+    # multi-role nodes that include SINK — those keep their propagated column).
     if col:
-        sink_col = max(col.values())
+        other_cols = [
+            col[s["node_id"]]
+            for s in node_specs
+            if not (s["role"] == "SINK" and s["node_id"] not in mixed_role_ids)
+        ]
+        sink_col = (max(other_cols) if other_cols else 0) + 1
         for s in node_specs:
             if s["role"] == "SINK" and s["node_id"] not in mixed_role_ids:
                 col[s["node_id"]] = sink_col
-
-    # Loop children stay right of parents after sink pinning.
-    for child_id, parent_id in loop_parent.items():
-        col[child_id] = max(col.get(child_id, 0), col.get(parent_id, 0) + 1)
 
     loop_return_nets = _orient_loop_series_ports(
         node_specs, col, loop_parent, outputs_by_net, inputs_by_net
