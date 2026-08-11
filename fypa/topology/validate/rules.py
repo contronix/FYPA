@@ -419,6 +419,23 @@ def check_wire_detour_excessive(model: TopologyModel) -> list[dict]:
         drawn = path_length(points)
         base = manhattan(points[0], points[-1])
         if base < WIRE_EPS:
+            # Closed / zero-span path: any real drawn length is an excessive detour.
+            if drawn <= WIRE_EPS:
+                continue
+            issues.append(
+                make_issue(
+                    "wire_detour_excessive",
+                    (
+                        f"Wire {wire.net} has drawn length {drawn:.1f} with "
+                        f"coincident endpoints (Manhattan 0)"
+                    ),
+                    net=wire.net,
+                    length=round(drawn, 1),
+                    manhattan=0.0,
+                    ratio=None,
+                    wire_index=wi,
+                )
+            )
             continue
         if drawn <= base * MAX_DETOUR_RATIO + WIRE_EPS:
             continue

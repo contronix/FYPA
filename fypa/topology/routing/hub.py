@@ -598,6 +598,7 @@ def route_hub(
     """Hub as a tree: collinear row buses, one vertical trunk, and row taps."""
     ordered = sorted(ports, key=lambda p: (p.y, p.x))
     label = wire_display_label(ordered, net)
+    mark = ctx.checkpoint()
 
     row_plans, singletons = _plan_hub_rows(ordered, obstacles, ctx, net)
     state = _HubRouteState(
@@ -623,7 +624,7 @@ def route_hub(
     for _group, port in downstream_singletons:
         state.append_singleton_tap(port)
 
-    return _assemble_hub_wires(
+    wires = _assemble_hub_wires(
         label,
         net,
         bus_x,
@@ -633,3 +634,7 @@ def route_hub(
         state.tap_ys,
         ordered,
     )
+    if not wires:
+        # Fail-closed drop (or nothing routed): drop phantom bands.
+        ctx.rollback(mark)
+    return wires

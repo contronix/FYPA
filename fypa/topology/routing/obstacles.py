@@ -52,41 +52,6 @@ def detour_y_for_horizontal_upward(
     return blocked_top - OBSTACLE_CLEAR
 
 
-def _blocking_nodes(
-    y_nominal: float,
-    x_lo: float,
-    x_hi: float,
-    obstacles: list[TopologyNode],
-    skip: set[str],
-) -> list[TopologyNode]:
-    lo, hi = min(x_lo, x_hi), max(x_lo, x_hi)
-    return [
-        node
-        for node in obstacles
-        if node.node_id not in skip and horizontal_crosses_node(node, y_nominal, lo, hi)
-    ]
-
-
-def _prefer_upward_detour(
-    y_nominal: float,
-    y_up: float,
-    y_down: float,
-    obstacles: list[TopologyNode],
-    x_lo: float,
-    x_hi: float,
-    skip: set[str],
-) -> bool:
-    """Prefer routing above a component when the port row sits on its body."""
-    blockers = _blocking_nodes(y_nominal, x_lo, x_hi, obstacles, skip)
-    if not blockers:
-        return abs(y_up - y_nominal) < abs(y_down - y_nominal) - WIRE_EPS
-    top = min(node.y for node in blockers)
-    bottom = max(node.y + node.height for node in blockers)
-    if top <= y_nominal <= bottom and y_up < top - WIRE_EPS and y_down > bottom + WIRE_EPS:
-        return True
-    return abs(y_up - y_nominal) < abs(y_down - y_nominal) - WIRE_EPS
-
-
 def _obstacle_detour_y_direction(
     ctx: RoutingContext,
     y_nominal: float,

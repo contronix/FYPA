@@ -241,6 +241,17 @@ def test_wire_detour_excessive():
     assert any(i["code"] == "wire_detour_excessive" for i in issues)
 
 
+def test_wire_detour_excessive_closed_path():
+    from fypa.topology.validate import check_wire_detour_excessive
+
+    wire = TopologyWire(
+        net="VIN",
+        path_d="M 0.0,0.0 H 100.0 V 100.0 H 0.0 V 0.0",
+    )
+    issues = check_wire_detour_excessive(TopologyModel(wires=[wire]))
+    assert any(i["code"] == "wire_detour_excessive" for i in issues)
+
+
 def test_hub_net_unrouted():
     from fypa.topology.validate import check_hub_net_unrouted
 
