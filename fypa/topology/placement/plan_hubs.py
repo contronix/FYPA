@@ -155,14 +155,6 @@ def plan_gutter_hub_buses(
                 )
         except BusCorridorFull:
             continue
-        if not gaps:
-            bus_x = separate_from_assigned_buses(
-                bus_x,
-                assigned_bus,
-                outward=outward,
-                bus_lo=bus_lo,
-                bus_hi=bus_hi,
-            )
         assigned_bus.append(bus_x)
         plan.hub_buses[net] = bus_x
         plan.gutter_spans[gkey].append(bus_x)

@@ -303,14 +303,12 @@ def _route_hub_tap(
             )
             if escaped is not None:
                 return escaped
-            # Fail-closed: do not draw a conflicting last-resort tap.
             continue
-    # Prefer a clear path from bus or stub; if corridors are blocked, leave
-    # unrouted so validate reports hub_net_disconnected / open stubs.
+    # Primary stub→bus route (also used when row joins failed). Full foreign
+    # clearance inside hub_tap_path* remains a follow-up; forced overlay feeds
+    # after blocked corridors were removed above.
     if stub > bus_x + WIRE_EPS:
         return hub_tap_path_from_bus(bus_x, port, obstacles, ctx, net)
-    # Still try the standard stub→bus path when the stub is not east of the bus;
-    # escape-column attempts above already failed for row joins.
     return hub_tap_path(port, bus_x, obstacles, ctx, net)
 
 

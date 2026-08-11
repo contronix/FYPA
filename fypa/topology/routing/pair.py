@@ -94,7 +94,7 @@ def _separate_from_assigned_buses(
                     assigned_in_group=assigned_bus,
                 )
             except BusCorridorFull:
-                return min(hi, max(lo, bus_x))
+                raise
     return min(hi, max(lo, bus_x))
 
 
@@ -222,22 +222,25 @@ def signal_wires_from_pairs(
         for _y_slot, bus_slot, a, b in slot_items:
             net = a.net
             start, end = stacked_routing_order(a, b)
-            bus_x = _bus_x_for_pair(
-                a,
-                b,
-                bus_plan=bus_plan,
-                ctx=ctx,
-                col=0,
-                side="",
-                lane=0,
-                n_lanes=0,
-                slot=bus_slot,
-                n_slots=n_slots,
-                channel_lo=channel_lo,
-                channel_hi=channel_hi,
-                assigned_bus=assigned_bus,
-                obstacles=obstacles,
-            )
+            try:
+                bus_x = _bus_x_for_pair(
+                    a,
+                    b,
+                    bus_plan=bus_plan,
+                    ctx=ctx,
+                    col=0,
+                    side="",
+                    lane=0,
+                    n_lanes=0,
+                    slot=bus_slot,
+                    n_slots=n_slots,
+                    channel_lo=channel_lo,
+                    channel_hi=channel_hi,
+                    assigned_bus=assigned_bus,
+                    obstacles=obstacles,
+                )
+            except BusCorridorFull:
+                continue
             assigned_bus.append(bus_x)
             path_d = two_port_wire_path(start, end, bus_x=bus_x, obstacles=obstacles, ctx=ctx)
             wires.append(

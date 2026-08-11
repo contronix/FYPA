@@ -75,15 +75,37 @@ def check_ports_overlapping(model: TopologyModel) -> list[dict]:
 
 
 def check_right_to_left_wires(model: TopologyModel) -> list[dict]:
-    """Power horizontals must not travel right→left except short channel stubs.
+    """Power horizontals must not travel right→left except left-face channel stubs.
 
-    Left-face ports reach their gutter bus with a short outward stub (path
-    order port→bus is decreasing x). Those channel entries are allowed up to
-    ``PORT_WIRE_STUB + WIRE_GUTTER_PAD``. Longer RTL runs are illegal.
+    A short RTL step is allowed only when it starts at a left-face port and ends
+    at that port's stub tip (channel entry). Other short reverse runs are illegal.
     """
     from fypa.topology.geometry import parse_wire_path
+    from fypa.topology.placement import port_stub_x
 
     max_stub = PORT_WIRE_STUB + WIRE_GUTTER_PAD + WIRE_EPS
+    left_ports: list[tuple[float, float, float]] = []
+    for node in model.nodes:
+        for port in node.ports:
+            if port.side != "left" or not port.net or port.net == GND_NET:
+                continue
+            left_ports.append((port.x, port.y, port_stub_x(port)))
+
+    def _is_left_channel_stub(x1: float, y1: float, x2: float) -> bool:
+        for px, py, stub_x in left_ports:
+            if abs(y1 - py) > WIRE_EPS:
+                continue
+            span = x1 - x2
+            if span <= WIRE_EPS or span > max_stub + WIRE_EPS:
+                continue
+            # Port → stub tip
+            if abs(x1 - px) <= WIRE_EPS and abs(x2 - stub_x) <= WIRE_EPS:
+                return True
+            # Stub tip → nearby gutter bus (still within the stub channel band)
+            if abs(x1 - stub_x) <= WIRE_EPS and x2 >= min(px, stub_x) - max_stub - WIRE_EPS:
+                return True
+        return False
+
     issues: list[dict] = []
     for wi, wire in enumerate(model.wires):
         if wire.dashed or not wire.net or wire.net == GND_NET:
@@ -94,7 +116,7 @@ def check_right_to_left_wires(model: TopologyModel) -> list[dict]:
                 continue
             if x1 <= x2 + WIRE_EPS:
                 continue
-            if (x1 - x2) <= max_stub:
+            if _is_left_channel_stub(x1, y1, x2):
                 continue
             issues.append(
                 make_issue(

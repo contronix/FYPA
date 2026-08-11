@@ -80,6 +80,19 @@ def test_right_to_left_wire_flagged():
 
 def test_short_channel_stub_rtl_allowed():
     """Left-face stub toward gutter bus is a short RTL path step — allowed."""
+    port = TopologyPort(
+        terminal="P",
+        net="VIN",
+        label="VIN",
+        side="left",
+        x=100.0,
+        y=50.0,
+        node_id="U1",
+        role="SINK",
+        stub_length=20.0,
+    )
+    node = _node("U1", role="SINK", x=100.0, ports=[port])
+    # port at 100, stub tip at 80 (left face)
     wire = TopologyWire(
         net="VIN",
         path_d="M 100.0,50.0 H 80.0",
@@ -88,7 +101,21 @@ def test_short_channel_stub_rtl_allowed():
         dst_node="",
         dst_terminal="",
     )
-    assert check_right_to_left_wires(TopologyModel(wires=[wire])) == []
+    assert check_right_to_left_wires(TopologyModel(nodes=[node], wires=[wire])) == []
+
+
+def test_short_non_stub_rtl_flagged():
+    """A short reverse run that is not a left-face stub is still illegal."""
+    wire = TopologyWire(
+        net="VIN",
+        path_d="M 150.0,50.0 H 130.0",
+        src_node="J1",
+        src_terminal="P",
+        dst_node="U1",
+        dst_terminal="P",
+    )
+    issues = check_right_to_left_wires(TopologyModel(wires=[wire]))
+    assert any(i["code"] == "right_to_left_wire" for i in issues)
 
 
 def test_left_to_right_wire_ok():

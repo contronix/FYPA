@@ -122,9 +122,6 @@ def plan_gutter_pair_buses(
                         outward=bus_outward(bus_x, channel_lo, channel_hi),
                         assigned_in_group=assigned_bus,
                     )
-                    for prev in assigned_bus:
-                        if abs(bus_x - prev) < MIN_PARALLEL_GAP - WIRE_EPS:
-                            bus_x = min(channel_hi, prev + MIN_PARALLEL_GAP)
             except BusCorridorFull:
                 continue
             assigned_bus.append(bus_x)
