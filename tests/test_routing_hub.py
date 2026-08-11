@@ -748,6 +748,48 @@ def test_connect_row_to_bus_retries_alternate_detour_y(monkeypatch):
     assert " V 180.0 " in f" {path_d} "
 
 
+def test_hub_tap_detour_skips_foreign_gnd_stub_column(monkeypatch):
+    """Y-detour must not drop a vertical on a foreign GND trunk at the stub x.
+
+    Left-port stubs often coincide with the column GND trunk; a detour vertical
+    on that column yields coincident_vertical_x (project_b_hub_vdd regression).
+    """
+    from fypa.topology.constants import GND_NET, PORT_WIRE_STUB
+    from fypa.topology.placement import port_stub_x
+    from fypa.topology.routing.context import RoutingContext
+    from fypa.topology.routing.paths import hub_tap_path
+    from fypa.topology.geometry import parse_wire_path
+
+    port = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=504.0,
+        y=177.0,
+        node_id="U2",
+    )
+    stub = port_stub_x(port)
+    assert abs(stub - (504.0 - PORT_WIRE_STUB)) < 0.1
+    bus_x = 708.0
+    ctx = RoutingContext()
+    # GND trunk shares the stub column and overlaps the detour Y span.
+    ctx.reserve_vertical(stub, 195.0, 408.0, GND_NET)
+
+    monkeypatch.setattr(
+        "fypa.topology.routing.paths.obstacle_detour_y",
+        lambda *_a, **_k: 222.0,
+    )
+    path, _ = hub_tap_path(port, bus_x=bus_x, obstacles=[], ctx=ctx, net="VDD")
+    assert path, "expected escape detour, not fail-closed empty path"
+    # No vertical segment may sit on the GND trunk column.
+    pts = parse_wire_path(path)
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if abs(x0 - x1) < 0.5 and abs(y0 - y1) > 0.5:
+            assert abs(x0 - stub) > 0.5, path
+    assert f"H {bus_x:.1f}" in path or path.rstrip().endswith(f"{bus_x:.1f}")
+
+
 def test_connect_row_to_bus_skips_foreign_vertical_column():
     """Detour vertical must not share a column with a foreign reserved vertical."""
     from fypa.topology.constants import NODE_W

@@ -533,6 +533,41 @@ def hub_row_tap_via_escape_column(
     return None
 
 
+def _hub_tap_detour_drop_x(
+    port: TopologyPort,
+    attach: float,
+    bus_x: float,
+    y: float,
+    y_clear: float,
+    obstacles: list[TopologyNode],
+    ctx: RoutingContext,
+    net: str,
+) -> float | None:
+    """Column for the stub→detour vertical; ``None`` if no clear outward escape."""
+    y_lo, y_hi = min(y, y_clear), max(y, y_clear)
+    if not _foreign_vertical_blocks_column(ctx, attach, y_lo, y_hi, net):
+        return attach
+    # Stub often coincides with a column GND trunk; step further outward.
+    outward = -1.0 if port.side == "left" else 1.0
+    skip = {port.node_id}
+    for step in range(1, 8):
+        cand = round(attach + outward * MIN_PARALLEL_GAP * step, 1)
+        if _foreign_vertical_blocks_column(ctx, cand, y_lo, y_hi, net):
+            continue
+        stub_lo, stub_hi = min(attach, cand), max(attach, cand)
+        if not horizontal_segment_clear(y, stub_lo, stub_hi, obstacles, skip):
+            continue
+        if _foreign_horizontal_blocks_row(ctx, y, stub_lo, stub_hi, net):
+            continue
+        feed_lo, feed_hi = min(cand, bus_x), max(cand, bus_x)
+        if not horizontal_segment_clear(y_clear, feed_lo, feed_hi, obstacles, set()):
+            continue
+        if _foreign_horizontal_blocks_row(ctx, y_clear, feed_lo, feed_hi, net):
+            continue
+        return cand
+    return None
+
+
 def hub_tap_path(
     port: TopologyPort,
     bus_x: float,
@@ -551,8 +586,20 @@ def hub_tap_path(
     else:
         start_leg, attach, _ = path_from_port_stub(port)
     if abs(y_clear - y) > WIRE_EPS:
-        ctx.reserve_vertical(attach, min(y, y_clear), max(y, y_clear), net)
-        ctx.reserve_horizontal(y_clear, x_lo, x_hi, net)
+        drop_x = _hub_tap_detour_drop_x(
+            port, attach, bus_x, y, y_clear, obstacles, ctx, net
+        )
+        if drop_x is None:
+            # No clear detour column (fail-closed); caller may leave the port open.
+            return "", y
+        y_lo, y_hi = min(y, y_clear), max(y, y_clear)
+        if abs(drop_x - attach) > WIRE_EPS:
+            ctx.reserve_horizontal(y, min(attach, drop_x), max(attach, drop_x), net)
+            start_leg = f"{start_leg} H {drop_x:.1f}"
+        ctx.reserve_vertical(drop_x, y_lo, y_hi, net)
+        ctx.reserve_horizontal(
+            y_clear, min(drop_x, bus_x), max(drop_x, bus_x), net
+        )
         path = f"{start_leg} V {y_clear:.1f} H {bus_x:.1f}"
         return simplify_wire_path(path), y_clear
     if foreign_vertical_covers_y(ctx, attach, y, net):
