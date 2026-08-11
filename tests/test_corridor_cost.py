@@ -88,6 +88,21 @@ def test_obstacle_detour_y_snaps_to_existing_same_net_band():
     assert abs(y - 279.0) < 1.0
 
 
+def test_obstacle_detour_y_avoids_same_net_twin_gap():
+    """When reuse is blocked, do not land in (0, MIN_PARALLEL_GAP) of a same-net H."""
+    from fypa.topology.constants import MIN_PARALLEL_GAP
+
+    ctx = RoutingContext()
+    ctx.reserve_horizontal(200.0, 80.0, 300.0, "VDD")
+    # Body bottom at y=200; downward clear is 210 (OBSTACLE_CLEAR), inside the
+    # illegal twin gap relative to the same-net band at 200 unless nudged.
+    body = _block("L1", 120.0, 150.0, height=50.0)
+    y = obstacle_detour_y(ctx, 175.0, 80.0, 300.0, [body], {"L1"}, "VDD")
+    # Prefer exact reuse, or at least MIN_PARALLEL_GAP away — never a twin gap.
+    gap = abs(y - 200.0)
+    assert gap <= 0.5 or gap >= MIN_PARALLEL_GAP - 0.1, y
+
+
 def test_hub_fail_closed_rolls_back_context_bands():
     """Discarded hub geometry must not leave phantom reservations for later nets."""
     from fypa.topology.routing.hub import route_hub

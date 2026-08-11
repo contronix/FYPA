@@ -79,11 +79,18 @@ def _obstacle_detour_y_direction(
         for _ in range(len(ctx.horizontal_bands) + 1):
             blocked = False
             for by, blo, bhi, bnet in ctx.horizontal_bands:
-                if net is not None and bnet == net:
-                    continue
                 if hi <= blo + WIRE_EPS or lo >= bhi - WIRE_EPS:
                     continue
-                if abs(by - y) < MIN_PARALLEL_GAP - WIRE_EPS:
+                gap = abs(by - y)
+                if gap <= WIRE_EPS:
+                    # Exact same-net reuse is legal; foreign on the same y must move.
+                    if net is not None and bnet == net:
+                        continue
+                    y = by + MIN_PARALLEL_GAP if downward else by - MIN_PARALLEL_GAP
+                    blocked = True
+                    break
+                if gap < MIN_PARALLEL_GAP - WIRE_EPS:
+                    # Foreign near-parallel *and* same-net twins (RULES.md §21).
                     y = by + MIN_PARALLEL_GAP if downward else by - MIN_PARALLEL_GAP
                     blocked = True
                     break
@@ -215,6 +222,33 @@ def obstacle_detour_y(
         if cost < best_cost - WIRE_EPS:
             best_cost = cost
             best_y = by
+    if best_cost == float("inf"):
+        # Directional detour landed in an illegal twin gap and reuse was blocked;
+        # force the next legal slot past the nearest same-net band.
+        for by, blo, bhi, bnet in ctx.horizontal_bands:
+            if bnet != net:
+                continue
+            if hi <= blo + WIRE_EPS or lo >= bhi - WIRE_EPS:
+                continue
+            for cand in (by + MIN_PARALLEL_GAP, by - MIN_PARALLEL_GAP):
+                if not horizontal_segment_clear(cand, lo, hi, obstacles, skip_node_ids):
+                    continue
+                if _foreign_horizontal_blocks_row_local(ctx, cand, lo, hi, net):
+                    continue
+                cost = corridor_cost(
+                    cand,
+                    y_nominal,
+                    lo,
+                    hi,
+                    obstacles,
+                    skip_node_ids,
+                    bends=1,
+                    ctx=ctx,
+                    net=net,
+                )
+                if cost < best_cost:
+                    best_cost = cost
+                    best_y = cand
     return best_y
 
 
