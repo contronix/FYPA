@@ -238,27 +238,8 @@ def _connect_row_to_bus(
             trunk_y = plan.y_row if abs(y_feed - plan.y_row) <= WIRE_EPS else y_feed
             return trunk_y, path_d
 
-    # Every clear candidate was blocked by foreign wiring. Leaving the row
-    # detached from the trunk is electrically wrong, so force a connection that
-    # still detours physical symbol bodies. It may cross a foreign wire (a
-    # validation warning), but connectivity must never be silently dropped.
-    y_forced = obstacle_detour_y(ctx, plan.y_row, lo, hi, obstacles, set(), net)
-    if abs(y_forced - plan.y_row) > WIRE_EPS:
-        y_lo, y_hi = min(plan.y_row, y_forced), max(plan.y_row, y_forced)
-        ctx.reserve_vertical(edge_x, y_lo, y_hi, net)
-        ctx.reserve_horizontal(y_forced, lo, hi, net)
-        return y_forced, simplify_wire_path(
-            f"M {edge_x:.1f},{plan.y_row:.1f} V {y_forced:.1f} H {bus_x:.1f}",
-        )
-    ctx.reserve_horizontal(
-        plan.y_row,
-        min(plan.span_lo, bus_x),
-        max(plan.span_hi, bus_x),
-        net,
-    )
-    return plan.y_row, simplify_wire_path(
-        f"M {edge_x:.1f},{plan.y_row:.1f} H {bus_x:.1f}",
-    )
+    # Fail-closed: no legal channel feed to the trunk (RULES.md).
+    return None, None
 
 
 def _route_hub_tap(
@@ -322,9 +303,14 @@ def _route_hub_tap(
             )
             if escaped is not None:
                 return escaped
+            # Fail-closed: do not draw a conflicting last-resort tap.
             continue
+    # Prefer a clear path from bus or stub; if corridors are blocked, leave
+    # unrouted so validate reports hub_net_disconnected / open stubs.
     if stub > bus_x + WIRE_EPS:
         return hub_tap_path_from_bus(bus_x, port, obstacles, ctx, net)
+    # Still try the standard stub→bus path when the stub is not east of the bus;
+    # escape-column attempts above already failed for row joins.
     return hub_tap_path(port, bus_x, obstacles, ctx, net)
 
 

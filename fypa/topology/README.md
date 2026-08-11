@@ -3,6 +3,8 @@
 Abstract PDN flow diagram: components as column layout, orthogonal wire routing,
 junction points and bridge symbols, net labels, and SVG rendering for the FYPA viewer.
 
+Normative layout rules: [`RULES.md`](RULES.md).
+
 The viewer rebuilds the diagram live while editor-mode changes are pending (before
 Resolve), using :func:`fypa.topology.preview.metadata_for_topology`.
 

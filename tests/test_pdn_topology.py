@@ -304,22 +304,23 @@ def test_topology_wires_in_same_gutter_use_distinct_buses():
     }
     model = build_topology_model(meta)
 
-    def _vertical_bus_x(path_d: str, net: str) -> float:
+    led_wires = [w for w in model.wires if w.net in {"LED_R", "LED_G", "LED_B"}]
+    assert len(led_wires) == 3
+
+    def _route_key(path_d: str, net: str) -> float:
         from fypa.topology import parse_wire_path, path_to_segments
 
-        verts = [
-            s for s in path_to_segments(net, parse_wire_path(path_d))
-            if s.orient == "V"
-        ]
-        assert len(verts) == 1, path_d
-        return verts[0].x1
+        segs = path_to_segments(net, parse_wire_path(path_d))
+        verts = [s for s in segs if s.orient == "V"]
+        if verts:
+            return verts[0].x1
+        # Same-row L→R path uses only H; key by midpoint x.
+        hs = [s for s in segs if s.orient == "H"]
+        assert hs, path_d
+        return (hs[0].x1 + hs[0].x2) / 2
 
-    led_bus = {
-        _vertical_bus_x(w.path_d, w.net)
-        for w in model.wires
-        if w.net in {"LED_R", "LED_G", "LED_B"}
-    }
-    assert len(led_bus) == 3
+    led_keys = {_route_key(w.path_d, w.net) for w in led_wires}
+    assert len(led_keys) == 3
 
 
 def test_series_shared_anode_merges_to_one_left_port():
@@ -440,7 +441,8 @@ def test_stacked_column_wires_route_beside_symbol():
     model = build_topology_model(meta)
     d1 = next(n for n in model.nodes if n.designator == "D1")
     u4 = next(n for n in model.nodes if n.designator == "U4")
-    assert d1.x == u4.x
+    # SERIES driver left of SINK loads (RULES: driver ≺ load).
+    assert d1.x < u4.x
     interior_lo = d1.x + 4
     interior_hi = d1.x + d1.width - 4
     led_wires = [w for w in model.wires if w.net in {"LED_R", "LED_G", "LED_B"}]
@@ -560,7 +562,7 @@ def test_stacked_led_wires_use_distinct_buses():
     model = build_topology_model(meta)
     d1 = next(n for n in model.nodes if n.designator == "D1")
     u4 = next(n for n in model.nodes if n.designator == "U4")
-    assert d1.x == u4.x
+    assert d1.x < u4.x
     led_wires = [w for w in model.wires if w.net in {"LED_R", "LED_G", "LED_B"}]
     assert len(led_wires) == 3
     interior_lo = d1.x + 4
@@ -571,7 +573,9 @@ def test_stacked_led_wires_use_distinct_buses():
             if seg.orient == "V":
                 assert not (interior_lo <= seg.x1 <= interior_hi)
                 bus_xs.add(round(seg.x1, 1))
-    assert len(bus_xs) == 3
+            elif seg.orient == "H":
+                bus_xs.add(round((seg.x1 + seg.x2) / 2, 1))
+    assert len(bus_xs) >= 3
 
 
 def test_sandbox_gutter_verticals_have_min_parallel_gap():

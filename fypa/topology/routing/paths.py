@@ -303,14 +303,18 @@ def hub_row_stub_columns(group: list[TopologyPort]) -> tuple[float, float]:
 
 
 def hub_row_path(group: list[TopologyPort], y: float) -> str:
+    """Horizontal hub row drawn strictly left→right (RULES: no RTL wires)."""
     ordered = sorted(group, key=lambda p: p.x)
-    left = ordered[0]
-    xs: list[float] = [port_stub_x(port) for port in ordered]
+    xs: list[float] = [p.x for p in ordered]
+    xs.extend(port_stub_x(port) for port in ordered)
     right = ordered[-1]
     if abs(right.x - port_stub_x(right)) > WIRE_EPS:
         xs.append(right.x)
-    parts = [f"M {left.x:.1f},{y:.1f}"]
-    for x in sorted(xs):
+    points = sorted(set(round(x, 1) for x in xs))
+    if not points:
+        return f"M {ordered[0].x:.1f},{y:.1f}"
+    parts = [f"M {points[0]:.1f},{y:.1f}"]
+    for x in points[1:]:
         parts.append(f"H {x:.1f}")
     return simplify_wire_path(" ".join(parts))
 

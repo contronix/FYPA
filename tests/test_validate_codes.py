@@ -140,10 +140,22 @@ def test_foreign_wire_crossing_detected():
 
 
 def test_check_gutter_wire_crossings_on_model():
+    """Hub↔hub crossings are included; fixture may report them as errors."""
     from tests.topology_fixtures import load_topology_fixture
 
     model = build_topology_model(load_topology_fixture("project_a_stepper_loop_rails"))
-    assert not check_gutter_wire_crossings(model)
+    issues = check_gutter_wire_crossings(model)
+    assert all(i["code"] == "foreign_wire_crossing" for i in issues)
+
+
+def test_hub_hub_crossing_no_longer_exempt():
+    """Two hub nets that cross in a gutter must be flagged (RULES: no overlap)."""
+    from fypa.topology.geometry import WireSeg
+    from fypa.topology.validate.util import foreign_segments_cross
+
+    segs_a = [WireSeg("NET_A", "V", 100.0, 10.0, 100.0, 90.0, wire_index=0)]
+    segs_b = [WireSeg("NET_B", "H", 40.0, 50.0, 160.0, 50.0, wire_index=1)]
+    assert foreign_segments_cross(segs_a, segs_b)
 
 
 def test_check_gutter_wire_crossings_uses_all_hub_wires():

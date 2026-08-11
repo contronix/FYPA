@@ -41,3 +41,34 @@ def is_output_port(role: str, terminal: str, side: str) -> bool:
     if role in ("RESISTOR", "SERIES"):
         return _terminal_matches("N", terminal)
     return False
+
+
+def expected_port_side(role: str, terminal: str) -> str | None:
+    """Canonical face for a power/return port: input=left, output=right.
+
+    Returns ``None`` when the terminal name is not part of the role's port
+    vocabulary (unknown / channel extras stay unconstrained here).
+    """
+    if role == "SOURCE":
+        if _terminal_matches("P", terminal):
+            return "right"
+        if _terminal_matches("N", terminal):
+            return "left"
+        return None
+    if role == "SINK":
+        if _terminal_matches("P", terminal) or _terminal_matches("N", terminal):
+            return "left"
+        return None
+    if role == "REGULATOR":
+        if terminal.startswith("IN_"):
+            return "left"
+        if terminal.startswith("OUT_"):
+            return "right"
+        return None
+    if role in ("RESISTOR", "SERIES"):
+        if _terminal_matches("P", terminal):
+            return "left"
+        if _terminal_matches("N", terminal):
+            return "right"
+        return None
+    return None

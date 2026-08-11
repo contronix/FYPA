@@ -391,9 +391,6 @@ def check_gutter_wire_crossings(model: TopologyModel) -> list[dict]:
         if wire.dashed or not wire.net:
             continue
         wires_by_net[wire.net].append(wire)
-    hub_nets = {
-        w.net for w in model.wires if w.net and not w.dashed and w.routing_kind.startswith("hub")
-    }
     issues: list[dict] = []
     for _gkey, nets in gutter_groups(all_ports).items():
         active = sorted(net for net in nets if net in wires_by_net)
@@ -405,8 +402,6 @@ def check_gutter_wire_crossings(model: TopologyModel) -> list[dict]:
         }
         for i, net_a in enumerate(active):
             for net_b in active[i + 1 :]:
-                if net_a in hub_nets and net_b in hub_nets:
-                    continue
                 if foreign_segments_cross(segs_by_net[net_a], segs_by_net[net_b]):
                     issues.append(
                         make_issue(
@@ -425,7 +420,7 @@ def check_vertical_under_node(
     *,
     directive_nodes: list[TopologyNode] | None = None,
 ) -> list[dict]:
-    """Warn when a vertical segment runs under a directive node body."""
+    """Error when a vertical segment runs under a directive node body."""
     nodes = directive_nodes
     if nodes is None:
         nodes = [n for n in model.nodes if n.role != "GND"]
@@ -445,7 +440,6 @@ def check_vertical_under_node(
                             f"Vertical segment at x={x:.1f} ({seg.net}) "
                             f"runs under node {node.designator}"
                         ),
-                        severity="warning",
                         net=seg.net,
                         node_id=node.node_id,
                         x=round(x, 1),

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fypa.topology.placement.bus_grid import allocate_bus_x, gnd_column_trunk_x
+from fypa.topology.placement.bus_grid import BusCorridorFull, allocate_bus_x, gnd_column_trunk_x
 from fypa.topology.placement.classify import (
     SignalNetGroups,
     classify_signal_nets,

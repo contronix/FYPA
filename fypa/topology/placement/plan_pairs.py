@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from fypa.topology.constants import MIN_PARALLEL_GAP, WIRE_EPS
-from fypa.topology.placement.bus_grid import allocate_bus_x
+from fypa.topology.placement.bus_grid import BusCorridorFull, allocate_bus_x
 from fypa.topology.placement.gutter_corridors import (
     ColumnGap,
     pick_gutter_bus_x,
@@ -46,16 +46,19 @@ def plan_stacked_pair_buses(
             for prev in assigned_bus:
                 if abs(bus_x - prev) < MIN_PARALLEL_GAP - WIRE_EPS:
                     bus_x = prev + outward * MIN_PARALLEL_GAP
-            bus_x = allocate_bus_x(
-                bus_x,
-                y_lo,
-                y_hi,
-                bus_x - MIN_PARALLEL_GAP,
-                bus_x + MIN_PARALLEL_GAP,
-                reserved,
-                net,
-                outward=outward,
-            )
+            try:
+                bus_x = allocate_bus_x(
+                    bus_x,
+                    y_lo,
+                    y_hi,
+                    bus_x - MIN_PARALLEL_GAP * max(n_lanes, 2),
+                    bus_x + MIN_PARALLEL_GAP * max(n_lanes, 2),
+                    reserved,
+                    net,
+                    outward=outward,
+                )
+            except BusCorridorFull:
+                continue
             plan.pair_buses[net] = bus_x
             assigned_bus.append(bus_x)
             reserved.append((bus_x, y_lo, y_hi, net))
@@ -86,41 +89,44 @@ def plan_gutter_pair_buses(
             y_lo, y_hi = min(a.y, b.y), max(a.y, b.y)
             anchor_x = port_stub_x(a)
             outward = 1.0 if a.side == "right" else -1.0
-            if gaps:
-                bus_x = pick_gutter_bus_x(
-                    bus_slot,
-                    n_slots,
-                    channel_lo,
-                    channel_hi,
-                    gaps,
-                    net,
-                    y_lo=y_lo,
-                    y_hi=y_hi,
-                    anchor_x=anchor_x,
-                    outward=outward,
-                    reserved=reserved,
-                    assigned_in_group=assigned_bus,
-                )
-            else:
-                bus_x = nominal_gutter_bus_x(bus_slot, n_slots, channel_lo, channel_hi)
-                for prev in assigned_bus:
-                    if bus_x < prev + MIN_PARALLEL_GAP - WIRE_EPS:
-                        bus_x = prev + MIN_PARALLEL_GAP
-                bus_x = min(channel_hi, max(channel_lo, bus_x))
-                bus_x = allocate_bus_x(
-                    bus_x,
-                    y_lo,
-                    y_hi,
-                    channel_lo,
-                    channel_hi,
-                    reserved,
-                    net,
-                    outward=bus_outward(bus_x, channel_lo, channel_hi),
-                    assigned_in_group=assigned_bus,
-                )
-                for prev in assigned_bus:
-                    if abs(bus_x - prev) < MIN_PARALLEL_GAP - WIRE_EPS:
-                        bus_x = min(channel_hi, prev + MIN_PARALLEL_GAP)
+            try:
+                if gaps:
+                    bus_x = pick_gutter_bus_x(
+                        bus_slot,
+                        n_slots,
+                        channel_lo,
+                        channel_hi,
+                        gaps,
+                        net,
+                        y_lo=y_lo,
+                        y_hi=y_hi,
+                        anchor_x=anchor_x,
+                        outward=outward,
+                        reserved=reserved,
+                        assigned_in_group=assigned_bus,
+                    )
+                else:
+                    bus_x = nominal_gutter_bus_x(bus_slot, n_slots, channel_lo, channel_hi)
+                    for prev in assigned_bus:
+                        if bus_x < prev + MIN_PARALLEL_GAP - WIRE_EPS:
+                            bus_x = prev + MIN_PARALLEL_GAP
+                    bus_x = min(channel_hi, max(channel_lo, bus_x))
+                    bus_x = allocate_bus_x(
+                        bus_x,
+                        y_lo,
+                        y_hi,
+                        channel_lo,
+                        channel_hi,
+                        reserved,
+                        net,
+                        outward=bus_outward(bus_x, channel_lo, channel_hi),
+                        assigned_in_group=assigned_bus,
+                    )
+                    for prev in assigned_bus:
+                        if abs(bus_x - prev) < MIN_PARALLEL_GAP - WIRE_EPS:
+                            bus_x = min(channel_hi, prev + MIN_PARALLEL_GAP)
+            except BusCorridorFull:
+                continue
             assigned_bus.append(bus_x)
             plan.pair_buses[net] = bus_x
             plan.gutter_spans[gkey].append(bus_x)

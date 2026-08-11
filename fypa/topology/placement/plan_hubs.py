@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from fypa.topology.constants import MIN_PARALLEL_GAP, WIRE_EPS
-from fypa.topology.placement.bus_grid import allocate_bus_x, nudge_bus_from_gnd_columns
+from fypa.topology.placement.bus_grid import (
+    BusCorridorFull,
+    allocate_bus_x,
+    nudge_bus_from_gnd_columns,
+)
 from fypa.topology.placement.gutter_corridors import (
     ColumnGap,
     pick_gutter_bus_x,
@@ -37,16 +41,19 @@ def plan_stack_hub_buses(
             y_lo = min(p.y for p in ports)
             y_hi = max(p.y for p in ports)
             outward = 1.0 if side == "right" else -1.0
-            bus_x = allocate_bus_x(
-                bus_x,
-                y_lo,
-                y_hi,
-                bus_x - MIN_PARALLEL_GAP,
-                bus_x + MIN_PARALLEL_GAP,
-                reserved,
-                net,
-                outward=outward,
-            )
+            try:
+                bus_x = allocate_bus_x(
+                    bus_x,
+                    y_lo,
+                    y_hi,
+                    bus_x - MIN_PARALLEL_GAP * max(n_lanes, 2),
+                    bus_x + MIN_PARALLEL_GAP * max(n_lanes, 2),
+                    reserved,
+                    net,
+                    outward=outward,
+                )
+            except BusCorridorFull:
+                continue
             plan.stack_buses[(col, side, net)] = bus_x
             plan.hub_buses[net] = bus_x
             reserved.append((bus_x, y_lo, y_hi, net))
@@ -101,50 +108,53 @@ def plan_gutter_hub_buses(
         bus_hi = max(bus_hi, bus_x)
         bus_x = min(bus_hi, max(bus_lo, bus_x))
         n_hub_slots = max(len(gutter_hub_nets.get(gkey, [])), 1)
-        if gaps:
-            bus_x = pick_gutter_bus_x(
-                len(assigned_bus),
-                n_hub_slots,
-                bus_lo,
-                bus_hi,
-                gaps,
-                net,
-                y_lo=y_lo,
-                y_hi=y_hi,
-                anchor_x=anchor_stub,
-                outward=outward,
-                reserved=reserved,
-                assigned_in_group=assigned_bus,
-            )
-            corridor = resolve_gutter_corridor(
-                bus_lo,
-                bus_hi,
-                gaps,
-                anchor_x=anchor_stub,
-                n_slots=n_hub_slots,
-            )
-            if corridor is not None:
-                corridor_lo, corridor_hi = corridor
-                bus_x = separate_from_assigned_buses(
-                    bus_x,
-                    assigned_bus,
+        try:
+            if gaps:
+                bus_x = pick_gutter_bus_x(
+                    len(assigned_bus),
+                    n_hub_slots,
+                    bus_lo,
+                    bus_hi,
+                    gaps,
+                    net,
+                    y_lo=y_lo,
+                    y_hi=y_hi,
+                    anchor_x=anchor_stub,
                     outward=outward,
-                    bus_lo=corridor_lo,
-                    bus_hi=corridor_hi,
+                    reserved=reserved,
+                    assigned_in_group=assigned_bus,
                 )
-                bus_x = max(corridor_lo, min(corridor_hi, bus_x))
-        else:
-            bus_x = allocate_bus_x(
-                bus_x,
-                y_lo,
-                y_hi,
-                bus_lo,
-                bus_hi,
-                reserved,
-                net,
-                outward=outward,
-                assigned_in_group=assigned_bus,
-            )
+                corridor = resolve_gutter_corridor(
+                    bus_lo,
+                    bus_hi,
+                    gaps,
+                    anchor_x=anchor_stub,
+                    n_slots=n_hub_slots,
+                )
+                if corridor is not None:
+                    corridor_lo, corridor_hi = corridor
+                    bus_x = separate_from_assigned_buses(
+                        bus_x,
+                        assigned_bus,
+                        outward=outward,
+                        bus_lo=corridor_lo,
+                        bus_hi=corridor_hi,
+                    )
+                    bus_x = max(corridor_lo, min(corridor_hi, bus_x))
+            else:
+                bus_x = allocate_bus_x(
+                    bus_x,
+                    y_lo,
+                    y_hi,
+                    bus_lo,
+                    bus_hi,
+                    reserved,
+                    net,
+                    outward=outward,
+                    assigned_in_group=assigned_bus,
+                )
+        except BusCorridorFull:
+            continue
         if not gaps:
             bus_x = separate_from_assigned_buses(
                 bus_x,

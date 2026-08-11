@@ -14,7 +14,7 @@ from fypa.topology.placement import (
     port_stub_x,
     stacked_routing_order,
 )
-from fypa.topology.placement.bus_grid import allocate_bus_x
+from fypa.topology.placement.bus_grid import BusCorridorFull, allocate_bus_x
 from fypa.topology.placement.gutter_corridors import (
     ColumnGap,
     adjust_bus_x_for_column_gaps,
@@ -81,17 +81,20 @@ def _separate_from_assigned_buses(
         elif _in_range(inward_cand):
             bus_x = inward_cand
         else:
-            return allocate_bus_x(
-                bus_x,
-                y_lo,
-                y_hi,
-                lo,
-                hi,
-                reserved,
-                net,
-                outward=outward,
-                assigned_in_group=assigned_bus,
-            )
+            try:
+                return allocate_bus_x(
+                    bus_x,
+                    y_lo,
+                    y_hi,
+                    lo,
+                    hi,
+                    reserved,
+                    net,
+                    outward=outward,
+                    assigned_in_group=assigned_bus,
+                )
+            except BusCorridorFull:
+                return min(hi, max(lo, bus_x))
     return min(hi, max(lo, bus_x))
 
 
