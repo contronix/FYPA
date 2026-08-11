@@ -11,6 +11,7 @@ from fypa.topology.validate.labels import check_wire_labels
 from fypa.topology.validate.segments import (
     check_gutter_wire_crossings,
     check_parallel_vertical_gap,
+    check_redundant_parallel_runs,
     check_segment_spacing,
     check_signal_vs_gnd_drop_gap,
     check_vertical_bus_column_gaps,
@@ -26,6 +27,7 @@ from fypa.topology.validate.rules import (
     check_ports_overlapping,
     check_right_to_left_wires,
     check_source_sink_columns,
+    check_wire_bends_excessive,
     check_wire_detour_excessive,
     check_wire_outside_channel,
 )
@@ -45,8 +47,10 @@ __all__ = [
     "check_right_to_left_wires",
     "check_segment_spacing",
     "check_source_sink_columns",
+    "check_wire_bends_excessive",
     "check_wire_detour_excessive",
     "check_wire_outside_channel",
+    "check_redundant_parallel_runs",
     "merge_validation_issues",
     "validate_topology",
     "vertical_segment_overlaps_node_body",
@@ -78,6 +82,7 @@ def validate_topology(
     issues.extend(check_source_sink_columns(model))
     issues.extend(check_loop_return_in_pair_gutter(model))
     issues.extend(check_wire_detour_excessive(model))
+    issues.extend(check_wire_bends_excessive(model))
     issues.extend(check_hub_net_unrouted(model))
 
     if geo is None:
@@ -89,6 +94,7 @@ def validate_topology(
 
     issues.extend(check_wire_labels(model, geo))
     issues.extend(check_segment_spacing(geo.segments, geo.junctions, geo.bridges))
+    issues.extend(check_redundant_parallel_runs(geo.segments))
     issues.extend(check_open_stub_ends(model, geo=geo))
     issues.extend(check_dangling_wire_endpoints(model, geo))
     issues.extend(check_hub_net_disconnected(model, geo))

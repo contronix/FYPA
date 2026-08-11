@@ -7,6 +7,7 @@ from collections import defaultdict
 from fypa.topology.constants import (
     GND_NET,
     MAX_DETOUR_RATIO,
+    MAX_EXTRA_BENDS,
     NODE_W,
     PORT_R,
     PORT_WIRE_STUB,
@@ -470,6 +471,64 @@ def check_wire_detour_excessive(model: TopologyModel) -> list[dict]:
                 length=round(drawn, 1),
                 manhattan=round(base, 1),
                 ratio=round(drawn / base, 2),
+                wire_index=wi,
+            )
+        )
+    return issues
+
+
+def _polyline_bend_count(points: list[tuple[float, float]]) -> int:
+    """Count axis changes / reversals along an orthogonal polyline."""
+    bends = 0
+    i = 1
+    while i < len(points) - 1:
+        x0, y0 = points[i - 1]
+        x1, y1 = points[i]
+        x2, y2 = points[i + 1]
+        dx1, dy1 = x1 - x0, y1 - y0
+        dx2, dy2 = x2 - x1, y2 - y1
+        if abs(dx1) + abs(dy1) < WIRE_EPS:
+            i += 1
+            continue
+        if abs(dx2) + abs(dy2) < WIRE_EPS:
+            i += 1
+            continue
+        o1 = "H" if abs(dy1) < WIRE_EPS else "V"
+        o2 = "H" if abs(dy2) < WIRE_EPS else "V"
+        if o1 != o2 or dx1 * dx2 + dy1 * dy2 < 0:
+            bends += 1
+        i += 1
+    return bends
+
+
+def check_wire_bends_excessive(model: TopologyModel) -> list[dict]:
+    """Flag wires with more bends than Manhattan-min + MAX_EXTRA_BENDS."""
+    issues: list[dict] = []
+    for wi, wire in enumerate(model.wires):
+        if wire.dashed or not wire.net or wire.net == GND_NET:
+            continue
+        points = parse_wire_path(wire.path_d)
+        if len(points) < 2:
+            continue
+        bends = _polyline_bend_count(points)
+        x0, y0 = points[0]
+        x1, y1 = points[-1]
+        manhattan_min = 0 if abs(x0 - x1) < WIRE_EPS or abs(y0 - y1) < WIRE_EPS else 1
+        limit = manhattan_min + MAX_EXTRA_BENDS
+        if bends <= limit:
+            continue
+        issues.append(
+            make_issue(
+                "wire_bends_excessive",
+                (
+                    f"Wire {wire.net} has {bends} bends "
+                    f"(limit {limit} = Manhattan-min {manhattan_min} "
+                    f"+ MAX_EXTRA_BENDS {MAX_EXTRA_BENDS})"
+                ),
+                net=wire.net,
+                bends=bends,
+                limit=limit,
+                manhattan_min=manhattan_min,
                 wire_index=wi,
             )
         )

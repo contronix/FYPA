@@ -55,6 +55,38 @@ def test_obstacle_detour_y_picks_lower_cost_side():
     assert abs(y - expected) <= 1.0, (y, expected, cost_up, cost_down)
 
 
+def test_corridor_cost_penalizes_foreign_crossings():
+    ctx = RoutingContext()
+    ctx.reserve_vertical(150.0, 0.0, 200.0, "OTHER")
+    clear = corridor_cost(
+        100.0, 100.0, 80.0, 300.0, [], set(), bends=0, ctx=ctx, net="VDD"
+    )
+    # No foreign vertical in a short span that avoids x=150.
+    short = corridor_cost(
+        100.0, 100.0, 80.0, 120.0, [], set(), bends=0, ctx=ctx, net="VDD"
+    )
+    assert clear > short
+
+
+def test_corridor_cost_prefers_reusing_same_net_band():
+    ctx = RoutingContext()
+    ctx.reserve_horizontal(200.0, 80.0, 300.0, "VDD")
+    reuse = corridor_cost(
+        200.0, 205.0, 80.0, 300.0, [], set(), bends=0, ctx=ctx, net="VDD"
+    )
+    twin = corridor_cost(
+        208.0, 205.0, 80.0, 300.0, [], set(), bends=0, ctx=ctx, net="VDD"
+    )
+    assert reuse < twin
+
+
+def test_obstacle_detour_y_snaps_to_existing_same_net_band():
+    ctx = RoutingContext()
+    ctx.reserve_horizontal(279.0, 400.0, 1340.0, "VDD")
+    y = obstacle_detour_y(ctx, 284.0, 400.0, 1340.0, [], set(), "VDD")
+    assert abs(y - 279.0) < 1.0
+
+
 def test_hub_fail_closed_rolls_back_context_bands():
     """Discarded hub geometry must not leave phantom reservations for later nets."""
     from fypa.topology.routing.hub import route_hub

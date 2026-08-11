@@ -260,6 +260,44 @@ def test_wire_detour_excessive():
     assert any(i["code"] == "wire_detour_excessive" for i in issues)
 
 
+def test_wire_bends_excessive():
+    from fypa.topology.validate import check_wire_bends_excessive
+
+    # Manhattan-min 1; 5 bends > 1+2.
+    wire = TopologyWire(
+        net="VIN",
+        path_d="M 0.0,0.0 H 20.0 V 20.0 H 40.0 V 40.0 H 100.0",
+    )
+    issues = check_wire_bends_excessive(TopologyModel(wires=[wire]))
+    assert any(i["code"] == "wire_bends_excessive" for i in issues)
+
+
+def test_redundant_parallel_run_same_net_horizontals():
+    from fypa.topology.geometry import compute_schematic_geometry
+    from fypa.topology.validate import check_redundant_parallel_runs
+
+    wires = [
+        TopologyWire(net="VIN", path_d="M 0.0,100.0 H 200.0"),
+        TopologyWire(net="VIN", path_d="M 50.0,108.0 H 250.0"),
+    ]
+    geo = compute_schematic_geometry(wires)
+    issues = check_redundant_parallel_runs(geo.segments)
+    assert any(i["code"] == "redundant_parallel_run" for i in issues)
+
+
+def test_redundant_parallel_run_allows_collinear():
+    from fypa.topology.geometry import compute_schematic_geometry
+    from fypa.topology.validate import check_redundant_parallel_runs
+
+    wires = [
+        TopologyWire(net="VIN", path_d="M 0.0,100.0 H 100.0"),
+        TopologyWire(net="VIN", path_d="M 100.0,100.0 H 200.0"),
+    ]
+    geo = compute_schematic_geometry(wires)
+    issues = check_redundant_parallel_runs(geo.segments)
+    assert not any(i["code"] == "redundant_parallel_run" for i in issues)
+
+
 def test_wire_detour_excessive_closed_path():
     from fypa.topology.validate import check_wire_detour_excessive
 

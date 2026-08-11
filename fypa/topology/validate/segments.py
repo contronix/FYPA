@@ -143,6 +143,74 @@ def check_segment_spacing(
     return issues
 
 
+def check_redundant_parallel_runs(
+    segments: list[WireSeg],
+) -> list[dict]:
+    """Same-net H/V pairs closer than MIN_PARALLEL_GAP with overlapping spans."""
+    issues: list[dict] = []
+    verticals = [s for s in segments if s.orient == "V"]
+    horizontals = [s for s in segments if s.orient == "H"]
+
+    for i, a in enumerate(verticals):
+        a_lo, a_hi = segment_span(a)
+        for b in verticals[i + 1 :]:
+            if a.net != b.net or not a.net:
+                continue
+            gap = abs(a.x1 - b.x1)
+            if gap <= WIRE_EPS or gap >= MIN_PARALLEL_GAP - WIRE_EPS:
+                continue
+            b_lo, b_hi = segment_span(b)
+            if not intervals_overlap(a_lo, a_hi, b_lo, b_hi):
+                continue
+            issues.append(
+                make_issue(
+                    "redundant_parallel_run",
+                    (
+                        f"Same-net verticals on {a.net} at x={a.x1:.1f} and "
+                        f"x={b.x1:.1f} are only {gap:.1f}px apart "
+                        f"(wires {a.wire_index}, {b.wire_index})"
+                    ),
+                    net=a.net,
+                    orient="V",
+                    x=round(a.x1, 1),
+                    x2=round(b.x1, 1),
+                    gap=round(gap, 1),
+                    wire_a=a.wire_index,
+                    wire_b=b.wire_index,
+                )
+            )
+
+    for i, a in enumerate(horizontals):
+        a_lo, a_hi = segment_span(a)
+        for b in horizontals[i + 1 :]:
+            if a.net != b.net or not a.net:
+                continue
+            gap = abs(a.y1 - b.y1)
+            if gap <= WIRE_EPS or gap >= MIN_PARALLEL_GAP - WIRE_EPS:
+                continue
+            b_lo, b_hi = segment_span(b)
+            if not intervals_overlap(a_lo, a_hi, b_lo, b_hi):
+                continue
+            issues.append(
+                make_issue(
+                    "redundant_parallel_run",
+                    (
+                        f"Same-net horizontals on {a.net} at y={a.y1:.1f} and "
+                        f"y={b.y1:.1f} are only {gap:.1f}px apart "
+                        f"(wires {a.wire_index}, {b.wire_index})"
+                    ),
+                    net=a.net,
+                    orient="H",
+                    y=round(a.y1, 1),
+                    y2=round(b.y1, 1),
+                    gap=round(gap, 1),
+                    wire_a=a.wire_index,
+                    wire_b=b.wire_index,
+                )
+            )
+    return issues
+
+
 def check_wires_through_foreign_nodes(model: TopologyModel) -> list[dict]:
     """Per-wire segments must not cross foreign directive node bodies."""
     issues: list[dict] = []

@@ -112,6 +112,8 @@ def obstacle_detour_y(
     """Return a Y that clears obstacles and reserved horizontal bands.
 
     Chooses the lower-cost of upward vs downward when both clear (RULES.md §20).
+    Prefers an existing same-net horizontal band when one already covers the span
+    (RULES.md §21).
     """
     from fypa.topology.routing.cost import corridor_cost
 
@@ -137,23 +139,100 @@ def obstacle_detour_y(
         downward=False,
     )
     if abs(y_down - y_nominal) < WIRE_EPS:
-        return y_down
-    if abs(y_up - y_nominal) < WIRE_EPS:
-        return y_up
-    cost_down = corridor_cost(
-        y_down, y_nominal, lo, hi, obstacles, skip_node_ids, bends=1
+        y_pick = y_down
+    elif abs(y_up - y_nominal) < WIRE_EPS:
+        y_pick = y_up
+    else:
+        cost_down = corridor_cost(
+            y_down,
+            y_nominal,
+            lo,
+            hi,
+            obstacles,
+            skip_node_ids,
+            bends=1,
+            ctx=ctx,
+            net=net,
+        )
+        cost_up = corridor_cost(
+            y_up,
+            y_nominal,
+            lo,
+            hi,
+            obstacles,
+            skip_node_ids,
+            bends=1,
+            ctx=ctx,
+            net=net,
+        )
+        if cost_up < cost_down - WIRE_EPS:
+            y_pick = y_up
+        elif cost_down < cost_up - WIRE_EPS:
+            y_pick = y_down
+        elif abs(y_up - y_nominal) < abs(y_down - y_nominal) - WIRE_EPS:
+            y_pick = y_up
+        else:
+            y_pick = y_down
+
+    if net is None:
+        return y_pick
+
+    # Snap onto a nearby same-net H band when that is cheaper than a twin corridor.
+    best_y = y_pick
+    best_cost = corridor_cost(
+        y_pick,
+        y_nominal,
+        lo,
+        hi,
+        obstacles,
+        skip_node_ids,
+        bends=0 if abs(y_pick - y_nominal) < WIRE_EPS else 1,
+        ctx=ctx,
+        net=net,
     )
-    cost_up = corridor_cost(
-        y_up, y_nominal, lo, hi, obstacles, skip_node_ids, bends=1
-    )
-    if cost_up < cost_down - WIRE_EPS:
-        return y_up
-    if cost_down < cost_up - WIRE_EPS:
-        return y_down
-    # Tie: prefer the smaller absolute detour.
-    if abs(y_up - y_nominal) < abs(y_down - y_nominal) - WIRE_EPS:
-        return y_up
-    return y_down
+    for by, blo, bhi, bnet in ctx.horizontal_bands:
+        if bnet != net:
+            continue
+        if hi <= blo + WIRE_EPS or lo >= bhi - WIRE_EPS:
+            continue
+        if abs(by - y_nominal) > MIN_PARALLEL_GAP * 2 + WIRE_EPS:
+            continue
+        if not horizontal_segment_clear(by, lo, hi, obstacles, skip_node_ids):
+            continue
+        if _foreign_horizontal_blocks_row_local(ctx, by, lo, hi, net):
+            continue
+        cost = corridor_cost(
+            by,
+            y_nominal,
+            lo,
+            hi,
+            obstacles,
+            skip_node_ids,
+            bends=0 if abs(by - y_nominal) < WIRE_EPS else 1,
+            ctx=ctx,
+            net=net,
+        )
+        if cost < best_cost - WIRE_EPS:
+            best_cost = cost
+            best_y = by
+    return best_y
+
+
+def _foreign_horizontal_blocks_row_local(
+    ctx: RoutingContext,
+    y: float,
+    x_lo: float,
+    x_hi: float,
+    net: str,
+) -> bool:
+    lo, hi = min(x_lo, x_hi), max(x_lo, x_hi)
+    for by, blo, bhi, bnet in ctx.horizontal_bands:
+        if bnet == net or abs(by - y) > WIRE_EPS:
+            continue
+        if hi <= blo + WIRE_EPS or lo >= bhi - WIRE_EPS:
+            continue
+        return True
+    return False
 
 
 def obstacle_detour_y_candidates(
@@ -178,6 +257,14 @@ def obstacle_detour_y_candidates(
 
     add(y_nominal)
     add(obstacle_detour_y(ctx, y_nominal, lo, hi, obstacles, skip_node_ids, net))
+    # Prefer existing same-net horizontal bands that already cover this span.
+    if net is not None:
+        for by, blo, bhi, bnet in ctx.horizontal_bands:
+            if bnet != net:
+                continue
+            if hi <= blo + WIRE_EPS or lo >= bhi - WIRE_EPS:
+                continue
+            add(by)
     add(
         _obstacle_detour_y_direction(
             ctx,
@@ -212,6 +299,8 @@ def obstacle_detour_y_candidates(
                 obstacles,
                 skip_node_ids,
                 bends=0 if abs(y - y_nominal) < WIRE_EPS else 1,
+                ctx=ctx,
+                net=net,
             ),
             abs(y - y_nominal),
         )

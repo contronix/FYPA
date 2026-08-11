@@ -291,6 +291,8 @@ def _connect_row_to_bus(
                 obstacles,
                 _clearance_skip(y_feed),
                 bends=bends,
+                ctx=ctx,
+                net=net,
             )
             if best is None or cost < best[0] - WIRE_EPS:
                 best = (cost, y_feed, drop_x)

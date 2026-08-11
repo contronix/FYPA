@@ -673,6 +673,72 @@ def test_hub_row_feed_detour_reserves_vertical_column():
     )
 
 
+def test_hub_east_taps_establish_band_for_west_feed():
+    """Sink-side H at one Y is reused by a west feed instead of a twin corridor."""
+    from fypa.topology.geometry import parse_wire_path
+    from fypa.topology.routing.hub import route_hub
+    from fypa.topology.types import TopologyNode, TopologyPort
+
+    bus_x = 500.0
+    driver = TopologyPort(
+        terminal="OUT_P",
+        net="VDD",
+        label="VDD",
+        side="right",
+        x=100.0,
+        y=180.0,
+        node_id="U1",
+        wire_x=120.0,
+    )
+    sink_a = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=700.0,
+        y=100.0,
+        node_id="J1",
+        wire_x=680.0,
+    )
+    sink_b = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=700.0,
+        y=279.0,
+        node_id="J2",
+        wire_x=680.0,
+    )
+    ctx = RoutingContext()
+    # Block the driver row so the west feed must detour near sink_b's y.
+    blocker = TopologyNode(
+        node_id="BLK",
+        label="BLK",
+        designator="BLK",
+        role="RESISTOR",
+        x=200.0,
+        y=160.0,
+        width=200.0,
+        height=40.0,
+        config_label="",
+        has_error=False,
+        bounds=(200.0, 160.0, 200.0, 40.0),
+    )
+    wires = route_hub("VDD", [driver, sink_a, sink_b], bus_x, [blocker], ctx)
+    assert wires
+    long_h_ys = []
+    for w in wires:
+        pts = parse_wire_path(w.path_d)
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            if abs(y0 - y1) < 0.5 and abs(x1 - x0) > 200:
+                long_h_ys.append(round(y0, 1))
+    # Near-parallel long runs of the same net must not both appear.
+    for i, ya in enumerate(long_h_ys):
+        for yb in long_h_ys[i + 1 :]:
+            assert abs(ya - yb) < 0.5 or abs(ya - yb) >= 15.5, (long_h_ys, wires)
+
+
 def test_connect_row_to_bus_ignores_row_drop_vertical():
     """A singleton drop onto the row must not skip the row→bus feed.
 

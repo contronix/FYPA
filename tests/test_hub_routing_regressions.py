@@ -54,6 +54,8 @@ def test_hub_fixture_passes_topology_validation(fixture_name: str) -> None:
         "open_gnd_stub",
         "dangling_wire_endpoint",
         "wire_detour_excessive",
+        "wire_bends_excessive",
+        "redundant_parallel_run",
         "loop_return_outside_pair_gutter",
     }
     if fixture_name == FIXTURE_ROW_DETOUR:

@@ -77,11 +77,20 @@ Generic designators (`J1`, `U1`, `R1`) and nets (`VIN`, `VOUT`, `GND`, `OUTA`, `
       between the two symbols (`loop_return_outside_pair_gutter` when a return
       leaves that gutter).
     - Exempt from rule 5 / `driver_not_left_of_load`; still subject to rules 6–7.
-20. **Shortest connection** — Prefer the lowest-cost legal corridor (drawn
-    length + bend count; clearance violation = infinite; grazing a body within
+20. **Short and few bends** — Prefer the lowest-cost legal corridor: drawn
+    length + bend count (clearance violation = infinite; grazing a body within
     `WIRE_GUTTER_PAD + MIN_PARALLEL_GAP` is expensive). Hard fail when drawn
     length exceeds Manhattan end-to-end distance by more than `MAX_DETOUR_RATIO`
-    (`wire_detour_excessive`).
+    (`wire_detour_excessive`), or when bend count exceeds the Manhattan minimum
+    (0 if endpoints share an axis, else 1) by more than `MAX_EXTRA_BENDS`
+    (`wire_bends_excessive`).
+21. **No redundant parallel runs** — Two H (or V) segments of the **same** net
+    with overlapping span and axis gap in `(0, MIN_PARALLEL_GAP)` are illegal
+    unless collinear (`redundant_parallel_run`). Foreign near-parallels stay
+    under rule 6 (`duplicate_horizontal_y` / `duplicate_vertical_x`).
+22. **Few foreign crossings** — Prefer corridors that avoid extra H∩V crossings
+    with other nets (soft cost). Hard fail for illegal crossings remains rule 6
+    (`foreign_wire_crossing`).
 
 ## Role → face (power)
 
@@ -116,6 +125,12 @@ RETA vertical west of parent U1 while child J1 is east of U1
 
 # Excessive detour
 Path length > MAX_DETOUR_RATIO × Manhattan(ends)  → wire_detour_excessive
+
+# Too many bends
+Wire with bends > Manhattan-min + MAX_EXTRA_BENDS  → wire_bends_excessive
+
+# Same-net parallel H runs
+VIN H at y=100 and y=105 overlapping in x  → redundant_parallel_run
 ```
 
 ## Gap vs prior implementation
@@ -130,7 +145,10 @@ Path length > MAX_DETOUR_RATIO × Manhattan(ends)  → wire_detour_excessive
 | Bus full | Clamp onto occupied x | Fail / no silent overlap |
 | Escape / last-resort | Draw despite conflict | Fail-closed |
 | Hub partial | Row/tap drawn without trunk feed | No wires + `hub_net_unrouted` |
-| Corridor pick | First-fit / nearest Δy | Cost (length + bends + graze) |
+| Corridor pick | First-fit / nearest Δy | Cost (length + bends + graze + crossings) |
 | Detour length | Unbounded legal detours | Cap via `wire_detour_excessive` |
+| Bend count | Soft only in corridor cost | Cap via `wire_bends_excessive` |
+| Same-net parallels | Allowed near-twins | `redundant_parallel_run` |
+| Foreign crossings | Hard only when illegal | Soft prefer fewer (rule 22) |
 | Rightmost col | Loop child could share SINK column | Pure SINKs alone rightmost (`non_sink_in_rightmost`) |
 | Row→bus skip | Any same-net V in row span skipped feed | Only skip when trunk/bus already met |
