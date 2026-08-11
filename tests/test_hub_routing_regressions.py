@@ -37,6 +37,7 @@ def test_hub_fixture_passes_topology_validation(fixture_name: str) -> None:
     model = build_hub_fixture(fixture_name)
     # foreign_wire_crossing and foundation rule codes are asserted separately /
     # still tightening under channel-router work.
+    # New RULES codes + fail-closed connectivity; keep spacing assertions elsewhere.
     skip = {
         "foreign_wire_crossing",
         "right_to_left_wire",
@@ -46,17 +47,20 @@ def test_hub_fixture_passes_topology_validation(fixture_name: str) -> None:
         "ports_overlapping",
         "source_not_leftmost",
         "sink_not_rightmost",
-        # Fail-closed routing can leave corridors crowded until gap widening
-        # is fully channel-aware; spacing is covered by dedicated unit tests.
-        "duplicate_vertical_x",
-        "duplicate_horizontal_y",
-        "coincident_vertical_x",
-        "parallel_vertical_gap",
         "hub_net_disconnected",
         "open_signal_stub",
         "open_gnd_stub",
         "dangling_wire_endpoint",
     }
+    if fixture_name == FIXTURE_ROW_DETOUR:
+        skip.update(
+            {
+                "duplicate_vertical_x",
+                "duplicate_horizontal_y",
+                "coincident_vertical_x",
+                "parallel_vertical_gap",
+            }
+        )
     issues = [i for i in validate_topology(model) if i["code"] not in skip]
     assert not issues, issues
 

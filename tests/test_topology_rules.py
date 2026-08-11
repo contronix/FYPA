@@ -170,6 +170,57 @@ def test_wire_outside_channel_vertical_in_body():
     assert any(i["code"] == "wire_outside_channel" for i in issues)
 
 
+def test_source_not_leftmost_when_all_sources_offset():
+    src = TopologyPort("P", "VIN", "VIN", "right", 300.0, 50.0, "J1", role="SOURCE")
+    other = TopologyPort("P", "VIN", "VIN", "left", 50.0, 50.0, "U1", role="SINK")
+    model = TopologyModel(
+        nodes=[
+            _node("U1", role="SINK", x=36.0, ports=[other]),
+            _node("J1", role="SOURCE", x=200.0, ports=[src]),
+        ]
+    )
+    from fypa.topology.validate import check_source_sink_columns
+
+    issues = check_source_sink_columns(model)
+    assert any(i["code"] == "source_not_leftmost" for i in issues)
+
+
+def test_sink_not_rightmost_when_all_sinks_offset():
+    src = TopologyPort("P", "VIN", "VIN", "right", 50.0, 50.0, "J1", role="SOURCE")
+    snk = TopologyPort("P", "VIN", "VIN", "left", 100.0, 50.0, "U1", role="SINK")
+    reg = TopologyPort("OUT_P", "VOUT", "VOUT", "right", 300.0, 50.0, "U2", role="REGULATOR")
+    model = TopologyModel(
+        nodes=[
+            _node("J1", role="SOURCE", x=36.0, ports=[src]),
+            _node("U1", role="SINK", x=100.0, ports=[snk]),
+            _node("U2", role="REGULATOR", x=200.0, ports=[reg]),
+        ]
+    )
+    from fypa.topology.validate import check_source_sink_columns
+
+    issues = check_source_sink_columns(model)
+    assert any(i["code"] == "sink_not_rightmost" for i in issues)
+
+
+def test_loop_series_fixed_faces_fail_closed_not_peer_facing():
+    """Loop SERIES keep P/N faces; routing issues surface as validate errors."""
+    from fypa.topology import build_topology_model, validate_topology
+    from tests.topology_fixtures import load_topology_fixture
+
+    model = build_topology_model(load_topology_fixture("project_a_stepper_loop_rails"))
+    for node in model.nodes:
+        if node.role not in ("SERIES", "RESISTOR"):
+            continue
+        for port in node.ports:
+            if port.terminal.startswith("P"):
+                assert port.side == "left"
+            elif port.terminal.startswith("N"):
+                assert port.side == "right"
+    # Peer-facing was removed; cycle/channel gaps must fail closed, not silently
+    # look clean with illegal faces.
+    assert validate_topology(model)  # non-empty until channel router covers loops
+
+
 def test_validate_topology_includes_rule_codes():
     port = TopologyPort(
         terminal="P",

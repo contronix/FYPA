@@ -55,6 +55,8 @@ Generic designators (`J1`, `U1`, `R1`) and nets (`VIN`, `VOUT`, `GND`) only.
     rules; GND uses its own trunk/bus.
 16. **Cycles** — Mutual REGULATOR feeds / loop SERIES: break with a
     SOURCE-anchored back-edge discard; remaining edges stay L→R.
+    Discarded back-edge ports may show `open_signal_stub` until a dedicated
+    return path exists — that is fail-closed, not peer-facing.
 17. **Multi-driver nets** — Parallel drivers of one net may share a column;
     loads stay strictly right of every driver.
 18. **Fail-closed** — If no legal channel geometry exists, validation reports
