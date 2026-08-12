@@ -493,6 +493,7 @@ def _connector_family_groups(
 def _coalesce_connector_family_columns(
     node_specs: list[NodeSpec],
     col: dict[str, int],
+    loop_parent: dict[str, str] | None = None,
 ) -> None:
     """Stack connector channels (``J14.1`` / ``J14.2`` / …) in one column.
 
@@ -514,8 +515,16 @@ def _coalesce_connector_family_columns(
             continue
         by_family[base].append(nid)
 
+    loop_parent = loop_parent or {}
+
     for _base, members in by_family.items():
         if len(members) < 2:
+            continue
+        member_set = set(members)
+        if any(
+            loop_parent.get(child) in member_set and loop_parent.get(child) != child
+            for child in members
+        ):
             continue
         anchor = max(col.get(nid, 0) for nid in members)
         for nid in members:
@@ -549,13 +558,14 @@ def _column_net(
     if side and is_output_port(role, terminal, side):
         phys = _column_flow_net(term)
         canon = canonical_net(terminal_net(term), net_to_rail)
-        if (
-            phys
-            and canon
-            and phys != canon
-            and term.get("resolved_via_local")
-        ):
-            return phys
+        if phys and canon and phys != canon:
+            if term.get("resolved_via_local"):
+                return phys
+            req = (term.get("requested_net") or "").strip()
+            if req and phys != req:
+                req_canon = canonical_net(req, net_to_rail)
+                if req_canon and req_canon == canon:
+                    return phys
     return canonical_net(terminal_net(term), net_to_rail)
 
 
@@ -932,7 +942,7 @@ def assign_columns(
         node_specs, col, inputs_by_net, loop_parent, role_by_id, outputs_by_net
     )
 
-    _coalesce_connector_family_columns(node_specs, col)
+    _coalesce_connector_family_columns(node_specs, col, loop_parent)
 
     _ensure_loads_right_of_net_drivers(
         col,
@@ -943,7 +953,7 @@ def assign_columns(
         connector_families,
     )
 
-    _coalesce_connector_family_columns(node_specs, col)
+    _coalesce_connector_family_columns(node_specs, col, loop_parent)
 
     for child_id, parent_id in loop_parent.items():
         target = max(col.get(child_id, 0), col.get(parent_id, 0) + 1)
@@ -951,9 +961,11 @@ def assign_columns(
         family = connector_families.get(child_id)
         if family:
             for nid in family:
+                if nid == parent_id:
+                    continue
                 col[nid] = max(col.get(nid, 0), target)
 
-    _coalesce_connector_family_columns(node_specs, col)
+    _coalesce_connector_family_columns(node_specs, col, loop_parent)
 
     # Pure SINKs occupy a dedicated rightmost column *after* loop children and
     # other non-sinks are placed, so the last column holds only SINK (or
