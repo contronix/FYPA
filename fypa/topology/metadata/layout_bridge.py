@@ -468,6 +468,28 @@ def _connector_family_base(designator: str) -> str | None:
     return designator.rsplit(".", 1)[0]
 
 
+def _connector_family_groups(
+    node_specs: list[NodeSpec],
+) -> dict[str, frozenset[str]]:
+    """Map each connector channel node to its full ``J*.*`` family."""
+    by_family: dict[str, list[str]] = defaultdict(list)
+    role_by_id = {s["node_id"]: s["role"] for s in node_specs}
+    for spec in node_specs:
+        nid = spec["node_id"]
+        base = _connector_family_base(spec.get("designator") or nid)
+        if not base or role_by_id.get(nid) != "RESISTOR" or not base.startswith("J"):
+            continue
+        by_family[base].append(nid)
+    groups: dict[str, frozenset[str]] = {}
+    for members in by_family.values():
+        if len(members) < 2:
+            continue
+        fam = frozenset(members)
+        for nid in members:
+            groups[nid] = fam
+    return groups
+
+
 def _coalesce_connector_family_columns(
     node_specs: list[NodeSpec],
     col: dict[str, int],
@@ -476,6 +498,8 @@ def _coalesce_connector_family_columns(
 
     Multi-channel connector resistors are not a left→right power chain; they
     share one symbol column like merged ``J14`` sections in the spec builder.
+    Use the family's rightmost required column so a later load bump does not
+    split siblings apart again.
     """
     by_family: dict[str, list[str]] = defaultdict(list)
     role_by_id = {s["node_id"]: s["role"] for s in node_specs}
@@ -493,7 +517,7 @@ def _coalesce_connector_family_columns(
     for _base, members in by_family.items():
         if len(members) < 2:
             continue
-        anchor = min(col.get(nid, 0) for nid in members)
+        anchor = max(col.get(nid, 0) for nid in members)
         for nid in members:
             col[nid] = anchor
 
@@ -670,8 +694,10 @@ def _ensure_loads_right_of_net_drivers(
     inputs_by_net: dict[str, list[str]],
     back_edges: set[tuple[str, str]],
     loop_parent: dict[str, str],
+    connector_families: dict[str, frozenset[str]] | None = None,
 ) -> None:
     """Bump every net load strictly right of every driver of that net."""
+    connector_families = connector_families or {}
     changed = True
     guard = 0
     n = max(len(col), 1)
@@ -696,8 +722,16 @@ def _ensure_loads_right_of_net_drivers(
                 if any(loop_parent.get(d) == load for d in drivers):
                     continue
                 if col.get(load, 0) <= max_d:
-                    col[load] = max_d + 1
-                    changed = True
+                    target = max_d + 1
+                    family = connector_families.get(load)
+                    if family:
+                        for nid in family:
+                            if col.get(nid, 0) < target:
+                                col[nid] = target
+                                changed = True
+                    else:
+                        col[load] = target
+                        changed = True
 
 
 def assign_columns(
@@ -745,6 +779,7 @@ def assign_columns(
                     inputs_by_canonical[cn].append(nid)
 
     loop_parent = _detect_loop_series_parents(node_specs, outputs_by_net, inputs_by_net)
+    connector_families = _connector_family_groups(node_specs)
     back_edges = _detect_propagation_back_edges(
         _propagation_edges(node_specs, outputs_by_net, inputs_by_net, net_to_rail, loop_parent),
         [s["node_id"] for s in sources] + [s["node_id"] for s in node_specs],
@@ -900,8 +935,15 @@ def assign_columns(
     _coalesce_connector_family_columns(node_specs, col)
 
     _ensure_loads_right_of_net_drivers(
-        col, outputs_by_net, inputs_by_net, back_edges, loop_parent
+        col,
+        outputs_by_net,
+        inputs_by_net,
+        back_edges,
+        loop_parent,
+        connector_families,
     )
+
+    _coalesce_connector_family_columns(node_specs, col)
 
     for child_id, parent_id in loop_parent.items():
         col[child_id] = max(col.get(child_id, 0), col.get(parent_id, 0) + 1)

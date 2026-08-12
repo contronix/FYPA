@@ -40,6 +40,23 @@ def _left_face_stub_channel_rtl_ok(
     )
 
 
+def _right_face_stub_channel_ltr_ok(
+    stub_x: float,
+    x: float,
+    port: TopologyPort,
+) -> bool:
+    """Eastward hop from ``stub_x`` only within the right-face stub band."""
+    if x <= stub_x + WIRE_EPS:
+        return True
+    if port.side != "right":
+        return False
+    max_stub = PORT_WIRE_STUB + WIRE_GUTTER_PAD + WIRE_EPS
+    return (
+        x - stub_x <= max_stub + WIRE_EPS
+        and abs(port_stub_x(port) - stub_x) <= WIRE_EPS
+    )
+
+
 def outward_escape_stub_x(port: TopologyPort) -> float:
     """Escape column one stub-length *outward* of the port (away from the body).
 
@@ -224,7 +241,9 @@ def _append_dest_from_bus_row(
     if drop_x is None:
         return None
     if abs(drop_x - e_stub) > WIRE_EPS:
-        if drop_x > e_stub + WIRE_EPS:
+        if drop_x > e_stub + WIRE_EPS and not _right_face_stub_channel_ltr_ok(
+            e_stub, drop_x, end
+        ):
             return None
         if (
             drop_x < e_stub - WIRE_EPS
