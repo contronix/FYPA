@@ -17,6 +17,7 @@ from fypa.topology.routing.obstacles import (
     foreign_vertical_covers_y,
     horizontal_segment_clear,
     obstacle_detour_y,
+    trunk_vertical_clear,
 )
 from fypa.topology.types import TopologyNode, TopologyPort
 
@@ -144,11 +145,74 @@ def _dest_leg_from_row(
     end: TopologyPort,
     end_leg: str,
 ) -> str:
-    """Horizontal to the destination stub column, then down/up to the port row."""
+    """Horizontal to the destination stub column, then down/up to the port row.
+
+    Prefer callers that can keep the vertical on the bus column via
+    ``_append_dest_from_bus_row``; this helper remains for simple clear cases.
+    """
     if abs(y_row - end.y) > WIRE_EPS:
         return f" H {e_stub:.1f} V {end.y:.1f}{end_leg}"
     return f" H {e_stub:.1f}{end_leg}"
 
+
+def _append_dest_from_bus_row(
+    prefix: str,
+    col_at: float,
+    y_at: float,
+    end: TopologyPort,
+    e_stub: float,
+    end_leg: str,
+    obstacles: list[TopologyNode],
+    skip: set[str],
+    ctx: RoutingContext,
+    net: str,
+) -> str | None:
+    """Continue from ``(col_at, y_at)`` into ``end`` without covering foreign verticals.
+
+    Prefers a vertical on the bus/feed column so bends stay in the gutter, then
+    a horizontal at the port row into the stub. Falls back to an outward escape
+    drop when the stub column is occupied (e.g. GND trunk).
+    """
+    y = end.y
+    if abs(y_at - y) <= WIRE_EPS:
+        lo, hi = min(col_at, e_stub), max(col_at, e_stub)
+        if not horizontal_segment_clear(y, lo, hi, obstacles, skip):
+            return None
+        if _foreign_horizontal_blocks_row(ctx, y, lo, hi, net):
+            return None
+        ctx.reserve_horizontal(y, lo, hi, net)
+        return simplify_wire_path(f"{prefix} H {e_stub:.1f}{end_leg}")
+
+    y_lo, y_hi = min(y_at, y), max(y_at, y)
+    stub_lo, stub_hi = min(col_at, e_stub), max(col_at, e_stub)
+    # Prefer: V on the current (bus) column, then H at port y into the stub.
+    if (
+        trunk_vertical_clear(col_at, y_lo, y_hi, obstacles, set())
+        and not _foreign_vertical_blocks_column(ctx, col_at, y_lo, y_hi, net)
+        and horizontal_segment_clear(y, stub_lo, stub_hi, obstacles, skip)
+        and not _foreign_horizontal_blocks_row(ctx, y, stub_lo, stub_hi, net)
+    ):
+        ctx.reserve_vertical(col_at, y_lo, y_hi, net)
+        ctx.reserve_horizontal(y, stub_lo, stub_hi, net)
+        return simplify_wire_path(
+            f"{prefix} V {y:.1f} H {e_stub:.1f}{end_leg}"
+        )
+
+    drop_x = _from_bus_detour_drop_x(
+        end, e_stub, col_at, y, y_at, obstacles, ctx, net
+    )
+    if drop_x is None:
+        return None
+    ctx.reserve_horizontal(y_at, min(col_at, drop_x), max(col_at, drop_x), net)
+    ctx.reserve_vertical(drop_x, y_lo, y_hi, net)
+    if abs(drop_x - e_stub) > WIRE_EPS:
+        ctx.reserve_horizontal(y, min(drop_x, e_stub), max(drop_x, e_stub), net)
+        return simplify_wire_path(
+            f"{prefix} H {drop_x:.1f} V {y:.1f} H {e_stub:.1f}{end_leg}"
+        )
+    return simplify_wire_path(
+        f"{prefix} H {e_stub:.1f} V {y:.1f}{end_leg}"
+    )
 
 def two_port_path(
     start: TopologyPort,
@@ -182,17 +246,26 @@ def two_port_path(
             detour, col_at = _append_bus_column_at_row(
                 detour, col_x, start, bus_x, y_clear, obs, skip
             )
-            detour, col_at = _horizontal_chain_at_row(detour, col_at, [e_stub], y_clear, obs, skip)
-            # The detour row (y_clear) differs from the shared port row (y == end.y);
-            # drop back down/up to the destination port's row before the final leg,
-            # otherwise the wire terminates on the detour row and leaves the port open.
-            path = f"{detour} V {end.y:.1f}{end_leg}"
+            # Stay on the bus column through the dest approach so the stub
+            # column is not used for a foreign-covering vertical drop.
+            finished = _append_dest_from_bus_row(
+                detour,
+                col_at,
+                y_clear,
+                end,
+                e_stub,
+                end_leg,
+                obs,
+                skip,
+                ctx,
+                net,
+            )
+            if finished is None:
+                return ""
             ctx.reserve_vertical(col_x, min(y, y_clear), max(y, y_clear), net)
             if abs(col_at - col_x) > WIRE_EPS:
                 ctx.reserve_horizontal(y_clear, min(col_x, col_at), max(col_x, col_at), net)
-            ctx.reserve_horizontal(y_clear, x_lo, x_hi, net)
-            ctx.reserve_vertical(col_at, min(y_clear, end.y), max(y_clear, end.y), net)
-            return simplify_wire_path(path)
+            return finished
         detour, col_at = _horizontal_chain_at_row(start_prefix, col_x, [e_stub], y, obs, skip)
         path = f"{detour}{end_leg}"
         ctx.reserve_horizontal(y, x_lo, x_hi, net)
@@ -206,20 +279,30 @@ def two_port_path(
     if abs(y_clear - start.y) > WIRE_EPS:
         detour = f"{start_prefix} V {y_clear:.1f}"
         detour, col_at = _append_bus_column_at_row(detour, col_x, start, bus_x, y_clear, obs, skip)
-        path = (
-            f"{detour} V {y_end_clear:.1f}{_dest_leg_from_row(e_stub, y_end_clear, end, end_leg)}"
-        )
-        ctx.reserve_horizontal(y_clear, x_lo, x_hi, net)
-        ctx.reserve_horizontal(y_end_clear, min(col_at, e_stub), max(col_at, e_stub), net)
-        ctx.reserve_vertical(col_x, min(start.y, y_clear), max(start.y, y_clear), net)
+        # Run the bus vertical to the dest approach row, then enter the port.
         if abs(y_end_clear - y_clear) > WIRE_EPS:
+            detour = f"{detour} V {y_end_clear:.1f}"
             ctx.reserve_vertical(
-                col_at,
-                min(y_clear, y_end_clear),
-                max(y_clear, y_end_clear),
-                net,
+                col_at, min(y_clear, y_end_clear), max(y_clear, y_end_clear), net
             )
-        return simplify_wire_path(path)
+            y_at = y_end_clear
+        else:
+            y_at = y_clear
+        finished = _append_dest_from_bus_row(
+            detour, col_at, y_at, end, e_stub, end_leg, obs, skip, ctx, net
+        )
+        if finished is None:
+            # Fall back to stub drop when the preferred bus-column entry fails.
+            path = (
+                f"{detour}{_dest_leg_from_row(e_stub, y_at, end, end_leg)}"
+            )
+            ctx.reserve_horizontal(y_at, min(col_at, e_stub), max(col_at, e_stub), net)
+            if abs(y_at - end.y) > WIRE_EPS:
+                ctx.reserve_vertical(e_stub, min(y_at, end.y), max(y_at, end.y), net)
+            finished = simplify_wire_path(path)
+        ctx.reserve_horizontal(y_clear, x_lo, x_hi, net)
+        ctx.reserve_vertical(col_x, min(start.y, y_clear), max(start.y, y_clear), net)
+        return finished
     if abs(y_end_clear - end.y) > WIRE_EPS:
         approach, col_at = _append_bus_column_at_row(
             start_prefix,
@@ -230,20 +313,25 @@ def two_port_path(
             obs,
             skip,
         )
-        path = (
-            f"{approach} V {y_end_clear:.1f}{_dest_leg_from_row(e_stub, y_end_clear, end, end_leg)}"
+        if abs(y_end_clear - start.y) > WIRE_EPS:
+            approach = f"{approach} V {y_end_clear:.1f}"
+            ctx.reserve_vertical(
+                col_at, min(start.y, y_end_clear), max(start.y, y_end_clear), net
+            )
+            y_at = y_end_clear
+        else:
+            y_at = start.y
+        finished = _append_dest_from_bus_row(
+            approach, col_at, y_at, end, e_stub, end_leg, obs, skip, ctx, net
         )
+        if finished is None:
+            path = f"{approach}{_dest_leg_from_row(e_stub, y_at, end, end_leg)}"
+            ctx.reserve_horizontal(y_at, min(col_at, e_stub), max(col_at, e_stub), net)
+            if abs(y_at - end.y) > WIRE_EPS:
+                ctx.reserve_vertical(e_stub, min(y_at, end.y), max(y_at, end.y), net)
+            finished = simplify_wire_path(path)
         ctx.reserve_horizontal(start.y, x_lo, x_hi, net)
-        ctx.reserve_horizontal(y_end_clear, min(col_at, e_stub), max(col_at, e_stub), net)
-        if abs(y_end_clear - end.y) > WIRE_EPS:
-            ctx.reserve_vertical(e_stub, min(y_end_clear, end.y), max(y_end_clear, end.y), net)
-        ctx.reserve_vertical(
-            col_at,
-            min(start.y, y_end_clear),
-            max(start.y, y_end_clear),
-            net,
-        )
-        return simplify_wire_path(path)
+        return finished
     approach, col_at = _append_bus_column_at_row(
         start_prefix,
         col_x,
@@ -380,6 +468,52 @@ def hub_tap_feed_column(
     return bus_x
 
 
+def _from_bus_detour_drop_x(
+    port: TopologyPort,
+    stub: float,
+    feed_x: float,
+    y: float,
+    y_clear: float,
+    obstacles: list[TopologyNode],
+    ctx: RoutingContext,
+    net: str,
+) -> float | None:
+    """Column for the y_clear→port-y vertical when feeding from the bus.
+
+    Prefer the stub when clear; otherwise step outward so the drop does not
+    share a foreign column (e.g. GND trunk) and bends stay off the body.
+    """
+    y_lo, y_hi = min(y, y_clear), max(y, y_clear)
+    skip = {port.node_id}
+
+    def _drop_ok(cand: float) -> bool:
+        if _foreign_vertical_blocks_column(ctx, cand, y_lo, y_hi, net):
+            return False
+        if not trunk_vertical_clear(cand, y_lo, y_hi, obstacles, set()):
+            return False
+        clear_lo, clear_hi = min(feed_x, cand), max(feed_x, cand)
+        if not horizontal_segment_clear(y_clear, clear_lo, clear_hi, obstacles, set()):
+            return False
+        if _foreign_horizontal_blocks_row(ctx, y_clear, clear_lo, clear_hi, net):
+            return False
+        if abs(cand - stub) > WIRE_EPS:
+            stub_lo, stub_hi = min(cand, stub), max(cand, stub)
+            if not horizontal_segment_clear(y, stub_lo, stub_hi, obstacles, skip):
+                return False
+            if _foreign_horizontal_blocks_row(ctx, y, stub_lo, stub_hi, net):
+                return False
+        return True
+
+    if _drop_ok(stub):
+        return stub
+    outward = -1.0 if port.side == "left" else 1.0
+    for step in range(1, 8):
+        cand = round(stub + outward * MIN_PARALLEL_GAP * step, 1)
+        if _drop_ok(cand):
+            return cand
+    return None
+
+
 def hub_tap_path_from_bus(
     bus_x: float,
     port: TopologyPort,
@@ -387,21 +521,48 @@ def hub_tap_path_from_bus(
     ctx: RoutingContext,
     net: str,
 ) -> tuple[str, float]:
-    """Route from a hub trunk column eastward into a downstream port."""
+    """Route from a hub trunk column eastward into a downstream port.
+
+    When a Y-detour is required, prefer dropping on the feed column so the
+    bend stays in the gutter (not against the symbol) and never place that
+    vertical on a foreign-occupied stub column (e.g. column GND trunk).
+    """
     stub = port_stub_x(port)
     y = port.y
     feed_x = hub_tap_feed_column(ctx, port, bus_x, obstacles, net)
     end_leg = path_into_port(port)
     x_lo, x_hi = min(feed_x, stub), max(feed_x, stub)
+    skip_port = {port.node_id}
+    # Direct row into the stub when the port-y corridor is clear (attach on the
+    # trunk at port y — avoids mid-trunk dangling starts from a detour row).
+    if horizontal_segment_clear(
+        y, x_lo, x_hi, obstacles, skip_port
+    ) and not _foreign_horizontal_blocks_row(ctx, y, x_lo, x_hi, net):
+        ctx.reserve_horizontal(y, x_lo, x_hi, net)
+        path = f"M {feed_x:.1f},{y:.1f} H {stub:.1f}{end_leg}"
+        return simplify_wire_path(path), y
+
     y_clear = obstacle_detour_y(ctx, y, x_lo, x_hi, obstacles, set(), net)
-    if abs(y_clear - y) > WIRE_EPS:
-        ctx.reserve_vertical(feed_x, min(y, y_clear), max(y, y_clear), net)
-        ctx.reserve_horizontal(y_clear, x_lo, x_hi, net)
-        path = f"M {feed_x:.1f},{y_clear:.1f} H {stub:.1f} V {y:.1f}{end_leg}"
-        return simplify_wire_path(path), y_clear
-    ctx.reserve_horizontal(y, x_lo, x_hi, net)
-    path = f"M {feed_x:.1f},{y:.1f} H {stub:.1f}{end_leg}"
-    return simplify_wire_path(path), y
+    if abs(y_clear - y) <= WIRE_EPS:
+        ctx.reserve_horizontal(y, x_lo, x_hi, net)
+        path = f"M {feed_x:.1f},{y:.1f} H {stub:.1f}{end_leg}"
+        return simplify_wire_path(path), y
+
+    finished = _append_dest_from_bus_row(
+        f"M {feed_x:.1f},{y_clear:.1f}",
+        feed_x,
+        y_clear,
+        port,
+        stub,
+        end_leg,
+        obstacles,
+        skip_port,
+        ctx,
+        net,
+    )
+    if finished is None:
+        return "", y
+    return finished, y_clear
 
 
 def _foreign_vertical_blocks_column(

@@ -56,29 +56,8 @@ def check_segment_spacing(
                 continue
             if a.net != b.net:
                 gap = abs(a.x1 - b.x1)
-                if GND_NET in (a.net, b.net):
-                    # A signal-vs-GND *gap* is deferred to
-                    # check_signal_vs_gnd_drop_gap, but that check requires
-                    # WIRE_EPS < gap, so a gap of ~0 (coincident different-net
-                    # verticals drawn as one ambiguous line, spans already known
-                    # to overlap) slips through both checks. Flag it here.
-                    if gap <= WIRE_EPS:
-                        issues.append(
-                            make_issue(
-                                "coincident_vertical_x",
-                                (
-                                    f"Vertical segments at x={a.x1:.1f} overlap "
-                                    f"exactly ({a.net} wire {a.wire_index}, "
-                                    f"{b.net} wire {b.wire_index})"
-                                ),
-                                x=round(a.x1, 1),
-                                x2=round(b.x1, 1),
-                                gap=round(gap, 1),
-                                net_a=a.net,
-                                net_b=b.net,
-                            )
-                        )
-                    continue
+                # GND is a normal foreign net for corridor spacing (RULES.md §6 /
+                # §15): no exemption that would allow covering a signal vertical.
                 issues.append(
                     make_issue(
                         "duplicate_vertical_x",
