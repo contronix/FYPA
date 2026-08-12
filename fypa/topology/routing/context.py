@@ -46,6 +46,14 @@ class RoutingContext:
         del self._horizontal_bands[h_n:]
         del self._vertical_bands[v_n:]
 
+    def release_vertical_at(self, x: float, net: str, *, eps: float = 0.6) -> None:
+        """Drop reserved verticals for ``net`` on column ``x`` (unused plan slot)."""
+        self._vertical_bands = [
+            band
+            for band in self._vertical_bands
+            if not (band[3] == net and abs(band[0] - x) < eps)
+        ]
+
     @property
     def horizontal_bands(self) -> list[tuple[float, float, float, str]]:
         return self._horizontal_bands

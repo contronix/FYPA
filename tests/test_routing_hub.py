@@ -1028,12 +1028,21 @@ def test_pair_routing_skips_empty_fail_closed_paths(monkeypatch):
         y=300.0,
         node_id="U3",
     )
+    ctx = RoutingContext()
+    ctx.reserve_vertical(160.0, 50.0, 300.0, "VDD")
     monkeypatch.setattr(
         "fypa.topology.routing.pair.two_port_wire_path",
         lambda *_a, **_k: "",
     )
-    wires = signal_wires_from_pairs([(a, b)], obstacles=[], ctx=RoutingContext())
+    monkeypatch.setattr(
+        "fypa.topology.routing.pair._bus_x_for_pair",
+        lambda *_a, **_k: 160.0,
+    )
+    wires = signal_wires_from_pairs([(a, b)], obstacles=[], ctx=ctx)
     assert wires == []
+    assert not any(
+        abs(vx - 160.0) < 0.5 and vnet == "VDD" for vx, _lo, _hi, vnet in ctx.vertical_bands
+    )
 
 
 def test_hub_tap_from_bus_detour_skips_gnd_stub_column(monkeypatch):

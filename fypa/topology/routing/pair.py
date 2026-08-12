@@ -197,6 +197,7 @@ def signal_wires_from_pairs(
             start, end = stacked_routing_order(a, b)
             path_d = stacked_wire_path(a, b, bus_x=bus_x, obstacles=obstacles, ctx=ctx)
             if not path_d:
+                ctx.release_vertical_at(bus_x, net)
                 continue
             wires.append(
                 TopologyWire(
@@ -245,6 +246,7 @@ def signal_wires_from_pairs(
                 continue
             path_d = two_port_wire_path(start, end, bus_x=bus_x, obstacles=obstacles, ctx=ctx)
             if not path_d:
+                ctx.release_vertical_at(bus_x, net)
                 continue
             assigned_bus.append(bus_x)
             wires.append(

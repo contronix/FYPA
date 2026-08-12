@@ -178,7 +178,7 @@ def _append_dest_from_bus_row(
         lo, hi = min(col_at, e_stub), max(col_at, e_stub)
         if not horizontal_segment_clear(y, lo, hi, obstacles, skip):
             return None
-        if _foreign_horizontal_blocks_row(ctx, y, lo, hi, net):
+        if _horizontal_corridor_illegal(ctx, y, lo, hi, net):
             return None
         ctx.reserve_horizontal(y, lo, hi, net)
         return simplify_wire_path(f"{prefix} H {e_stub:.1f}{end_leg}")
@@ -186,11 +186,13 @@ def _append_dest_from_bus_row(
     y_lo, y_hi = min(y_at, y), max(y_at, y)
     stub_lo, stub_hi = min(col_at, e_stub), max(col_at, e_stub)
     # Prefer: V on the current (bus) column, then H at port y into the stub.
+    # Skip when the port row is still illegal under spacing (the detour that
+    # produced y_at must not be undone by redrawing H at end.y).
     if (
         trunk_vertical_clear(col_at, y_lo, y_hi, obstacles, set())
         and not _foreign_vertical_blocks_column(ctx, col_at, y_lo, y_hi, net)
         and horizontal_segment_clear(y, stub_lo, stub_hi, obstacles, skip)
-        and not _foreign_horizontal_blocks_row(ctx, y, stub_lo, stub_hi, net)
+        and not _horizontal_corridor_illegal(ctx, y, stub_lo, stub_hi, net)
     ):
         ctx.reserve_vertical(col_at, y_lo, y_hi, net)
         ctx.reserve_horizontal(y, stub_lo, stub_hi, net)
@@ -202,6 +204,10 @@ def _append_dest_from_bus_row(
         end, e_stub, col_at, y, y_at, obstacles, ctx, net
     )
     if drop_x is None:
+        return None
+    if abs(drop_x - e_stub) > WIRE_EPS and _horizontal_corridor_illegal(
+        ctx, y, min(drop_x, e_stub), max(drop_x, e_stub), net
+    ):
         return None
     ctx.reserve_horizontal(y_at, min(col_at, drop_x), max(col_at, drop_x), net)
     ctx.reserve_vertical(drop_x, y_lo, y_hi, net)
@@ -487,13 +493,13 @@ def _from_bus_detour_drop_x(
         clear_lo, clear_hi = min(feed_x, cand), max(feed_x, cand)
         if not horizontal_segment_clear(y_clear, clear_lo, clear_hi, obstacles, set()):
             return False
-        if _foreign_horizontal_blocks_row(ctx, y_clear, clear_lo, clear_hi, net):
+        if _horizontal_corridor_illegal(ctx, y_clear, clear_lo, clear_hi, net):
             return False
         if abs(cand - stub) > WIRE_EPS:
             stub_lo, stub_hi = min(cand, stub), max(cand, stub)
             if not horizontal_segment_clear(y, stub_lo, stub_hi, obstacles, skip):
                 return False
-            if _foreign_horizontal_blocks_row(ctx, y, stub_lo, stub_hi, net):
+            if _horizontal_corridor_illegal(ctx, y, stub_lo, stub_hi, net):
                 return False
         return True
 
@@ -530,7 +536,7 @@ def hub_tap_path_from_bus(
     # trunk at port y — avoids mid-trunk dangling starts from a detour row).
     if horizontal_segment_clear(
         y, x_lo, x_hi, obstacles, skip_port
-    ) and not _foreign_horizontal_blocks_row(ctx, y, x_lo, x_hi, net):
+    ) and not _horizontal_corridor_illegal(ctx, y, x_lo, x_hi, net):
         ctx.reserve_horizontal(y, x_lo, x_hi, net)
         path = f"M {feed_x:.1f},{y:.1f} H {stub:.1f}{end_leg}"
         return simplify_wire_path(path), y
@@ -591,6 +597,32 @@ def _foreign_horizontal_blocks_row(
         if hi <= blo + WIRE_EPS or lo >= bhi - WIRE_EPS:
             continue
         return True
+    return False
+
+
+def _horizontal_corridor_illegal(
+    ctx: RoutingContext,
+    y: float,
+    x_lo: float,
+    x_hi: float,
+    net: str,
+) -> bool:
+    """True when ``y`` conflicts with reserved H bands on the span (exact or near-twin).
+
+    Matches ``obstacle_detour_y``: same-net exact reuse is legal; foreign exact and
+    any near-parallel gap in ``(0, MIN_PARALLEL_GAP)`` are illegal (RULES.md §6/§21).
+    """
+    lo, hi = min(x_lo, x_hi), max(x_lo, x_hi)
+    for by, blo, bhi, bnet in ctx.horizontal_bands:
+        if hi <= blo + WIRE_EPS or lo >= bhi - WIRE_EPS:
+            continue
+        gap = abs(by - y)
+        if gap <= WIRE_EPS:
+            if bnet == net:
+                continue
+            return True
+        if gap < MIN_PARALLEL_GAP - WIRE_EPS:
+            return True
     return False
 
 
