@@ -53,6 +53,9 @@ def build_signal_wires(
                 bus_x = bus_plan.stack_buses[(col, side, net)]
             elif bus_plan and net in bus_plan.hub_buses:
                 bus_x = bus_plan.hub_buses[net]
+            elif bus_plan is not None:
+                # BusCorridorFull left this net unplanned — fail-closed (no nominal).
+                continue
             else:
                 bus_x = column_bus_x(col, side, lane=lane, n_lanes=n_lanes)
             wires.extend(route_hub(net, ports, bus_x, obstacles, ctx))
@@ -82,6 +85,8 @@ def build_signal_wires(
         assigned_bus = gutter_assigned.setdefault(gkey, [])
         if bus_plan and net in bus_plan.hub_buses:
             bus_x = bus_plan.hub_buses[net]
+        elif bus_plan is not None:
+            continue
         else:
             bus_lo, bus_hi = hub_bus_channel_bounds(ports)
             bus_x = hub_bus_nominal_x(ports, bus_lo, bus_hi)

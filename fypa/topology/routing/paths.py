@@ -740,26 +740,34 @@ def _hub_tap_detour_drop_x(
 ) -> float | None:
     """Column for the stub→detour vertical; ``None`` if no clear outward escape."""
     y_lo, y_hi = min(y, y_clear), max(y, y_clear)
-    if not _foreign_vertical_blocks_column(ctx, attach, y_lo, y_hi, net):
+    skip = {port.node_id}
+
+    def _drop_ok(cand: float) -> bool:
+        if _foreign_vertical_blocks_column(ctx, cand, y_lo, y_hi, net):
+            return False
+        if not trunk_vertical_clear(cand, y_lo, y_hi, obstacles, set()):
+            return False
+        stub_lo, stub_hi = min(attach, cand), max(attach, cand)
+        if abs(cand - attach) > WIRE_EPS:
+            if not horizontal_segment_clear(y, stub_lo, stub_hi, obstacles, skip):
+                return False
+            if _horizontal_corridor_illegal(ctx, y, stub_lo, stub_hi, net):
+                return False
+        feed_lo, feed_hi = min(cand, bus_x), max(cand, bus_x)
+        if not horizontal_segment_clear(y_clear, feed_lo, feed_hi, obstacles, set()):
+            return False
+        if _horizontal_corridor_illegal(ctx, y_clear, feed_lo, feed_hi, net):
+            return False
+        return True
+
+    if _drop_ok(attach):
         return attach
     # Stub often coincides with a column GND trunk; step further outward.
     outward = -1.0 if port.side == "left" else 1.0
-    skip = {port.node_id}
     for step in range(1, 8):
         cand = round(attach + outward * MIN_PARALLEL_GAP * step, 1)
-        if _foreign_vertical_blocks_column(ctx, cand, y_lo, y_hi, net):
-            continue
-        stub_lo, stub_hi = min(attach, cand), max(attach, cand)
-        if not horizontal_segment_clear(y, stub_lo, stub_hi, obstacles, skip):
-            continue
-        if _foreign_horizontal_blocks_row(ctx, y, stub_lo, stub_hi, net):
-            continue
-        feed_lo, feed_hi = min(cand, bus_x), max(cand, bus_x)
-        if not horizontal_segment_clear(y_clear, feed_lo, feed_hi, obstacles, set()):
-            continue
-        if _foreign_horizontal_blocks_row(ctx, y_clear, feed_lo, feed_hi, net):
-            continue
-        return cand
+        if _drop_ok(cand):
+            return cand
     return None
 
 

@@ -192,6 +192,8 @@ def signal_wires_from_pairs(
                 bus_x = bus_plan.pair_buses[net]
             elif bus_plan and (col, side, net) in bus_plan.stack_buses:
                 bus_x = bus_plan.stack_buses[(col, side, net)]
+            elif bus_plan is not None:
+                continue
             else:
                 bus_x = column_bus_x(col, side, lane=bus_lane, n_lanes=n_lanes)
             start, end = stacked_routing_order(a, b)
