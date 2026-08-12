@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from fypa.topology.constants import WIRE_EPS
+from fypa.topology.constants import PORT_WIRE_STUB, WIRE_EPS, WIRE_GUTTER_PAD
 from fypa.topology.geometry import parse_wire_path, simplify_wire_path
 from fypa.topology.placement import port_stub_x
 from fypa.topology.routing.context import RoutingContext
@@ -181,14 +181,41 @@ def _row_meets_bus_column(
     return False
 
 
+def _hub_feed_drop_rtl_ok(edge_x: float, drop_x: float) -> bool:
+    """Reject row-edge hops that would draw illegal RTL (RULES.md §5).
+
+    A westward hop from the feed column is only allowed within the left-face
+    stub channel band — same limit as ``check_right_to_left_wires``.
+    """
+    if drop_x >= edge_x - WIRE_EPS:
+        return True
+    max_stub = PORT_WIRE_STUB + WIRE_GUTTER_PAD + WIRE_EPS
+    return edge_x - drop_x <= max_stub + WIRE_EPS
+
+
 def _hub_feed_drop_columns(edge_x: float, bus_x: float) -> list[float]:
-    """Row-edge first, then columns stepped toward the bus (escape GND stubs)."""
+    """Row-edge first, then toward the bus, then away (GND stub pinch).
+
+    Toward-bus steps escape a GND trunk that sits just outside the edge.
+    When a symbol body fills the toward-bus lane and GND is still within
+    ``MIN_PARALLEL_GAP`` of ``edge_x``, one RTL-legal outward column can
+    clear the near-parallel band so a detoured feed can reach the trunk.
+    """
     from fypa.topology.constants import MIN_PARALLEL_GAP
 
+    toward = MIN_PARALLEL_GAP if bus_x >= edge_x - WIRE_EPS else -MIN_PARALLEL_GAP
+    away = -toward
     cols = [edge_x]
-    step = MIN_PARALLEL_GAP if bus_x >= edge_x - WIRE_EPS else -MIN_PARALLEL_GAP
     for k in range(1, 8):
-        cols.append(round(edge_x + step * k, 1))
+        drop_x = round(edge_x + toward * k, 1)
+        if not _hub_feed_drop_rtl_ok(edge_x, drop_x):
+            break
+        cols.append(drop_x)
+    for k in range(1, 8):
+        drop_x = round(edge_x + away * k, 1)
+        if not _hub_feed_drop_rtl_ok(edge_x, drop_x):
+            break
+        cols.append(drop_x)
     return cols
 
 
@@ -226,6 +253,8 @@ def _connect_row_to_bus(
         if _foreign_horizontal_blocks_row(ctx, y_feed, feed_lo, feed_hi, net):
             return False
         if abs(drop_x - edge_x) > WIRE_EPS:
+            if not _hub_feed_drop_rtl_ok(edge_x, drop_x):
+                return False
             stub_lo, stub_hi = min(edge_x, drop_x), max(edge_x, drop_x)
             if not horizontal_segment_clear(
                 plan.y_row, stub_lo, stub_hi, obstacles, {p.node_id for p in plan.group}

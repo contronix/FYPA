@@ -1189,6 +1189,174 @@ def test_connect_row_to_bus_skips_foreign_vertical_column():
     assert abs(trunk_y - 212.0) > 1e-6, path_d
 
 
+def test_connect_row_to_bus_escapes_gnd_pinch_outward():
+    """When GND pins the row edge and a body fills toward-bus, drop away first.
+
+    Geometry mirrors a gutter hub whose east-side stub sits within
+    ``MIN_PARALLEL_GAP`` of a GND trunk while the SERIES body occupies every
+    toward-bus column; a foreign same-row H also blocks a flat feed. The feed
+    must step outward (away from the bus) then detour onto the trunk.
+    """
+    from fypa.topology.constants import NODE_W
+    from fypa.topology.routing.hub import _HubRowPlan, _connect_row_to_bus
+    from fypa.topology.types import TopologyNode
+
+    edge_x = 552.0
+    bus_x = 1024.0
+    y_row = 585.0
+    port_a = TopologyPort(
+        terminal="OUT_P",
+        net="VDD",
+        label="VDD",
+        side="right",
+        x=392.0,
+        y=y_row,
+        node_id="U1",
+        wire_x=412.0,
+    )
+    port_b = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=572.0,
+        y=y_row,
+        node_id="L1",
+        wire_x=edge_x,
+    )
+    plan = _HubRowPlan(
+        group=[port_a, port_b],
+        y_row=y_row,
+        span_lo=392.0,
+        span_hi=572.0,
+        row_lo=412.0,
+        row_hi=edge_x,
+        detoured=False,
+    )
+    series = TopologyNode(
+        node_id="L1",
+        label="L1",
+        designator="L1",
+        role="SERIES",
+        x=572.0,
+        y=546.0,
+        width=NODE_W,
+        height=74.0,
+        config_label="",
+        has_error=False,
+        bounds=(572.0, 546.0, NODE_W, 74.0),
+        ports=[],
+    )
+    ctx = RoutingContext()
+    # GND trunk in the stub gutter — blocks vertical at edge_x (gap < MIN_PARALLEL_GAP).
+    ctx.reserve_vertical(560.0, 400.0, 900.0, "GND")
+    # Foreign same-row H across the toward-bus corridor (blocks flat feed).
+    ctx.reserve_horizontal(y_row, 700.0, 1168.0, "VDD_MCU")
+    trunk_y, path_d = _connect_row_to_bus(plan, bus_x, ctx, "VDD", [series])
+    assert path_d is not None, "expected outward-escape feed"
+    assert trunk_y is not None
+    assert abs(trunk_y - y_row) > 1e-6, path_d
+    assert "H 536.0" in path_d, path_d
+    assert f"H {bus_x:.1f}" in path_d
+    from fypa.topology.types import TopologyModel, TopologyWire
+    from fypa.topology.validate.rules import check_right_to_left_wires
+
+    u1 = TopologyNode(
+        node_id="U1",
+        label="U1",
+        designator="U1",
+        role="REGULATOR",
+        x=392.0,
+        y=546.0,
+        width=NODE_W,
+        height=74.0,
+        config_label="",
+        has_error=False,
+        bounds=(392.0, 546.0, NODE_W, 74.0),
+        ports=[port_a],
+    )
+    l1 = TopologyNode(
+        node_id="L1",
+        label="L1",
+        designator="L1",
+        role="SERIES",
+        x=572.0,
+        y=546.0,
+        width=NODE_W,
+        height=74.0,
+        config_label="",
+        has_error=False,
+        bounds=(572.0, 546.0, NODE_W, 74.0),
+        ports=[port_b],
+    )
+    model = TopologyModel(
+        nodes=[u1, l1],
+        wires=[TopologyWire(net="VDD", path_d=path_d)],
+    )
+    assert check_right_to_left_wires(model) == []
+
+
+def test_connect_row_to_bus_fail_closed_when_rtl_escape_blocked():
+    """When the only RTL-legal away column is blocked, fail-closed — no deep RTL."""
+    from fypa.topology.constants import NODE_W
+    from fypa.topology.routing.hub import _HubRowPlan, _connect_row_to_bus
+    from fypa.topology.types import TopologyNode
+
+    edge_x = 552.0
+    bus_x = 1024.0
+    y_row = 585.0
+    port_a = TopologyPort(
+        terminal="OUT_P",
+        net="VDD",
+        label="VDD",
+        side="right",
+        x=392.0,
+        y=y_row,
+        node_id="U1",
+        wire_x=412.0,
+    )
+    port_b = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=572.0,
+        y=y_row,
+        node_id="L1",
+        wire_x=edge_x,
+    )
+    plan = _HubRowPlan(
+        group=[port_a, port_b],
+        y_row=y_row,
+        span_lo=392.0,
+        span_hi=572.0,
+        row_lo=412.0,
+        row_hi=edge_x,
+        detoured=False,
+    )
+    series = TopologyNode(
+        node_id="L1",
+        label="L1",
+        designator="L1",
+        role="SERIES",
+        x=572.0,
+        y=546.0,
+        width=NODE_W,
+        height=74.0,
+        config_label="",
+        has_error=False,
+        bounds=(572.0, 546.0, NODE_W, 74.0),
+        ports=[],
+    )
+    ctx = RoutingContext()
+    ctx.reserve_vertical(560.0, 400.0, 900.0, "GND")
+    ctx.reserve_horizontal(y_row, 700.0, 1168.0, "VDD_MCU")
+    ctx.reserve_vertical(536.0, 400.0, 900.0, "SIG")
+    trunk_y, path_d = _connect_row_to_bus(plan, bus_x, ctx, "VDD", [series])
+    assert trunk_y is None
+    assert path_d is None
+
+
 def test_detoured_hub_row_emits_row_bus_and_vertical_drops():
     """Detoured row plans still emit ``hub_row`` plus drops from port Y onto the bus."""
     from fypa.topology.types import TopologyNode
