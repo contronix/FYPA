@@ -1398,6 +1398,123 @@ def test_connect_row_to_bus_fail_closed_when_rtl_escape_blocked():
     assert path_d is None
 
 
+def test_connect_row_to_bus_rejects_rtl_detoured_bus_leg():
+    """Detoured row→bus feeds must not run the final H right-to-left."""
+    from fypa.topology.constants import NODE_W
+    from fypa.topology.routing.hub import _HubRowPlan, _connect_row_to_bus
+    from fypa.topology.types import TopologyNode
+
+    edge_x = 552.0
+    bus_x = 360.0
+    y_row = 585.0
+    port_a = TopologyPort(
+        terminal="OUT_P",
+        net="VDD",
+        label="VDD",
+        side="right",
+        x=392.0,
+        y=y_row,
+        node_id="U1",
+        wire_x=412.0,
+    )
+    port_b = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=572.0,
+        y=y_row,
+        node_id="L1",
+        wire_x=edge_x,
+    )
+    plan = _HubRowPlan(
+        group=[port_a, port_b],
+        y_row=y_row,
+        span_lo=392.0,
+        span_hi=572.0,
+        row_lo=412.0,
+        row_hi=edge_x,
+        detoured=False,
+    )
+    series = TopologyNode(
+        node_id="L1",
+        label="L1",
+        designator="L1",
+        role="SERIES",
+        x=572.0,
+        y=546.0,
+        width=NODE_W,
+        height=74.0,
+        config_label="",
+        has_error=False,
+        bounds=(572.0, 546.0, NODE_W, 74.0),
+        ports=[],
+    )
+    ctx = RoutingContext()
+    trunk_y, path_d = _connect_row_to_bus(plan, bus_x, ctx, "VDD", [series])
+    assert trunk_y is None
+    assert path_d is None
+
+
+def test_connect_row_to_bus_no_westward_escape_from_right_face_edge():
+    """Westward away columns apply only at a left-face stub on the feed edge."""
+    from fypa.topology.constants import NODE_W
+    from fypa.topology.routing.hub import _HubRowPlan, _connect_row_to_bus
+    from fypa.topology.types import TopologyNode
+
+    edge_x = 412.0
+    bus_x = 1024.0
+    y_row = 585.0
+    port_a = TopologyPort(
+        terminal="OUT_P",
+        net="VDD",
+        label="VDD",
+        side="right",
+        x=392.0,
+        y=y_row,
+        node_id="U1",
+        wire_x=edge_x,
+    )
+    port_b = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=572.0,
+        y=y_row,
+        node_id="L1",
+        wire_x=552.0,
+    )
+    plan = _HubRowPlan(
+        group=[port_a, port_b],
+        y_row=y_row,
+        span_lo=392.0,
+        span_hi=572.0,
+        row_lo=edge_x,
+        row_hi=552.0,
+        detoured=False,
+    )
+    driver = TopologyNode(
+        node_id="U1",
+        label="U1",
+        designator="U1",
+        role="REGULATOR",
+        x=392.0,
+        y=546.0,
+        width=NODE_W,
+        height=74.0,
+        config_label="",
+        has_error=False,
+        bounds=(392.0, 546.0, NODE_W, 74.0),
+        ports=[],
+    )
+    ctx = RoutingContext()
+    ctx.reserve_vertical(424.0, 400.0, 900.0, "GND")
+    ctx.reserve_horizontal(y_row, 700.0, 1168.0, "VDD_MCU")
+    trunk_y, path_d = _connect_row_to_bus(plan, bus_x, ctx, "VDD", [driver])
+    assert path_d is None or "H 396.0" not in path_d
+
+
 def test_detoured_hub_row_emits_row_bus_and_vertical_drops():
     """Detoured row plans still emit ``hub_row`` plus drops from port Y onto the bus."""
     from fypa.topology.types import TopologyNode

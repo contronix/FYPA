@@ -181,19 +181,39 @@ def _row_meets_bus_column(
     return False
 
 
-def _hub_feed_drop_rtl_ok(edge_x: float, drop_x: float) -> bool:
+def _hub_feed_drop_rtl_ok(edge_x: float, drop_x: float, plan: _HubRowPlan) -> bool:
     """Reject row-edge hops that would draw illegal RTL (RULES.md §5).
 
     A westward hop from the feed column is only allowed within the left-face
-    stub channel band — same limit as ``check_right_to_left_wires``.
+    stub channel band at ``edge_x`` — same limit as ``check_right_to_left_wires``.
     """
     if drop_x >= edge_x - WIRE_EPS:
         return True
     max_stub = PORT_WIRE_STUB + WIRE_GUTTER_PAD + WIRE_EPS
-    return edge_x - drop_x <= max_stub + WIRE_EPS
+    if edge_x - drop_x > max_stub + WIRE_EPS:
+        return False
+    for port in plan.group:
+        if abs(port.y - plan.y_row) > WIRE_EPS or port.side != "left":
+            continue
+        if abs(port_stub_x(port) - edge_x) <= WIRE_EPS:
+            return True
+    return False
 
 
-def _hub_feed_drop_columns(edge_x: float, bus_x: float) -> list[float]:
+def _hub_feed_bus_leg_ltr_ok(
+    edge_x: float,
+    drop_x: float,
+    y_feed: float,
+    y_row: float,
+    bus_x: float,
+) -> bool:
+    """The row→trunk feed horizontal must not run right-to-left."""
+    if abs(y_feed - y_row) <= WIRE_EPS:
+        return bus_x >= edge_x - WIRE_EPS
+    return bus_x >= drop_x - WIRE_EPS
+
+
+def _hub_feed_drop_columns(edge_x: float, bus_x: float, plan: _HubRowPlan) -> list[float]:
     """Row-edge first, then toward the bus, then away (GND stub pinch).
 
     Toward-bus steps escape a GND trunk that sits just outside the edge.
@@ -208,12 +228,12 @@ def _hub_feed_drop_columns(edge_x: float, bus_x: float) -> list[float]:
     cols = [edge_x]
     for k in range(1, 8):
         drop_x = round(edge_x + toward * k, 1)
-        if not _hub_feed_drop_rtl_ok(edge_x, drop_x):
+        if not _hub_feed_drop_rtl_ok(edge_x, drop_x, plan):
             break
         cols.append(drop_x)
     for k in range(1, 8):
         drop_x = round(edge_x + away * k, 1)
-        if not _hub_feed_drop_rtl_ok(edge_x, drop_x):
+        if not _hub_feed_drop_rtl_ok(edge_x, drop_x, plan):
             break
         cols.append(drop_x)
     return cols
@@ -246,6 +266,8 @@ def _connect_row_to_bus(
         return set()
 
     def _feed_ok(y_feed: float, drop_x: float) -> bool:
+        if not _hub_feed_bus_leg_ltr_ok(edge_x, drop_x, y_feed, plan.y_row, bus_x):
+            return False
         skip = _clearance_skip(y_feed)
         feed_lo, feed_hi = min(drop_x, bus_x), max(drop_x, bus_x)
         if not horizontal_segment_clear(y_feed, feed_lo, feed_hi, obstacles, skip):
@@ -253,7 +275,7 @@ def _connect_row_to_bus(
         if _foreign_horizontal_blocks_row(ctx, y_feed, feed_lo, feed_hi, net):
             return False
         if abs(drop_x - edge_x) > WIRE_EPS:
-            if not _hub_feed_drop_rtl_ok(edge_x, drop_x):
+            if not _hub_feed_drop_rtl_ok(edge_x, drop_x, plan):
                 return False
             stub_lo, stub_hi = min(edge_x, drop_x), max(edge_x, drop_x)
             if not horizontal_segment_clear(
@@ -307,7 +329,7 @@ def _connect_row_to_bus(
         set(),
         net,
     ):
-        for drop_x in _hub_feed_drop_columns(edge_x, bus_x):
+        for drop_x in _hub_feed_drop_columns(edge_x, bus_x, plan):
             if not _feed_ok(y_feed, drop_x):
                 continue
             bends = 0 if abs(y_feed - plan.y_row) <= WIRE_EPS else 1
