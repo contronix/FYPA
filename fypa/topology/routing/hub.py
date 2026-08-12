@@ -12,6 +12,7 @@ from fypa.topology.routing.context import RoutingContext
 from fypa.topology.routing.paths import (
     _foreign_horizontal_blocks_row,
     _foreign_vertical_blocks_column,
+    _horizontal_corridor_illegal,
     group_ports_by_row,
     hub_row_path,
     hub_row_groups,
@@ -277,6 +278,8 @@ def _connect_row_to_bus(
             return False
         if _foreign_horizontal_blocks_row(ctx, y_feed, feed_lo, feed_hi, net):
             return False
+        if _horizontal_corridor_illegal(ctx, y_feed, feed_lo, feed_hi, net):
+            return False
         if abs(drop_x - edge_x) > WIRE_EPS:
             if not _hub_feed_drop_rtl_ok(edge_x, drop_x, plan):
                 return False
@@ -286,6 +289,8 @@ def _connect_row_to_bus(
             ):
                 return False
             if _foreign_horizontal_blocks_row(ctx, plan.y_row, stub_lo, stub_hi, net):
+                return False
+            if _horizontal_corridor_illegal(ctx, plan.y_row, stub_lo, stub_hi, net):
                 return False
         if abs(y_feed - plan.y_row) > WIRE_EPS:
             y_lo, y_hi = min(plan.y_row, y_feed), max(plan.y_row, y_feed)

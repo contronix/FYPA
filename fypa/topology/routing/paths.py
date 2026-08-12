@@ -223,6 +223,14 @@ def _append_dest_from_bus_row(
     )
     if drop_x is None:
         return None
+    if abs(drop_x - e_stub) > WIRE_EPS:
+        if drop_x > e_stub + WIRE_EPS:
+            return None
+        if (
+            drop_x < e_stub - WIRE_EPS
+            and not _left_face_stub_channel_rtl_ok(e_stub, drop_x, end)
+        ):
+            return None
     if abs(drop_x - e_stub) > WIRE_EPS and _horizontal_corridor_illegal(
         ctx, y, min(drop_x, e_stub), max(drop_x, e_stub), net
     ):
@@ -702,7 +710,16 @@ def hub_tap_vertical_to_row(
         else:
             sk = skip or {port.node_id}
         lo, hi = min(col_x, bus_x), max(col_x, bus_x)
-        if horizontal_segment_clear(port.y, lo, hi, obs, sk):
+        if (
+            bus_x < col_x - WIRE_EPS
+            and not _left_face_stub_channel_rtl_ok(col_x, bus_x, port)
+        ):
+            return "", row_y
+        if horizontal_segment_clear(port.y, lo, hi, obs, sk) and not (
+            ctx is not None
+            and net is not None
+            and _horizontal_corridor_illegal(ctx, port.y, lo, hi, net)
+        ):
             if ctx is not None and net is not None:
                 ctx.reserve_vertical(
                     bus_x,
@@ -850,6 +867,8 @@ def hub_tap_path(
         )
         path = f"{start_leg} V {y_clear:.1f} H {bus_x:.1f}"
         return simplify_wire_path(path), y_clear
+    if _horizontal_corridor_illegal(ctx, y, x_lo, x_hi, net):
+        return "", y
     if foreign_vertical_covers_y(ctx, attach, y, net):
         escape = outward_escape_stub_x(port)
         ctx.reserve_horizontal(
