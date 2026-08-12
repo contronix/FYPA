@@ -14,6 +14,7 @@ from fypa.topology.placement.gutter_corridors import (
     resolve_gutter_corridor,
 )
 from fypa.topology.placement.hub_planning import (
+    hub_bus_anchor_stub,
     hub_bus_channel_bounds,
     hub_bus_nominal_x,
     hub_bus_outward,
@@ -100,7 +101,7 @@ def plan_gutter_hub_buses(
         y_lo = min(p.y for p in ports)
         y_hi = max(p.y for p in ports)
         bus_x = hub_bus_nominal_x(ports, bus_lo, bus_hi)
-        anchor_stub = port_stub_x(hub_destination_anchor(ports))
+        anchor_stub = hub_bus_anchor_stub(ports)
         bus_x = nudge_bus_from_gnd_columns(
             bus_x,
             y_lo,

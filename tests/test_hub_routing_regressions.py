@@ -235,14 +235,17 @@ class TestHubEscapeVerticalEastTap:
         )
         assert abs(start_y - downstream_port.y) < WIRE_EPS
 
-    def test_power_net_has_no_hub_trunk_wire(self, model) -> None:
+    def test_power_net_hub_trunk_is_escape_column_or_absent(self, model) -> None:
+        """No *extra* trunk beside the escape column (bus may sit on the escape x)."""
         if not any(w.net == self.POWER_NET for w in model.wires):
             pytest.skip("hub net unrouted (fail-closed)")
-        assert not any(
-            w.routing_kind == "hub"
-            for w in model.wires
-            if w.net == self.POWER_NET
-        )
+        escape = upstream_escape_tap(model, self.POWER_NET)
+        col_x = escape_vertical_x(escape)
+        for w in model.wires:
+            if w.net != self.POWER_NET or w.routing_kind != "hub":
+                continue
+            # Planned densest-stub bus may coincide with the escape column.
+            assert abs((w.bus_x or 0.0) - col_x) < WIRE_EPS, w.path_d
 
     def test_row_meets_escape_column_without_separate_bus_feed(self, model) -> None:
         if not any(w.net == self.POWER_NET for w in model.wires):

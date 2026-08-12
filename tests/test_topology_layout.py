@@ -730,3 +730,90 @@ def test_multi_role_stacked_symbol_geometry():
         assert u2.y + sec.y + HEADER_H < port.y < u2.y + sec.y + sec.height, (
             f"port {port.terminal} ({port.role}) outside its section band"
         )
+
+
+def test_shared_net_ports_align_across_unequal_channel_rows() -> None:
+    """Connector and tall sink share AX on different channel indices → same port Y."""
+    from fypa.topology.constants import BODY_PAD, HEADER_H, PORT_ROW_H
+    from fypa.topology.layout.vertical_align import (
+        _port_aligned_top_y,
+        assign_vertical_positions,
+    )
+    from fypa.topology.metadata.layout_bridge import ResolvedPort
+
+    def make_spec(nid: str, role: str, ports: list[tuple[str, str, int, str]]) -> dict:
+        port_defs = [(pn, side, sk) for pn, side, sk, _net in ports]
+        resolved = {
+            pn: ResolvedPort(wnet=net, plabel=net, tooltip="")
+            for pn, _side, _sk, net in ports
+        }
+        return {
+            "node_id": nid,
+            "label": nid,
+            "designator": nid,
+            "role": role,
+            "config_label": "",
+            "has_error": False,
+            "terms": {},
+            "port_defs": port_defs,
+            "resolved_ports": resolved,
+            "port_directives": {},
+            "tooltip": "",
+            "directive": {},
+            "directives": [],
+        }
+
+    # J14: AX on row 0; U27: VDD on row 0, AX on row 2 → tops must shift.
+    j14 = make_spec(
+        "J14.1",
+        "RESISTOR",
+        [("P1", "right", 0, "AX1"), ("N1", "right", 1, "AY1")],
+    )
+    u27 = make_spec(
+        "U27.1",
+        "SINK",
+        [
+            ("P1", "left", 0, "VDD"),
+            ("N2", "left", 1, "OTHER"),
+            ("N3", "left", 2, "AX1"),
+        ],
+    )
+    cols = {"J14.1": 0, "U27.1": 1}
+    y = assign_vertical_positions([j14, u27], cols, max_col=1)
+    j_off = HEADER_H + BODY_PAD + 0 * PORT_ROW_H + PORT_ROW_H / 2
+    u_off = HEADER_H + BODY_PAD + 2 * PORT_ROW_H + PORT_ROW_H / 2
+    assert abs((y["J14.1"] + j_off) - (y["U27.1"] + u_off)) < 0.5
+    # Helper used by the placer.
+    aligned = _port_aligned_top_y(j14, u27, partner_top=100.0)
+    assert abs(aligned - (100.0 + u_off - j_off)) < 0.5
+
+
+def test_hub_bus_nominal_prefers_densest_stub_cluster() -> None:
+    """Trunk sits on the stub column shared by most ports, not the far destination."""
+    from fypa.topology.placement.hub_planning import hub_bus_nominal_x
+    from fypa.topology.types import TopologyPort
+
+    def p(nid: str, x: float, side: str) -> TopologyPort:
+        return TopologyPort(
+            terminal="P",
+            net="VDD",
+            label="VDD",
+            side=side,
+            x=x,
+            y=100.0,
+            node_id=nid,
+        )
+
+    # Five left stubs at x=3168 (stub 3148) + one far sink at 3872 (stub 3852)
+    # + one driver at 2912 (stub 2932).
+    ports = [
+        p("U7", 2912.0, "right"),
+        p("L1", 3168.0, "left"),
+        p("L2", 3168.0, "left"),
+        p("U27.1", 3168.0, "left"),
+        p("U27.2", 3168.0, "left"),
+        p("U27.3", 3168.0, "left"),
+        p("U3", 3872.0, "left"),
+    ]
+    nominal = hub_bus_nominal_x(ports, bus_lo=2900.0, bus_hi=3900.0)
+    assert abs(nominal - 3148.0) < 1.0, nominal

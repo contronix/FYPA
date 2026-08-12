@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 from fypa.topology.constants import MIN_PARALLEL_GAP, WIRE_EPS
 from fypa.topology.placement.ports import (
     bus_outward,
@@ -61,15 +63,33 @@ def hub_destination_anchor(ports: list[TopologyPort]) -> TopologyPort:
     return min(dests, key=lambda p: (p.y, p.terminal))
 
 
+def hub_bus_anchor_stub(ports: list[TopologyPort]) -> float:
+    """Stub x for corridor anchoring: densest cluster, else destination stub."""
+    stubs = [port_stub_x(p) for p in ports]
+    if not stubs:
+        return 0.0
+    buckets = [round(s / MIN_PARALLEL_GAP) * MIN_PARALLEL_GAP for s in stubs]
+    mode_bucket, mode_count = Counter(buckets).most_common(1)[0]
+    if mode_count >= 2:
+        cluster = sorted(s for s in stubs if abs(s - mode_bucket) <= MIN_PARALLEL_GAP)
+        return cluster[len(cluster) // 2]
+    return port_stub_x(hub_destination_anchor(ports))
+
+
 def hub_bus_nominal_x(
     ports: list[TopologyPort],
     bus_lo: float,
     bus_hi: float,
 ) -> float:
-    """Hub trunk x at the destination stub (minimize incoming feed length)."""
-    del bus_hi  # upper bound comes from ``hub_bus_channel_bounds``
-    stub = port_stub_x(hub_destination_anchor(ports))
-    return max(bus_lo, stub)
+    """Hub trunk x at the densest stub cluster (fallback: destination stub).
+
+    Multi-column hubs (driver west of a sink stack, far loads further east)
+    used to pin the trunk on the rightmost destination stub. Feeds from the
+    west row then had to cross the sink-column bodies and often fail-closed.
+    Prefer the stub x shared by the most ports so the trunk sits in the
+    busiest gutter; clamp into ``bus_lo..bus_hi``.
+    """
+    return min(bus_hi, max(bus_lo, hub_bus_anchor_stub(ports)))
 
 
 def hub_bus_channel_bounds(

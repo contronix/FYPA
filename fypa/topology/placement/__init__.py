@@ -9,6 +9,7 @@ from fypa.topology.placement.classify import (
     group_two_port_pairs,
 )
 from fypa.topology.placement.hub_planning import (
+    hub_bus_anchor_stub,
     hub_bus_channel_bounds,
     hub_bus_nominal_x,
     hub_bus_outward,
@@ -64,6 +65,7 @@ __all__ = [
     "gutter_bus_x_bounds",
     "gutter_groups",
     "group_ports_by_net",
+    "hub_bus_anchor_stub",
     "hub_bus_channel_bounds",
     "hub_bus_nominal_x",
     "hub_bus_outward",
