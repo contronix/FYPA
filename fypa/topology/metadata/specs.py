@@ -488,11 +488,12 @@ def component_spec_from_directives(
     elif role == "SOURCE":
         for i, d in enumerate(channels):
             ch_idx = _channel_number(d, i)
-            for base, side in (("P", "right"), ("N", "left")):
+            for base, side in (("P", "right"), ("N", "right")):
                 pname = _suffix_for_channel(ch_idx, multi=multi, base=base)
                 term = (d.get("terminals") or {}).get(base)
                 if term and not is_ideal_return(term):
-                    port_defs.append((pname, side, i))
+                    sk = i * 2 + (0 if base == "P" else 1)
+                    port_defs.append((pname, side, sk))
                     terms[pname] = term
                     if multi:
                         channel_ports.add(pname)

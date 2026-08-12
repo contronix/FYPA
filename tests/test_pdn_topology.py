@@ -40,8 +40,8 @@ def test_topology_svg_contains_designators_and_ports():
 def test_topology_nodes_have_input_output_ports():
     model = build_topology_model(_project_b_compact_metadata())
     j1 = next(n for n in model.nodes if n.designator == "J1")
-    sides = {p.side for p in j1.ports}
-    assert "left" in sides and "right" in sides
+    assert {p.side for p in j1.ports} == {"right"}
+    assert {p.terminal[0] for p in j1.ports} == {"P", "N"}
     reg = next(n for n in model.nodes if n.designator == "U2")
     assert sum(1 for p in reg.ports if p.side == "left") == 2
     assert sum(1 for p in reg.ports if p.side == "right") == 2

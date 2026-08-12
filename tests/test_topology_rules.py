@@ -365,3 +365,21 @@ def test_validate_topology_includes_rule_codes():
     model = TopologyModel(nodes=[_node("J1", role="SOURCE", x=36.0, ports=[port])])
     codes = {i["code"] for i in validate_topology(model)}
     assert "port_on_wrong_side" in codes
+
+
+def test_source_return_on_left_is_wrong_side():
+    from fypa.topology.validate import check_port_sides
+
+    port = TopologyPort(
+        terminal="N",
+        net="GND",
+        label="GND",
+        side="left",
+        x=10.0,
+        y=70.0,
+        node_id="J1",
+        role="SOURCE",
+    )
+    model = TopologyModel(nodes=[_node("J1", role="SOURCE", x=36.0, ports=[port])])
+    assert any(i["code"] == "port_on_wrong_side" for i in check_port_sides(model))
+

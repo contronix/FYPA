@@ -50,10 +50,8 @@ def expected_port_side(role: str, terminal: str) -> str | None:
     vocabulary (unknown / channel extras stay unconstrained here).
     """
     if role == "SOURCE":
-        if _terminal_matches("P", terminal):
+        if _terminal_matches("P", terminal) or _terminal_matches("N", terminal):
             return "right"
-        if _terminal_matches("N", terminal):
-            return "left"
         return None
     if role == "SINK":
         if _terminal_matches("P", terminal) or _terminal_matches("N", terminal):

@@ -110,7 +110,7 @@ LABEL_VERTICAL_ANCHOR_FRACTIONS = (0.3, 0.45, 0.55, 0.7)
 
 # (terminal_name, side, sort_key) — left = input, right = output
 ROLE_PORTS: dict[str, list[tuple[str, str, int]]] = {
-    "SOURCE": [("N", "left", 1), ("P", "right", 0)],
+    "SOURCE": [("P", "right", 0), ("N", "right", 1)],
     "SINK": [("N", "left", 1), ("P", "left", 0)],
     "REGULATOR": [
         ("IN_N", "left", 3),

@@ -305,7 +305,7 @@ def test_regulator_mutual_feed_columns_are_deterministic() -> None:
         }
 
     v1 = spec("V1", "SOURCE", {"P": term("VIN"), "N": ideal},
-              [("P", "right", 0), ("N", "left", 1)])
+              [("P", "right", 0), ("N", "right", 1)])
     # U1 <- VIN (source) and RAIL_Y (from U2); U1 -> RAIL_X.
     u1 = spec("U1", "REGULATOR",
               {"IN_P": term("VIN"), "IN_P2": term("RAIL_Y"),

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from fypa.topology.terminal_roles import is_output_port, is_power_input_port
+from fypa.topology.terminal_roles import (
+    expected_port_side,
+    is_output_port,
+    is_power_input_port,
+)
 
 
 @pytest.mark.parametrize(
@@ -45,3 +49,16 @@ def test_is_power_input_port(role: str, terminal: str, expected: bool) -> None:
 )
 def test_is_output_port(role: str, terminal: str, side: str, expected: bool) -> None:
     assert is_output_port(role, terminal, side) is expected
+
+
+@pytest.mark.parametrize(
+    "terminal, expected",
+    [
+        ("P", "right"),
+        ("P1", "right"),
+        ("N", "right"),
+        ("N2", "right"),
+    ],
+)
+def test_source_expected_port_side(terminal: str, expected: str) -> None:
+    assert expected_port_side("SOURCE", terminal) == expected
