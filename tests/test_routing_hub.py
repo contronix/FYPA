@@ -1398,6 +1398,41 @@ def test_connect_row_to_bus_fail_closed_when_rtl_escape_blocked():
     assert path_d is None
 
 
+def test_connect_row_to_bus_allows_flat_stub_band_feed_west_of_edge():
+    """Flat left-face stub hops within the channel band may reach a west trunk."""
+    from fypa.topology.constants import NODE_W
+    from fypa.topology.routing.hub import _HubRowPlan, _connect_row_to_bus
+    from fypa.topology.types import TopologyNode
+
+    edge_x = 552.0
+    bus_x = 536.0
+    y_row = 585.0
+    port_b = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=572.0,
+        y=y_row,
+        node_id="L1",
+        wire_x=edge_x,
+    )
+    plan = _HubRowPlan(
+        group=[port_b],
+        y_row=y_row,
+        span_lo=572.0,
+        span_hi=572.0,
+        row_lo=edge_x,
+        row_hi=edge_x,
+        detoured=False,
+    )
+    ctx = RoutingContext()
+    trunk_y, path_d = _connect_row_to_bus(plan, bus_x, ctx, "VDD", [])
+    assert trunk_y == y_row
+    assert path_d is not None
+    assert f"H {bus_x:.1f}" in path_d
+
+
 def test_connect_row_to_bus_rejects_rtl_detoured_bus_leg():
     """Detoured row→bus feeds must not run the final H right-to-left."""
     from fypa.topology.constants import NODE_W

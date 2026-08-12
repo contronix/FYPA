@@ -206,10 +206,13 @@ def _hub_feed_bus_leg_ltr_ok(
     y_feed: float,
     y_row: float,
     bus_x: float,
+    plan: _HubRowPlan,
 ) -> bool:
-    """The row→trunk feed horizontal must not run right-to-left."""
+    """The row→trunk feed horizontal must not run illegal RTL."""
     if abs(y_feed - y_row) <= WIRE_EPS:
-        return bus_x >= edge_x - WIRE_EPS
+        if bus_x >= edge_x - WIRE_EPS:
+            return True
+        return _hub_feed_drop_rtl_ok(edge_x, bus_x, plan)
     return bus_x >= drop_x - WIRE_EPS
 
 
@@ -266,7 +269,7 @@ def _connect_row_to_bus(
         return set()
 
     def _feed_ok(y_feed: float, drop_x: float) -> bool:
-        if not _hub_feed_bus_leg_ltr_ok(edge_x, drop_x, y_feed, plan.y_row, bus_x):
+        if not _hub_feed_bus_leg_ltr_ok(edge_x, drop_x, y_feed, plan.y_row, bus_x, plan):
             return False
         skip = _clearance_skip(y_feed)
         feed_lo, feed_hi = min(drop_x, bus_x), max(drop_x, bus_x)
