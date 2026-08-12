@@ -681,6 +681,8 @@ def route_hub(
         ordered,
     )
     if not wires:
-        # Fail-closed drop (or nothing routed): drop phantom bands.
+        # Fail-closed drop (or nothing routed): drop phantom bands and the
+        # planned bus column so later nets can reuse the corridor.
         ctx.rollback(mark)
+        ctx.release_vertical_at(bus_x, net)
     return wires

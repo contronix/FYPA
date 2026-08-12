@@ -328,6 +328,23 @@ def test_hub_net_unrouted():
     assert any(i["code"] == "hub_net_unrouted" for i in issues)
 
 
+def test_pair_net_unrouted():
+    from fypa.topology.validate import check_hub_net_unrouted
+
+    ports = [
+        TopologyPort("P", "VOUT", "VOUT", "right", 100.0, 50.0, "U1", role="REGULATOR"),
+        TopologyPort("P", "VOUT", "VOUT", "left", 300.0, 50.0, "J1", role="SINK"),
+    ]
+    model = TopologyModel(
+        nodes=[
+            _node("U1", role="REGULATOR", x=36.0, ports=[ports[0]]),
+            _node("J1", role="SINK", x=200.0, ports=[ports[1]]),
+        ]
+    )
+    issues = check_hub_net_unrouted(model)
+    assert any(i["code"] == "hub_net_unrouted" and i["port_count"] == 2 for i in issues)
+
+
 def test_loop_return_rtl_exempt():
     wire = TopologyWire(net="RETA", path_d="M 200.0,50.0 H 100.0")
     model = TopologyModel(wires=[wire], loop_return_nets=frozenset({"RETA"}))

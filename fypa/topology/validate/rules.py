@@ -366,17 +366,20 @@ def check_source_sink_columns(model: TopologyModel) -> list[dict]:
                         node_id=s.node_id,
                     )
                 )
-    for n in by_x[rightmost]:
-        if not _has_sink_role(n):
-            issues.append(
-                make_issue(
-                    "non_sink_in_rightmost",
-                    f"{n.designator} ({n.role}) must not share the rightmost "
-                    "column with SINKs",
-                    node_id=n.node_id,
-                    role=n.role,
+    # Reserve the rightmost column for SINKs whenever the model has pure SINKs.
+    # Skip when there are no SINKs at all (sink-less PDNs may end with REGULATOR).
+    if pure_sinks:
+        for n in by_x[rightmost]:
+            if not _has_sink_role(n):
+                issues.append(
+                    make_issue(
+                        "non_sink_in_rightmost",
+                        f"{n.designator} ({n.role}) must not share the rightmost "
+                        "column with SINKs",
+                        node_id=n.node_id,
+                        role=n.role,
+                    )
                 )
-            )
     return issues
 
 
