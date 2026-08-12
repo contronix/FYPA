@@ -6,6 +6,7 @@ from fypa.topology.constants import (
     MIN_PARALLEL_GAP,
     PORT_WIRE_STUB,
     WIRE_EPS,
+    WIRE_GUTTER_PAD,
 )
 from fypa.topology.geometry import simplify_wire_path
 from fypa.topology.placement import (
@@ -20,6 +21,23 @@ from fypa.topology.routing.obstacles import (
     trunk_vertical_clear,
 )
 from fypa.topology.types import TopologyNode, TopologyPort
+
+
+def _left_face_stub_channel_rtl_ok(
+    stub_x: float,
+    x: float,
+    port: TopologyPort,
+) -> bool:
+    """Westward hop from ``stub_x`` only within the left-face stub band."""
+    if x >= stub_x - WIRE_EPS:
+        return True
+    if port.side != "left":
+        return False
+    max_stub = PORT_WIRE_STUB + WIRE_GUTTER_PAD + WIRE_EPS
+    return (
+        stub_x - x <= max_stub + WIRE_EPS
+        and abs(port_stub_x(port) - stub_x) <= WIRE_EPS
+    )
 
 
 def outward_escape_stub_x(port: TopologyPort) -> float:
@@ -486,6 +504,8 @@ def _from_bus_detour_drop_x(
     skip = {port.node_id}
 
     def _drop_ok(cand: float) -> bool:
+        if cand < feed_x - WIRE_EPS:
+            return False
         if _foreign_vertical_blocks_column(ctx, cand, y_lo, y_hi, net):
             return False
         if not trunk_vertical_clear(cand, y_lo, y_hi, obstacles, set()):
@@ -496,6 +516,11 @@ def _from_bus_detour_drop_x(
         if _horizontal_corridor_illegal(ctx, y_clear, clear_lo, clear_hi, net):
             return False
         if abs(cand - stub) > WIRE_EPS:
+            if (
+                cand < stub - WIRE_EPS
+                and not _left_face_stub_channel_rtl_ok(stub, cand, port)
+            ):
+                return False
             stub_lo, stub_hi = min(cand, stub), max(cand, stub)
             if not horizontal_segment_clear(y, stub_lo, stub_hi, obstacles, skip):
                 return False
@@ -505,11 +530,21 @@ def _from_bus_detour_drop_x(
 
     if _drop_ok(stub):
         return stub
-    # Step from the stub toward the feed so the final H into the stub stays
-    # left-to-right (outward past a right-face stub would draw RTL).
-    toward_feed = 1.0 if feed_x > stub + WIRE_EPS else -1.0
+    if abs(feed_x - stub) > WIRE_EPS:
+        toward_feed = 1.0 if feed_x > stub else -1.0
+        for step in range(1, 8):
+            cand = round(stub + toward_feed * MIN_PARALLEL_GAP * step, 1)
+            if toward_feed > 0 and cand > feed_x + WIRE_EPS:
+                break
+            if toward_feed < 0 and cand < feed_x - WIRE_EPS:
+                break
+            if _drop_ok(cand):
+                return cand
+    outward = -1.0 if port.side == "left" else 1.0
     for step in range(1, 8):
-        cand = round(stub + toward_feed * MIN_PARALLEL_GAP * step, 1)
+        cand = round(stub + outward * MIN_PARALLEL_GAP * step, 1)
+        if not _left_face_stub_channel_rtl_ok(stub, cand, port):
+            break
         if _drop_ok(cand):
             return cand
     return None
@@ -745,12 +780,19 @@ def _hub_tap_detour_drop_x(
     skip = {port.node_id}
 
     def _drop_ok(cand: float) -> bool:
+        if bus_x < cand - WIRE_EPS:
+            return False
         if _foreign_vertical_blocks_column(ctx, cand, y_lo, y_hi, net):
             return False
         if not trunk_vertical_clear(cand, y_lo, y_hi, obstacles, set()):
             return False
         stub_lo, stub_hi = min(attach, cand), max(attach, cand)
         if abs(cand - attach) > WIRE_EPS:
+            if (
+                cand < attach - WIRE_EPS
+                and not _left_face_stub_channel_rtl_ok(attach, cand, port)
+            ):
+                return False
             if not horizontal_segment_clear(y, stub_lo, stub_hi, obstacles, skip):
                 return False
             if _horizontal_corridor_illegal(ctx, y, stub_lo, stub_hi, net):
@@ -764,10 +806,11 @@ def _hub_tap_detour_drop_x(
 
     if _drop_ok(attach):
         return attach
-    # Stub often coincides with a column GND trunk; step further outward.
     outward = -1.0 if port.side == "left" else 1.0
     for step in range(1, 8):
         cand = round(attach + outward * MIN_PARALLEL_GAP * step, 1)
+        if not _left_face_stub_channel_rtl_ok(attach, cand, port):
+            break
         if _drop_ok(cand):
             return cand
     return None
