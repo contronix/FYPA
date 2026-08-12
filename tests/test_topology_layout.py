@@ -788,6 +788,49 @@ def test_shared_net_ports_align_across_unequal_channel_rows() -> None:
     assert abs(aligned - (100.0 + u_off - j_off)) < 0.5
 
 
+def test_port_align_clamps_symbol_top_to_margin() -> None:
+    """Deep shared-net rows must not push the upstream symbol above the canvas."""
+    from fypa.topology.constants import BODY_PAD, HEADER_H, MARGIN, PORT_ROW_H
+    from fypa.topology.layout.vertical_align import assign_vertical_positions
+    from fypa.topology.metadata.layout_bridge import ResolvedPort
+
+    def make_spec(nid: str, role: str, ports: list[tuple[str, str, int, str]]) -> dict:
+        port_defs = [(pn, side, sk) for pn, side, sk, _net in ports]
+        resolved = {
+            pn: ResolvedPort(wnet=net, plabel=net, tooltip="")
+            for pn, _side, _sk, net in ports
+        }
+        return {
+            "node_id": nid,
+            "label": nid,
+            "designator": nid,
+            "role": role,
+            "config_label": "",
+            "has_error": False,
+            "terms": {},
+            "port_defs": port_defs,
+            "resolved_ports": resolved,
+            "port_directives": {},
+            "tooltip": "",
+            "directive": {},
+            "directives": [],
+        }
+
+    src = make_spec("J1", "RESISTOR", [("P1", "right", 0, "AX1")])
+    sink = make_spec(
+        "U1",
+        "SINK",
+        [("P1", "left", 0, "VDD"), ("N2", "left", 1, "OTHER"), ("N3", "left", 2, "AX1")],
+    )
+    y = assign_vertical_positions([src, sink], {"J1": 0, "U1": 1}, max_col=1)
+    assert y["U1"] >= MARGIN
+    assert y["J1"] >= MARGIN
+    j_off = HEADER_H + BODY_PAD + 0 * PORT_ROW_H + PORT_ROW_H / 2
+    u_off = HEADER_H + BODY_PAD + 2 * PORT_ROW_H + PORT_ROW_H / 2
+    # Alignment may yield to the margin floor when the ideal top undershoots.
+    assert y["J1"] + j_off >= y["U1"] + u_off - 0.5 or abs(y["J1"] - MARGIN) < 0.5
+
+
 def test_hub_bus_nominal_prefers_densest_stub_cluster() -> None:
     """Trunk sits on the stub column shared by most ports, not the far destination."""
     from fypa.topology.placement.hub_planning import hub_bus_nominal_x

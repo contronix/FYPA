@@ -1433,6 +1433,53 @@ def test_connect_row_to_bus_allows_flat_stub_band_feed_west_of_edge():
     assert f"H {bus_x:.1f}" in path_d
 
 
+def test_connect_row_to_bus_same_row_honors_offset_drop(monkeypatch):
+    """Same-row feeds must still H to an offset drop_x before the bus leg."""
+    from fypa.topology.routing import hub as hub_mod
+    from fypa.topology.routing.hub import _HubRowPlan, _connect_row_to_bus
+
+    edge_x = 400.0
+    drop_needed = 416.0
+    bus_x = 520.0
+    y_row = 200.0
+    port = TopologyPort(
+        terminal="OUT_P",
+        net="VDD",
+        label="VDD",
+        side="right",
+        x=380.0,
+        y=y_row,
+        node_id="U1",
+        wire_x=edge_x,
+    )
+    plan = _HubRowPlan(
+        group=[port],
+        y_row=y_row,
+        span_lo=380.0,
+        span_hi=380.0,
+        row_lo=edge_x,
+        row_hi=edge_x,
+        detoured=False,
+    )
+    ctx = RoutingContext()
+    monkeypatch.setattr(
+        hub_mod,
+        "obstacle_detour_y_candidates",
+        lambda *_a, **_k: [y_row],
+    )
+    monkeypatch.setattr(
+        hub_mod,
+        "_hub_feed_drop_columns",
+        lambda *_a, **_k: [drop_needed],
+    )
+    trunk_y, path_d = _connect_row_to_bus(plan, bus_x, ctx, "VDD", [])
+    assert path_d is not None, "expected same-row offset-drop feed"
+    assert trunk_y == y_row
+    assert f"H {drop_needed:.1f}" in path_d, path_d
+    assert f"H {bus_x:.1f}" in path_d
+    assert " V " not in f" {path_d} "
+
+
 def test_connect_row_to_bus_rejects_rtl_detoured_bus_leg():
     """Detoured row→bus feeds must not run the final H right-to-left."""
     from fypa.topology.constants import NODE_W

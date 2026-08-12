@@ -149,6 +149,11 @@ def _port_aligned_top_y(
     return partner_top + offs_part[best_net] - offs_self[best_net]
 
 
+def _clamp_top_y(y: float) -> float:
+    """Keep symbol tops on-canvas (port align can undershoot ``MARGIN``)."""
+    return max(float(MARGIN), y)
+
+
 def _intervals_overlap(
     y: float,
     height: float,
@@ -168,7 +173,7 @@ def _alloc_free_y(
     preferred: float | None = None,
 ) -> float:
     if preferred is not None and not _intervals_overlap(preferred, height, occupied):
-        return preferred
+        return max(float(MARGIN), preferred)
     y = float(MARGIN)
     for y0, y1 in sorted(occupied):
         if y + height + ROW_GAP <= y0 + WIRE_EPS:
@@ -363,12 +368,14 @@ def assign_vertical_positions(
                         specs_by_id[partner_id],
                         y_assign[partner_id],
                     )
+                    y = _clamp_top_y(y)
                 elif c == max_col:
                     y = _alloc_free_y(occupied[c], nh)
                 else:
                     continue
                 if _intervals_overlap(y, nh, occupied[c]):
                     y = _alloc_free_y(occupied[c], nh, preferred=y)
+                    y = _clamp_top_y(y)
                 y_assign[nid] = y
                 occupied[c].append((y, y + nh))
                 pending.remove(spec)

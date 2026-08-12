@@ -88,6 +88,9 @@ def hub_bus_nominal_x(
     west row then had to cross the sink-column bodies and often fail-closed.
     Prefer the stub x shared by the most ports so the trunk sits in the
     busiest gutter; clamp into ``bus_lo..bus_hi``.
+
+    Far-east destinations beyond that trunk attach with eastward ``hub_tap``
+    runs from the bus (not westward multi-port row feeds).
     """
     return min(bus_hi, max(bus_lo, hub_bus_anchor_stub(ports)))
 

@@ -315,6 +315,17 @@ def _connect_row_to_bus(
             return simplify_wire_path(
                 f"{prefix} V {y_feed:.1f} H {bus_x:.1f}",
             )
+        # Same-row feed: honor offset drop_x (GND pinch / blocked edge column).
+        if abs(drop_x - edge_x) > WIRE_EPS:
+            ctx.reserve_horizontal(
+                plan.y_row, min(edge_x, drop_x), max(edge_x, drop_x), net
+            )
+            ctx.reserve_horizontal(
+                plan.y_row, min(drop_x, bus_x), max(drop_x, bus_x), net
+            )
+            return simplify_wire_path(
+                f"M {edge_x:.1f},{plan.y_row:.1f} H {drop_x:.1f} H {bus_x:.1f}",
+            )
         ctx.reserve_horizontal(
             y_feed,
             min(plan.span_lo, bus_x),
