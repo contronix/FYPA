@@ -33,6 +33,85 @@ def test_sink_multi_channel_port_names():
     assert pnames.count("N") == 1
 
 
+def test_source_multi_channel_coface_power_above_return():
+    """SOURCE P*/N* share the right face; power rows pack above shared return."""
+    from fypa.topology.constants import RETURN_PORT_GND_SORT_BASE, RETURN_PORT_SORT_BASE
+    from fypa.topology.layout.vertical_align import port_layout_rows
+
+    directives = [
+        {
+            "role": "SOURCE",
+            "designator": "J1",
+            "channel_index": 1,
+            "terminals": {
+                "P": {"pins": [{"net": "VDD_A", "pad": "1"}]},
+                "N": {"pins": [{"net": "GND", "pad": "3"}]},
+            },
+        },
+        {
+            "role": "SOURCE",
+            "designator": "J1",
+            "channel_index": 2,
+            "terminals": {
+                "P": {"pins": [{"net": "VDD_B", "pad": "2"}]},
+                "N": {"pins": [{"net": "GND", "pad": "3"}]},
+            },
+        },
+    ]
+    specs = directives_to_component_specs(directives, [], {})
+    assert len(specs) == 1
+    port_defs = specs[0]["port_defs"]
+    assert all(side == "right" for _n, side, _sk in port_defs)
+    pnames = [p[0] for p in port_defs]
+    assert "P1" in pnames and "P2" in pnames
+    assert pnames.count("N") == 1
+
+    power = sorted(
+        (sk for n, _s, sk in port_defs if n.startswith("P")),
+    )
+    returns = [sk for n, _s, sk in port_defs if n.startswith("N")]
+    assert power == [0, 1]
+    assert returns and returns[0] >= RETURN_PORT_SORT_BASE
+    assert returns[0] >= RETURN_PORT_GND_SORT_BASE
+
+    n_rows, row_map = port_layout_rows(port_defs)
+    assert n_rows == 3
+    assert row_map[returns[0]] == 2
+    assert max(power) < row_map[returns[0]]
+
+
+def test_source_ideal_return_leaves_dense_power_rows():
+    """Missing/ideal N must not leave blank mid-rows between power channels."""
+    from fypa.topology.layout.vertical_align import port_layout_rows
+
+    directives = [
+        {
+            "role": "SOURCE",
+            "designator": "J1",
+            "channel_index": 1,
+            "terminals": {
+                "P": {"pins": [{"net": "VDD_A", "pad": "1"}]},
+                "N": {"ideal_return": True},
+            },
+        },
+        {
+            "role": "SOURCE",
+            "designator": "J1",
+            "channel_index": 2,
+            "terminals": {
+                "P": {"pins": [{"net": "VDD_B", "pad": "2"}]},
+                "N": {"ideal_return": True},
+            },
+        },
+    ]
+    specs = directives_to_component_specs(directives, [], {})
+    port_defs = specs[0]["port_defs"]
+    assert [p[0] for p in port_defs] == ["P1", "P2"]
+    assert [sk for _n, _s, sk in port_defs] == [0, 1]
+    n_rows, _ = port_layout_rows(port_defs)
+    assert n_rows == 2
+
+
 def test_regulator_dedupes_shared_in_n():
     directives = [
         {

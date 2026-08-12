@@ -486,19 +486,21 @@ def component_spec_from_directives(
             port_defs.append((pname, "right", sort_key))
             terms[pname] = term
     elif role == "SOURCE":
+        # Power channels densify on consecutive rows; returns pack below via
+        # RETURN_PORT_* sort bases (same packing as SINK, both faces right).
         for i, d in enumerate(channels):
             ch_idx = _channel_number(d, i)
-            for base, side in (("P", "right"), ("N", "right")):
-                pname = _suffix_for_channel(ch_idx, multi=multi, base=base)
-                term = (d.get("terminals") or {}).get(base)
-                if term and not is_ideal_return(term):
-                    sk = i * 2 + (0 if base == "P" else 1)
-                    port_defs.append((pname, side, sk))
-                    terms[pname] = term
-                    if multi:
-                        channel_ports.add(pname)
-                    if base == "P":
-                        port_directives[pname] = d
+            pname = _suffix_for_channel(ch_idx, multi=multi, base="P")
+            p_term = (d.get("terminals") or {}).get("P")
+            if p_term and not is_ideal_return(p_term):
+                port_defs.append((pname, "right", i))
+                terms[pname] = p_term
+                port_directives[pname] = d
+                if multi:
+                    channel_ports.add(pname)
+        for pname, n_term, sort_key in _dedupe_return_terms(channels, "N", net_to_rail):
+            port_defs.append((pname, "right", sort_key))
+            terms[pname] = n_term
     elif role in ("RESISTOR", "SERIES"):
         p_defs, p_terms, p_dirs, p_channel_ports = _passive_channel_port_defs(
             channels,
