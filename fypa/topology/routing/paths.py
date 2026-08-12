@@ -505,9 +505,11 @@ def _from_bus_detour_drop_x(
 
     if _drop_ok(stub):
         return stub
-    outward = -1.0 if port.side == "left" else 1.0
+    # Step from the stub toward the feed so the final H into the stub stays
+    # left-to-right (outward past a right-face stub would draw RTL).
+    toward_feed = 1.0 if feed_x > stub + WIRE_EPS else -1.0
     for step in range(1, 8):
-        cand = round(stub + outward * MIN_PARALLEL_GAP * step, 1)
+        cand = round(stub + toward_feed * MIN_PARALLEL_GAP * step, 1)
         if _drop_ok(cand):
             return cand
     return None

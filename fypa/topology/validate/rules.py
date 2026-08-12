@@ -33,7 +33,12 @@ def _expected_side_for_port(
     net: str,
 ) -> str | None:
     """Canonical face, with loop-return override (RULES.md §19)."""
-    if net and net in model.loop_return_nets:
+    # Rule 19 only rewrites SERIES/RESISTOR peer faces on return nets.
+    if (
+        net
+        and net in model.loop_return_nets
+        and role in ("SERIES", "RESISTOR")
+    ):
         if terminal.startswith("P"):
             return "right"
         if terminal.startswith("N"):
@@ -536,24 +541,25 @@ def check_wire_bends_excessive(model: TopologyModel) -> list[dict]:
 
 
 def check_hub_net_unrouted(model: TopologyModel) -> list[dict]:
-    """Multi-port nets with no connecting wires (fail-closed hub drop)."""
+    """Nets with 2+ ports and no connecting wires (fail-closed route drop)."""
     by_net: dict[str, list] = defaultdict(list)
     for node in model.nodes:
         for port in node.ports:
             if port.net and port.net != GND_NET:
                 by_net[port.net].append(port)
-    wired = {w.net for w in model.wires if w.net}
+    wired = {w.net for w in model.wires if w.net and w.path_d}
     issues: list[dict] = []
     for net, ports in by_net.items():
-        if len(ports) < 3:
+        if len(ports) < 2:
             continue
         if net in wired:
             continue
+        kind = "Hub" if len(ports) >= 3 else "Pair"
         issues.append(
             make_issue(
                 "hub_net_unrouted",
                 (
-                    f"Hub net {net!r} has {len(ports)} ports but no wires "
+                    f"{kind} net {net!r} has {len(ports)} ports but no wires "
                     f"(fail-closed: no legal connected channel geometry)"
                 ),
                 net=net,
