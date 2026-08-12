@@ -277,6 +277,7 @@ def two_port_path(
     y_end_clear = obstacle_detour_y(ctx, end.y, x_approach_lo, x_approach_hi, obs, skip, net)
     start_prefix, col_x = _start_prefix_at_row(start, bus_x, start.y, obs, skip)
     if abs(y_clear - start.y) > WIRE_EPS:
+        mark = ctx.checkpoint()
         detour = f"{start_prefix} V {y_clear:.1f}"
         detour, col_at = _append_bus_column_at_row(detour, col_x, start, bus_x, y_clear, obs, skip)
         # Run the bus vertical to the dest approach row, then enter the port.
@@ -292,11 +293,13 @@ def two_port_path(
             detour, col_at, y_at, end, e_stub, end_leg, obs, skip, ctx, net
         )
         if finished is None:
+            ctx.rollback(mark)
             return ""
         ctx.reserve_horizontal(y_clear, x_lo, x_hi, net)
         ctx.reserve_vertical(col_x, min(start.y, y_clear), max(start.y, y_clear), net)
         return finished
     if abs(y_end_clear - end.y) > WIRE_EPS:
+        mark = ctx.checkpoint()
         approach, col_at = _append_bus_column_at_row(
             start_prefix,
             col_x,
@@ -318,6 +321,7 @@ def two_port_path(
             approach, col_at, y_at, end, e_stub, end_leg, obs, skip, ctx, net
         )
         if finished is None:
+            ctx.rollback(mark)
             return ""
         ctx.reserve_horizontal(start.y, x_lo, x_hi, net)
         return finished

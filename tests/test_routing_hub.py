@@ -984,6 +984,7 @@ def test_two_port_path_dest_fail_closed_when_no_clear_drop(monkeypatch):
         )
     # Also block the bus column so the preferred feed drop cannot land there.
     ctx.reserve_vertical(bus_x, 40.0, 500.0, GND_NET)
+    bands_before = len(ctx.vertical_bands)
 
     def _detour(_ctx, y_nominal, *_a, **_k):
         # Force a dest-row detour so entry must pick a drop column.
@@ -1000,6 +1001,39 @@ def test_two_port_path_dest_fail_closed_when_no_clear_drop(monkeypatch):
         start, end, bus_x=bus_x, net="VDD", obstacles=[], ctx=ctx
     )
     assert path == "", path
+    assert len(ctx.vertical_bands) == bands_before, (
+        "fail-closed dest must roll back phantom bus reservations"
+    )
+
+
+def test_pair_routing_skips_empty_fail_closed_paths(monkeypatch):
+    """Gutter pair emission must not keep ghost wires when routing fail-closes."""
+    from fypa.topology.routing.pair import signal_wires_from_pairs
+
+    a = TopologyPort(
+        terminal="N",
+        net="VDD",
+        label="VDD",
+        side="right",
+        x=100.0,
+        y=50.0,
+        node_id="L1",
+    )
+    b = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=400.0,
+        y=300.0,
+        node_id="U3",
+    )
+    monkeypatch.setattr(
+        "fypa.topology.routing.pair.two_port_wire_path",
+        lambda *_a, **_k: "",
+    )
+    wires = signal_wires_from_pairs([(a, b)], obstacles=[], ctx=RoutingContext())
+    assert wires == []
 
 
 def test_hub_tap_from_bus_detour_skips_gnd_stub_column(monkeypatch):

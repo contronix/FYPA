@@ -196,6 +196,8 @@ def signal_wires_from_pairs(
                 bus_x = column_bus_x(col, side, lane=bus_lane, n_lanes=n_lanes)
             start, end = stacked_routing_order(a, b)
             path_d = stacked_wire_path(a, b, bus_x=bus_x, obstacles=obstacles, ctx=ctx)
+            if not path_d:
+                continue
             wires.append(
                 TopologyWire(
                     net=net,
@@ -241,8 +243,10 @@ def signal_wires_from_pairs(
                 )
             except BusCorridorFull:
                 continue
-            assigned_bus.append(bus_x)
             path_d = two_port_wire_path(start, end, bus_x=bus_x, obstacles=obstacles, ctx=ctx)
+            if not path_d:
+                continue
+            assigned_bus.append(bus_x)
             wires.append(
                 TopologyWire(
                     net=net,
