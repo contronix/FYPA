@@ -946,7 +946,14 @@ def assign_columns(
     _coalesce_connector_family_columns(node_specs, col)
 
     for child_id, parent_id in loop_parent.items():
-        col[child_id] = max(col.get(child_id, 0), col.get(parent_id, 0) + 1)
+        target = max(col.get(child_id, 0), col.get(parent_id, 0) + 1)
+        col[child_id] = target
+        family = connector_families.get(child_id)
+        if family:
+            for nid in family:
+                col[nid] = max(col.get(nid, 0), target)
+
+    _coalesce_connector_family_columns(node_specs, col)
 
     # Pure SINKs occupy a dedicated rightmost column *after* loop children and
     # other non-sinks are placed, so the last column holds only SINK (or
