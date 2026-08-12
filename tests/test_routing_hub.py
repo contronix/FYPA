@@ -949,12 +949,116 @@ def test_two_port_path_dest_avoids_gnd_stub_vertical():
             assert abs(seg.x1 - stub) > 0.5, path
 
 
-def test_hub_tap_from_bus_prefers_feed_column_drop(monkeypatch):
-    """From-bus attach uses the trunk at port y when that corridor is clear.
+def test_two_port_path_dest_fail_closed_when_no_clear_drop(monkeypatch):
+    """When bus and outward escapes are blocked, emit no stub-on-GND vertical."""
+    from fypa.topology.constants import GND_NET, MIN_PARALLEL_GAP, PORT_WIRE_STUB
+    from fypa.topology.placement import port_stub_x
+    from fypa.topology.routing.context import RoutingContext
 
-    Avoids a stub-column vertical on a shared GND trunk and keeps bends off the
-    destination body.
-    """
+    start = TopologyPort(
+        terminal="N",
+        net="VDD",
+        label="VDD",
+        side="right",
+        x=100.0,
+        y=50.0,
+        node_id="L1",
+    )
+    end = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=400.0,
+        y=300.0,
+        node_id="U3",
+    )
+    stub = port_stub_x(end)
+    assert abs(stub - (400.0 - PORT_WIRE_STUB)) < 0.1
+    bus_x = 160.0
+    ctx = RoutingContext()
+    # Occupy stub and every outward escape column across the dest Y span.
+    for step in range(0, 10):
+        ctx.reserve_vertical(
+            stub - MIN_PARALLEL_GAP * step, 40.0, 500.0, GND_NET
+        )
+    # Also block the bus column so the preferred feed drop cannot land there.
+    ctx.reserve_vertical(bus_x, 40.0, 500.0, GND_NET)
+
+    def _detour(_ctx, y_nominal, *_a, **_k):
+        # Force a dest-row detour so entry must pick a drop column.
+        if abs(y_nominal - end.y) < 1.0:
+            return 250.0
+        return y_nominal
+
+    monkeypatch.setattr(
+        "fypa.topology.routing.paths.obstacle_detour_y",
+        _detour,
+    )
+
+    path = two_port_path(
+        start, end, bus_x=bus_x, net="VDD", obstacles=[], ctx=ctx
+    )
+    assert path == "", path
+
+
+def test_hub_tap_from_bus_detour_skips_gnd_stub_column(monkeypatch):
+    """Y-detour from the bus must not place a vertical on a GND stub column."""
+    from fypa.topology.constants import GND_NET, PORT_WIRE_STUB
+    from fypa.topology.placement import port_stub_x
+    from fypa.topology.routing.context import RoutingContext
+    from fypa.topology.routing.paths import hub_tap_path_from_bus
+    from fypa.topology.geometry import parse_wire_path
+    from fypa.topology.types import TopologyNode
+
+    port = TopologyPort(
+        terminal="IN_P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=400.0,
+        y=200.0,
+        node_id="U2",
+    )
+    stub = port_stub_x(port)
+    assert abs(stub - (400.0 - PORT_WIRE_STUB)) < 0.1
+    bus_x = 200.0
+    # Block only the mid-gutter on the port row so a clear outward escape
+    # remains between the obstacle and the stub (stub itself is GND).
+    blocker = TopologyNode(
+        node_id="U_block",
+        label="U_block",
+        designator="U_block",
+        role="SINK",
+        x=220.0,
+        y=190.0,
+        width=80.0,
+        height=40.0,
+        config_label="",
+        has_error=False,
+        bounds=(220.0, 190.0, 80.0, 40.0),
+        ports=[],
+    )
+    ctx = RoutingContext()
+    ctx.reserve_vertical(stub, 50.0, 400.0, GND_NET)
+
+    monkeypatch.setattr(
+        "fypa.topology.routing.paths.obstacle_detour_y",
+        lambda *_a, **_k: 120.0,
+    )
+    path, _ = hub_tap_path_from_bus(
+        bus_x, port, obstacles=[blocker], ctx=ctx, net="VDD"
+    )
+    assert path, path
+    pts = parse_wire_path(path)
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if abs(x0 - x1) < 0.5 and abs(y0 - y1) > 0.5:
+            assert abs(x0 - stub) > 0.5, path
+    assert abs(pts[0][0] - bus_x) < 0.5 and abs(pts[0][1] - 120.0) < 0.5, path
+
+
+def test_hub_tap_from_bus_prefers_feed_column_drop():
+    """From-bus attach uses the trunk at port y when that corridor is clear."""
     from fypa.topology.constants import GND_NET, PORT_WIRE_STUB
     from fypa.topology.placement import port_stub_x
     from fypa.topology.routing.context import RoutingContext
@@ -976,17 +1080,12 @@ def test_hub_tap_from_bus_prefers_feed_column_drop(monkeypatch):
     ctx = RoutingContext()
     ctx.reserve_vertical(stub, 50.0, 400.0, GND_NET)
 
-    monkeypatch.setattr(
-        "fypa.topology.routing.paths.obstacle_detour_y",
-        lambda *_a, **_k: 180.0,
-    )
     path, _ = hub_tap_path_from_bus(bus_x, port, obstacles=[], ctx=ctx, net="VDD")
     assert path, path
     pts = parse_wire_path(path)
     for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
         if abs(x0 - x1) < 0.5 and abs(y0 - y1) > 0.5:
             assert abs(x0 - stub) > 0.5, path
-    # Clear port-y corridor → attach on the feed column at port y (no stub V).
     assert abs(pts[0][0] - bus_x) < 0.5 and abs(pts[0][1] - 100.0) < 0.5, path
 
 

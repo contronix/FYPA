@@ -61,13 +61,22 @@ def test_hub_fixture_passes_topology_validation(fixture_name: str) -> None:
     if fixture_name == FIXTURE_ROW_DETOUR:
         skip.update(
             {
+                # Known signal↔signal corridor pressure on this dense fixture;
+                # GND↔signal spacing is still asserted below.
                 "duplicate_vertical_x",
                 "duplicate_horizontal_y",
-                "coincident_vertical_x",
                 "parallel_vertical_gap",
             }
         )
-    issues = [i for i in validate_topology(model) if i["code"] not in skip]
+    all_issues = validate_topology(model)
+    gnd_spacing = [
+        i
+        for i in all_issues
+        if i["code"] in ("duplicate_vertical_x", "signal_vs_gnd_drop_gap")
+        and GND_NET in (i.get("net_a"), i.get("net_b"), i.get("net", ""))
+    ]
+    assert not gnd_spacing, gnd_spacing
+    issues = [i for i in all_issues if i["code"] not in skip]
     assert not issues, issues
 
 

@@ -292,14 +292,7 @@ def two_port_path(
             detour, col_at, y_at, end, e_stub, end_leg, obs, skip, ctx, net
         )
         if finished is None:
-            # Fall back to stub drop when the preferred bus-column entry fails.
-            path = (
-                f"{detour}{_dest_leg_from_row(e_stub, y_at, end, end_leg)}"
-            )
-            ctx.reserve_horizontal(y_at, min(col_at, e_stub), max(col_at, e_stub), net)
-            if abs(y_at - end.y) > WIRE_EPS:
-                ctx.reserve_vertical(e_stub, min(y_at, end.y), max(y_at, end.y), net)
-            finished = simplify_wire_path(path)
+            return ""
         ctx.reserve_horizontal(y_clear, x_lo, x_hi, net)
         ctx.reserve_vertical(col_x, min(start.y, y_clear), max(start.y, y_clear), net)
         return finished
@@ -325,11 +318,7 @@ def two_port_path(
             approach, col_at, y_at, end, e_stub, end_leg, obs, skip, ctx, net
         )
         if finished is None:
-            path = f"{approach}{_dest_leg_from_row(e_stub, y_at, end, end_leg)}"
-            ctx.reserve_horizontal(y_at, min(col_at, e_stub), max(col_at, e_stub), net)
-            if abs(y_at - end.y) > WIRE_EPS:
-                ctx.reserve_vertical(e_stub, min(y_at, end.y), max(y_at, end.y), net)
-            finished = simplify_wire_path(path)
+            return ""
         ctx.reserve_horizontal(start.y, x_lo, x_hi, net)
         return finished
     approach, col_at = _append_bus_column_at_row(
