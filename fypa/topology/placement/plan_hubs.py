@@ -43,12 +43,22 @@ def plan_stack_hub_buses(
             outward = 1.0 if side == "right" else -1.0
             try:
                 attach = [port_stub_x(p) for p in ports]
+                span = MIN_PARALLEL_GAP * max(n_lanes, 2)
+                win_lo = bus_x - span
+                win_hi = bus_x + span
+                # Keep the window on the stub/gutter side of the column bodies.
+                if side == "left":
+                    win_hi = min(win_hi, min(attach))
+                else:
+                    win_lo = max(win_lo, max(attach))
+                if win_hi < win_lo + WIRE_EPS:
+                    continue
                 bus_x = allocate_bus_x(
                     bus_x,
                     y_lo,
                     y_hi,
-                    bus_x - MIN_PARALLEL_GAP * max(n_lanes, 2),
-                    bus_x + MIN_PARALLEL_GAP * max(n_lanes, 2),
+                    win_lo,
+                    win_hi,
                     reserved,
                     net,
                     outward=outward,

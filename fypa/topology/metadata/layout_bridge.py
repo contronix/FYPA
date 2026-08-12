@@ -643,6 +643,10 @@ def _ensure_loads_right_of_net_drivers(
                     continue
                 if loop_parent.get(load) in driver_set:
                     continue
+                # Return nets: child drives parent; do not push the loop parent
+                # right of its child (loop_parent fixups own that pair spacing).
+                if any(loop_parent.get(d) == load for d in drivers):
+                    continue
                 if col.get(load, 0) <= max_d:
                     col[load] = max_d + 1
                     changed = True

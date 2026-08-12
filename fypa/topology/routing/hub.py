@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from fypa.topology.constants import WIRE_EPS
@@ -294,6 +295,8 @@ def _connect_row_to_bus(
                 ctx=ctx,
                 net=net,
             )
+            if cost == math.inf:
+                continue
             if best is None or cost < best[0] - WIRE_EPS:
                 best = (cost, y_feed, drop_x)
 

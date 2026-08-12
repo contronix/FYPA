@@ -47,12 +47,22 @@ def plan_stacked_pair_buses(
                 if abs(bus_x - prev) < MIN_PARALLEL_GAP - WIRE_EPS:
                     bus_x = prev + outward * MIN_PARALLEL_GAP
             try:
+                attach = [port_stub_x(a), port_stub_x(b)]
+                span = MIN_PARALLEL_GAP * max(n_lanes, 2)
+                win_lo = bus_x - span
+                win_hi = bus_x + span
+                if side == "left":
+                    win_hi = min(win_hi, min(attach))
+                else:
+                    win_lo = max(win_lo, max(attach))
+                if win_hi < win_lo + WIRE_EPS:
+                    continue
                 bus_x = allocate_bus_x(
                     bus_x,
                     y_lo,
                     y_hi,
-                    bus_x - MIN_PARALLEL_GAP * max(n_lanes, 2),
-                    bus_x + MIN_PARALLEL_GAP * max(n_lanes, 2),
+                    win_lo,
+                    win_hi,
                     reserved,
                     net,
                     outward=outward,
