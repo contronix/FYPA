@@ -461,12 +461,50 @@ def _orient_loop_series_ports(
     return return_nets
 
 
+def _connector_family_base(designator: str) -> str | None:
+    """``J14.2`` → ``J14``; plain designators → ``None``."""
+    if "." not in designator:
+        return None
+    return designator.rsplit(".", 1)[0]
+
+
+def _coalesce_connector_family_columns(
+    node_specs: list[NodeSpec],
+    col: dict[str, int],
+) -> None:
+    """Stack connector channels (``J14.1`` / ``J14.2`` / …) in one column.
+
+    Multi-channel connector resistors are not a left→right power chain; they
+    share one symbol column like merged ``J14`` sections in the spec builder.
+    """
+    by_family: dict[str, list[str]] = defaultdict(list)
+    role_by_id = {s["node_id"]: s["role"] for s in node_specs}
+    for spec in node_specs:
+        nid = spec["node_id"]
+        base = _connector_family_base(spec.get("designator") or nid)
+        if not base:
+            continue
+        if role_by_id.get(nid) != "RESISTOR":
+            continue
+        if not base.startswith("J"):
+            continue
+        by_family[base].append(nid)
+
+    for _base, members in by_family.items():
+        if len(members) < 2:
+            continue
+        anchor = min(col.get(nid, 0) for nid in members)
+        for nid in members:
+            col[nid] = anchor
+
+
 def _column_net(
     role: str,
     term: TerminalDict | None,
     net_to_rail: dict[str, str],
     *,
     terminal: str = "",
+    side: str = "",
 ) -> str | None:
     """Net key for the column-placement graph.
 
@@ -484,6 +522,16 @@ def _column_net(
         return _column_flow_net(term)
     if is_power_input_port(role, terminal):
         return _column_flow_net(term)
+    if side and is_output_port(role, terminal, side):
+        phys = _column_flow_net(term)
+        canon = canonical_net(terminal_net(term), net_to_rail)
+        if (
+            phys
+            and canon
+            and phys != canon
+            and term.get("resolved_via_local")
+        ):
+            return phys
     return canonical_net(terminal_net(term), net_to_rail)
 
 
@@ -546,7 +594,7 @@ def _propagation_edges(
             term = (s["terms"] or {}).get(pname)
             if is_ideal_return(term):
                 continue
-            flow_net = _column_net(port_role, term, net_to_rail, terminal=pname)
+            flow_net = _column_net(port_role, term, net_to_rail, terminal=pname, side=side)
             if not flow_net or flow_net == GND_NET:
                 continue
             for other in inputs_by_net.get(flow_net, []):
@@ -684,7 +732,7 @@ def assign_columns(
             if is_ideal_return(term):
                 continue
             port_role = spec_port_role(s, pname)
-            flow_net = _column_net(port_role, term, net_to_rail, terminal=pname)
+            flow_net = _column_net(port_role, term, net_to_rail, terminal=pname, side=side)
             if not flow_net or flow_net == GND_NET:
                 continue
             if is_output_port(port_role, pname, side):
@@ -717,7 +765,7 @@ def assign_columns(
                 term = (s["terms"] or {}).get(pname)
                 if is_ideal_return(term):
                     continue
-                flow_net = _column_net(port_role, term, net_to_rail, terminal=pname)
+                flow_net = _column_net(port_role, term, net_to_rail, terminal=pname, side=side)
                 if not flow_net or flow_net == GND_NET:
                     continue
                 for other in inputs_by_net.get(flow_net, []):
@@ -812,7 +860,7 @@ def assign_columns(
                 term = (s["terms"] or {}).get(pname)
                 if is_ideal_return(term):
                     continue
-                flow_net = _column_net(port_role, term, net_to_rail, terminal=pname)
+                flow_net = _column_net(port_role, term, net_to_rail, terminal=pname, side=side)
                 if not flow_net or flow_net == GND_NET:
                     continue
                 for other in inputs_by_net.get(flow_net, []):
@@ -848,6 +896,8 @@ def assign_columns(
     _push_passive_load_columns(
         node_specs, col, inputs_by_net, loop_parent, role_by_id, outputs_by_net
     )
+
+    _coalesce_connector_family_columns(node_specs, col)
 
     _ensure_loads_right_of_net_drivers(
         col, outputs_by_net, inputs_by_net, back_edges, loop_parent

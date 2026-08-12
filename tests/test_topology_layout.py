@@ -326,6 +326,109 @@ def test_regulator_mutual_feed_columns_are_deterministic() -> None:
     assert assign_columns([u2, u1, v1], {}) == (cols, _returns, _parents)
 
 
+def test_regulator_switch_node_output_uses_physical_net_for_columns() -> None:
+    """REGULATOR OUT on a distinct downstream net (e.g. LX) must drive column order."""
+    from fypa.topology.metadata.layout_bridge import assign_columns
+
+    def term(net: str) -> dict:
+        return {"requested_net": net, "pins": [{"net": net, "pad": "1"}]}
+
+    ideal = {"ideal_return": True}
+
+    def spec(nid: str, role: str, terms: dict, port_defs: list) -> dict:
+        return {
+            "node_id": nid,
+            "label": nid,
+            "designator": nid,
+            "role": role,
+            "config_label": "",
+            "has_error": False,
+            "terms": terms,
+            "port_defs": port_defs,
+            "port_directives": {},
+            "tooltip": "",
+            "directive": {},
+            "directives": [],
+        }
+
+    j13 = spec(
+        "J13",
+        "SOURCE",
+        {"P": term("VDD_IN"), "N": ideal},
+        [("P", "right", 0), ("N", "right", 1)],
+    )
+    u17 = spec(
+        "U17.1",
+        "REGULATOR",
+        {
+            "IN_P": term("VDD_IN"),
+            "OUT_P": {
+                "requested_net": "LX",
+                "resolved_via_local": True,
+                "pins": [{"net": "LX.1", "pad": "1"}],
+            },
+            "IN_N": ideal,
+        },
+        [("IN_P", "left", 0), ("OUT_P", "right", 1), ("IN_N", "left", 2)],
+    )
+    l6 = spec(
+        "L6.1",
+        "RESISTOR",
+        {"P": term("LX.1"), "N": term("VDD_OUT")},
+        [("P", "left", 0), ("N", "right", 1)],
+    )
+    cols, _ret, _par = assign_columns([j13, u17, l6], {"LX.1": "VDD_IN"})
+    assert cols["J13"] < cols["U17.1"] < cols["L6.1"]
+
+
+def test_connector_family_channels_share_one_column() -> None:
+    """``J14.1`` / ``J14.2`` / ``J14.3`` stack in one column, not a fake L→R chain."""
+    from fypa.topology.metadata.layout_bridge import assign_columns
+
+    def term(net: str) -> dict:
+        return {"requested_net": net, "pins": [{"net": net, "pad": "1"}]}
+
+    def j_channel(nid: str, p_net: str, n_net: str) -> dict:
+        return {
+            "node_id": nid,
+            "label": nid,
+            "designator": nid,
+            "role": "RESISTOR",
+            "config_label": "",
+            "has_error": False,
+            "terms": {"P1": term(p_net), "N1": term(n_net)},
+            "port_defs": [("P1", "right", 0), ("N1", "right", 1)],
+            "port_directives": {},
+            "tooltip": "",
+            "directive": {},
+            "directives": [],
+        }
+
+    j1 = j_channel("J14.1", "AX1", "AY1")
+    j2 = j_channel("J14.2", "AX2", "AY2")
+    j3 = j_channel("J14.3", "AX3", "AY3")
+    sink = {
+        "node_id": "U27",
+        "label": "U27",
+        "designator": "U27",
+        "role": "SINK",
+        "config_label": "",
+        "has_error": False,
+        "terms": {
+            "P1": term("AX3"),
+            "N1": term("AY3"),
+        },
+        "port_defs": [("P1", "left", 0), ("N1", "left", 1)],
+        "port_directives": {},
+        "tooltip": "",
+        "directive": {},
+        "directives": [],
+    }
+    cols, _ret, _par = assign_columns([j1, j2, j3, sink], {})
+    assert cols["J14.1"] == cols["J14.2"] == cols["J14.3"]
+    assert cols["J14.3"] < cols["U27"]
+
+
 def test_hub_tap_escape_stays_outward_of_symbol_body() -> None:
     """When the stub column is blocked by a foreign vertical, the escape column
     must leave the port *outward* (away from the symbol body), not double back
