@@ -226,6 +226,8 @@ def signal_wires_from_pairs(
         assigned_bus: list[float] = []
         for _y_slot, bus_slot, a, b in slot_items:
             net = a.net
+            if bus_plan is not None and net not in bus_plan.pair_buses:
+                continue
             start, end = stacked_routing_order(a, b)
             try:
                 bus_x = _bus_x_for_pair(

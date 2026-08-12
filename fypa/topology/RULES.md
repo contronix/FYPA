@@ -143,7 +143,7 @@ VIN H at y=100 and y=105 overlapping in x  → redundant_parallel_run
 
 | Rule area | Prior behaviour | Target |
 |-----------|-----------------|--------|
-| Port faces | SERIES flip + loop “all ports face parent” | Fixed In=L / Out=R; loop returns peer-facing (rule 19) |
+| Port faces | SERIES flip + loop “all ports face parent” | Fixed In=L / Out=R; loop returns peer-facing (rule 20) |
 | RTL | Partial driver≺load; detours could wrap | No RTL H on power (loop returns / GND exempt) |
 | Channels | Stack lanes, face climbs, escape columns | V in col gaps, H in row gaps |
 | Hub↔hub | Exempt from `foreign_wire_crossing` | Included |
@@ -155,6 +155,6 @@ VIN H at y=100 and y=105 overlapping in x  → redundant_parallel_run
 | Detour length | Unbounded legal detours | Cap via `wire_detour_excessive` |
 | Bend count | Soft only in corridor cost | Cap via `wire_bends_excessive` |
 | Same-net parallels | Allowed near-twins | `redundant_parallel_run` |
-| Foreign crossings | Hard only when illegal | Soft prefer fewer (rule 22) |
+| Foreign crossings | Hard only when illegal | Soft prefer fewer (rule 23) |
 | Rightmost col | Loop child could share SINK column | Pure SINKs alone rightmost (`non_sink_in_rightmost`) |
 | Row→bus skip | Any same-net V in row span skipped feed | Only skip when trunk/bus already met |

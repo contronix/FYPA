@@ -1189,6 +1189,47 @@ def test_connect_row_to_bus_skips_foreign_vertical_column():
     assert abs(trunk_y - 212.0) > 1e-6, path_d
 
 
+def test_connect_row_to_bus_records_trunk_y_when_row_already_meets_bus():
+    """When a same-net row H already reaches the trunk, record trunk Y without feed."""
+    from fypa.topology.routing.hub import _HubRowPlan, _connect_row_to_bus
+
+    port_a = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="right",
+        x=164.0,
+        y=261.0,
+        node_id="J3",
+        wire_x=184.0,
+    )
+    port_b = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=264.0,
+        y=261.0,
+        node_id="U4",
+        wire_x=244.0,
+    )
+    plan = _HubRowPlan(
+        group=[port_a, port_b],
+        y_row=261.0,
+        span_lo=164.0,
+        span_hi=264.0,
+        row_lo=184.0,
+        row_hi=244.0,
+        detoured=False,
+    )
+    ctx = RoutingContext()
+    bus_x = 456.0
+    ctx.reserve_horizontal(plan.y_row, plan.span_lo, bus_x, "VDD")
+    trunk_y, feed = _connect_row_to_bus(plan, bus_x, ctx, "VDD", [])
+    assert trunk_y == plan.y_row
+    assert feed is None
+
+
 def test_connect_row_to_bus_escapes_gnd_pinch_outward():
     """When GND pins the row edge and a body fills toward-bus, drop away first.
 

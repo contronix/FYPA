@@ -238,7 +238,7 @@ def _connect_row_to_bus(
     if plan.row_lo - WIRE_EPS <= bus_x <= plan.row_hi + WIRE_EPS:
         return plan.y_row, None
     if _row_meets_bus_column(ctx, plan, net, bus_x):
-        return None, None
+        return plan.y_row, None
 
     def _clearance_skip(y_feed: float) -> set[str]:
         if abs(y_feed - plan.y_row) <= WIRE_EPS:
