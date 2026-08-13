@@ -473,10 +473,6 @@ def assign_vertical_positions(
         groups: dict[str, list[NodeSpec]] = defaultdict(list)
         for s in pending:
             groups[find(s["node_id"])].append(s)
-        occupied = [
-            (y_assign[s["node_id"]], y_assign[s["node_id"]] + heights[s["node_id"]])
-            for s in pending
-        ]
         for members in groups.values():
             if len(members) < 2:
                 continue
@@ -496,10 +492,16 @@ def assign_vertical_positions(
             # Pull the block up toward the highest member (avoid parking at canvas bottom).
             preferred = min(tops)
             block_h = tight
+            member_ids = {m["node_id"] for m in members}
+            # Rebuild obstacles from current y_assign so a prior peer group
+            # that already moved is not treated as still at its old band.
             others = [
-                (a, b)
-                for s, (a, b) in zip(pending, occupied)
-                if s["node_id"] not in {m["node_id"] for m in members}
+                (
+                    y_assign[s["node_id"]],
+                    y_assign[s["node_id"]] + heights[s["node_id"]],
+                )
+                for s in pending
+                if s["node_id"] not in member_ids
             ]
             top = _alloc_free_y(others, block_h, preferred=preferred)
             top = _clamp_top_y(top)
