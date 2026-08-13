@@ -744,6 +744,184 @@ def _ensure_loads_right_of_net_drivers(
                         changed = True
 
 
+def _direct_load_ids(
+    nid: str,
+    outputs_by_net: dict[str, list[str]],
+    inputs_by_net: dict[str, list[str]],
+    back_edges: set[tuple[str, str]],
+    loop_parent: dict[str, str],
+) -> list[str]:
+    """Nodes that take an input from ``nid``'s output nets (forward edges only)."""
+    loads: list[str] = []
+    seen: set[str] = set()
+    for net, drivers in outputs_by_net.items():
+        if nid not in drivers:
+            continue
+        for load in inputs_by_net.get(net) or []:
+            if load == nid or load in seen:
+                continue
+            if (nid, load) in back_edges:
+                continue
+            if loop_parent.get(nid) == load:
+                continue
+            seen.add(load)
+            loads.append(load)
+    return loads
+
+
+def _direct_driver_ids(
+    nid: str,
+    outputs_by_net: dict[str, list[str]],
+    inputs_by_net: dict[str, list[str]],
+    back_edges: set[tuple[str, str]],
+    loop_parent: dict[str, str],
+) -> list[str]:
+    """Nodes that drive an input net of ``nid`` (forward edges only)."""
+    drivers: list[str] = []
+    seen: set[str] = set()
+    for net, loads in inputs_by_net.items():
+        if nid not in loads:
+            continue
+        for d in outputs_by_net.get(net) or []:
+            if d == nid or d in seen:
+                continue
+            if (d, nid) in back_edges:
+                continue
+            if loop_parent.get(d) == nid:
+                continue
+            seen.add(d)
+            drivers.append(d)
+    return drivers
+
+
+def _right_pack_columns(
+    col: dict[str, int],
+    node_specs: list[NodeSpec],
+    outputs_by_net: dict[str, list[str]],
+    inputs_by_net: dict[str, list[str]],
+    back_edges: set[tuple[str, str]],
+    loop_parent: dict[str, str],
+    mixed_role_ids: set[str],
+    connector_families: dict[str, frozenset[str]],
+) -> None:
+    """Densify via adjacent singleton merge after compacting empty indices.
+
+    Far ALAP jumps inflate gutters and can fail-close pair nets. Only merge a
+    non-SOURCE singleton into the immediate right or left neighbour when L→R
+    still holds. Connector-family members are not right-merged as singletons;
+    a SERIES singleton may join a connector column on the right.
+    """
+    role_by_id = {s["node_id"]: s["role"] for s in node_specs}
+    pure_sinks = {
+        s["node_id"]
+        for s in node_specs
+        if s["role"] == "SINK" and s["node_id"] not in mixed_role_ids
+    }
+    family_ids: set[str] = set()
+    for members in connector_families.values():
+        family_ids |= set(members)
+    if not col:
+        return
+
+    def _can_place(nid: str, dest: int, by_col: dict[int, list[str]]) -> bool:
+        if dest not in by_col:
+            return False
+        if all(n in pure_sinks for n in by_col[dest]):
+            return False
+        loads = _direct_load_ids(
+            nid, outputs_by_net, inputs_by_net, back_edges, loop_parent
+        )
+        drivers = _direct_driver_ids(
+            nid, outputs_by_net, inputs_by_net, back_edges, loop_parent
+        )
+        if loads and min(col[L] for L in loads) <= dest:
+            return False
+        if drivers and max(col[d] for d in drivers) >= dest:
+            return False
+        if any(L in by_col[dest] for L in loads):
+            return False
+        if any(d in by_col[dest] for d in drivers):
+            return False
+        return True
+
+    def _refresh() -> dict[int, list[str]]:
+        compacted = _compact_columns(col)
+        col.clear()
+        col.update(compacted)
+        by: dict[int, list[str]] = defaultdict(list)
+        for nid, c in col.items():
+            by[c].append(nid)
+        return by
+
+    # --- Singleton right-merge ---
+    guard = 0
+    while guard < len(col) + 5:
+        guard += 1
+        by_col = _refresh()
+        moved = False
+        for c in sorted(by_col.keys()):
+            members = [n for n in by_col[c] if n not in pure_sinks]
+            if len(members) != 1:
+                continue
+            nid = members[0]
+            if role_by_id.get(nid) == "SOURCE" or nid in family_ids:
+                continue
+            dest = c + 1
+            if not _can_place(nid, dest, by_col):
+                continue
+            col[nid] = dest
+            moved = True
+            break
+        if not moved:
+            break
+
+    # --- Singleton left-absorb ---
+    guard = 0
+    while guard < len(col) + 5:
+        guard += 1
+        by_col = _refresh()
+        moved = False
+        for c in sorted(by_col.keys(), reverse=True):
+            members = [n for n in by_col[c] if n not in pure_sinks]
+            if len(members) != 1:
+                continue
+            nid = members[0]
+            if role_by_id.get(nid) == "SOURCE":
+                continue
+            dest = c - 1
+            if dest < 0:
+                continue
+            if any(n in family_ids for n in by_col.get(dest, [])) and nid not in family_ids:
+                continue
+            if not _can_place(nid, dest, by_col):
+                continue
+            col[nid] = dest
+            moved = True
+            break
+        if not moved:
+            break
+
+    _refresh()
+
+    for child_id, parent_id in loop_parent.items():
+        col[child_id] = max(col.get(child_id, 0), col.get(parent_id, 0) + 1)
+
+    _ensure_loads_right_of_net_drivers(
+        col,
+        outputs_by_net,
+        inputs_by_net,
+        back_edges,
+        loop_parent,
+        None,
+    )
+    if pure_sinks:
+        other = [c for nid, c in col.items() if nid not in pure_sinks]
+        need = (max(other) if other else 0) + 1
+        for nid in pure_sinks:
+            col[nid] = need
+    _refresh()
+
+
 def assign_columns(
     node_specs: list[NodeSpec],
     net_to_rail: dict[str, str],
@@ -979,6 +1157,40 @@ def assign_columns(
         sink_col = (max(other_cols) if other_cols else 0) + 1
         for s in node_specs:
             if s["role"] == "SINK" and s["node_id"] not in mixed_role_ids:
+                col[s["node_id"]] = sink_col
+
+    # Densify indices so adjacent singleton merges see real neighbours.
+    compacted = _compact_columns(col)
+    col.clear()
+    col.update(compacted)
+
+    _right_pack_columns(
+        col,
+        node_specs,
+        outputs_by_net,
+        inputs_by_net,
+        back_edges,
+        loop_parent,
+        mixed_role_ids,
+        connector_families,
+    )
+    _coalesce_connector_family_columns(node_specs, col, loop_parent)
+
+    # Pure SINKs may need a fresh rightmost index after right-pack merges.
+    if col:
+        pure_sinks = [
+            s
+            for s in node_specs
+            if s["role"] == "SINK" and s["node_id"] not in mixed_role_ids
+        ]
+        if pure_sinks:
+            other_cols = [
+                col[s["node_id"]]
+                for s in node_specs
+                if not (s["role"] == "SINK" and s["node_id"] not in mixed_role_ids)
+            ]
+            sink_col = (max(other_cols) if other_cols else 0) + 1
+            for s in pure_sinks:
                 col[s["node_id"]] = sink_col
 
     loop_return_nets = _orient_loop_series_ports(

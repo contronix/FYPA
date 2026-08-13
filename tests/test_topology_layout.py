@@ -132,6 +132,42 @@ def test_probe_project_a_stays_compact() -> None:
     TestHubRowDetourReachesTrunk().test_every_power_port_is_on_one_connected_net(model)
 
 
+def test_probe_qube_dense_pack_gate() -> None:
+    """qube probe: peer stack, port ΔY, hub rail, column densify (skip if missing)."""
+    from fypa.topology.constants import ROW_GAP
+    from fypa.topology.report import topology_wiring_report
+
+    model = _load_probe_dir("qube")
+    if model is None:
+        return
+    xs = sorted({round(n.x, 1) for n in model.nodes})
+    # Safe adjacent singleton pack drops ≥1 ASAP column; far ALAP is avoided.
+    assert len(xs) <= 13, len(xs)
+    peers = [n for n in model.nodes if (n.designator or "") in ("Q7", "Q14", "Q15")]
+    if len(peers) == 3:
+        span = max(n.y for n in peers) - min(n.y for n in peers)
+        assert span <= 3 * (peers[0].height + ROW_GAP), span
+    rep = topology_wiring_report(model)
+    assert not any(
+        i.get("code") == "hub_net_unrouted" and i.get("net") == "VDD_3V3"
+        for i in rep.get("issues") or []
+    )
+    assert any(w.get("net") == "VDD_3V3" for w in rep.get("wires") or [])
+    ports = rep.get("ports") or []
+    dys = [
+        abs(a["y"] - b["y"])
+        for a in ports
+        if str(a.get("node_id", "")).startswith("J14")
+        for b in ports
+        if str(b.get("node_id", "")).startswith("U27")
+        and a.get("net")
+        and a.get("net") == b.get("net")
+        and a.get("net") != "GND"
+    ]
+    if dys:
+        assert max(dys) == 0.0, max(dys)
+
+
 def test_all_sinks_share_rightmost_column():
     """Pure SINK symbols align in the last column even when propagation stops early."""
     from fypa.topology.metadata.layout_bridge import (
@@ -427,6 +463,240 @@ def test_connector_family_channels_share_one_column() -> None:
     cols, _ret, _par = assign_columns([j1, j2, j3, sink], {})
     assert cols["J14.1"] == cols["J14.2"] == cols["J14.3"]
     assert cols["J14.3"] < cols["U27"]
+
+
+def test_singleton_column_absorbs_left_when_safe() -> None:
+    """Lone hop-1 switch beside a load column merges left when L→R allows."""
+    from fypa.topology.metadata.layout_bridge import assign_columns
+
+    def term(net: str) -> dict:
+        return {"requested_net": net, "pins": [{"net": net, "pad": "1"}]}
+
+    def series(nid: str, p_net: str, n_net: str) -> dict:
+        return {
+            "node_id": nid,
+            "label": nid,
+            "designator": nid,
+            "role": "SERIES",
+            "config_label": "",
+            "has_error": False,
+            "terms": {"P": term(p_net), "N": term(n_net)},
+            "port_defs": [("P", "left", 0), ("N", "right", 0)],
+            "port_directives": {},
+            "tooltip": "",
+            "directive": {},
+            "directives": [],
+        }
+
+    def sink(nid: str, net: str) -> dict:
+        return {
+            "node_id": nid,
+            "label": nid,
+            "designator": nid,
+            "role": "SINK",
+            "config_label": "",
+            "has_error": False,
+            "terms": {"P": term(net)},
+            "port_defs": [("P", "left", 0)],
+            "port_directives": {},
+            "tooltip": "",
+            "directive": {},
+            "directives": [],
+        }
+
+    src = {
+        "node_id": "J1",
+        "label": "J1",
+        "designator": "J1",
+        "role": "SOURCE",
+        "config_label": "",
+        "has_error": False,
+        "terms": {"P": term("VIN")},
+        "port_defs": [("P", "right", 0)],
+        "port_directives": {},
+        "tooltip": "",
+        "directive": {},
+        "directives": [],
+    }
+    # J1 → Q1 → L1 → U1, plus parallel Q2 that only feeds U1 (singleton mid col).
+    q1 = series("Q1", "VIN", "MID")
+    l1 = series("L1", "MID", "OUT")
+    q2 = series("Q2", "VIN", "RAIL")
+    u1 = sink("U1", "OUT")
+    u2 = sink("U2", "RAIL")
+    cols, _ret, _par = assign_columns([src, q1, l1, q2, u1, u2], {})
+    # Q2 should not occupy a dedicated column alone between Q1 and sinks if it
+    # can sit with Q1 (same driver side, loads only in sink column).
+    assert cols["J1"] < cols["Q1"] <= cols["L1"] < cols["U1"]
+    assert cols["Q2"] < cols["U2"]
+    n_cols = len(set(cols.values()))
+    assert n_cols <= 5, cols
+
+
+def test_singleton_right_merges_into_next_column() -> None:
+    """Compact+pack merges an ASAP singleton into the occupied column on its right."""
+    from collections import defaultdict
+
+    from fypa.topology.metadata.layout_bridge import (
+        _direct_driver_ids,
+        _direct_load_ids,
+        _right_pack_columns,
+    )
+
+    def term(net: str) -> dict:
+        return {"requested_net": net, "pins": [{"net": net, "pad": "1"}]}
+
+    def series(nid: str, p_net: str, n_net: str) -> dict:
+        return {
+            "node_id": nid,
+            "label": nid,
+            "designator": nid,
+            "role": "SERIES",
+            "config_label": "",
+            "has_error": False,
+            "terms": {"P": term(p_net), "N": term(n_net)},
+            "port_defs": [("P", "left", 0), ("N", "right", 0)],
+            "port_directives": {},
+            "tooltip": "",
+            "directive": {},
+            "directives": [],
+        }
+
+    def sink(nid: str, net: str) -> dict:
+        return {
+            "node_id": nid,
+            "label": nid,
+            "designator": nid,
+            "role": "SINK",
+            "config_label": "",
+            "has_error": False,
+            "terms": {"P": term(net)},
+            "port_defs": [("P", "left", 0)],
+            "port_directives": {},
+            "tooltip": "",
+            "directive": {},
+            "directives": [],
+        }
+
+    # Crafted ASAP: lone Lx between Q8 and J2; Lx only loads the far sink.
+    q8 = series("Q8", "A", "B")
+    lx = series("Lx", "B", "FAR")
+    j2 = series("J2", "X", "Y")
+    u_far = sink("U_FAR", "FAR")
+    u1 = sink("U1", "Y")
+    specs = [q8, lx, j2, u_far, u1]
+    col = {"Q8": 0, "Lx": 1, "J2": 2, "U_FAR": 3, "U1": 3}
+    outputs_by_net = defaultdict(list)
+    inputs_by_net = defaultdict(list)
+    outputs_by_net["B"] = ["Q8"]
+    inputs_by_net["B"] = ["Lx"]
+    outputs_by_net["FAR"] = ["Lx"]
+    inputs_by_net["FAR"] = ["U_FAR"]
+    outputs_by_net["Y"] = ["J2"]
+    inputs_by_net["Y"] = ["U1"]
+    _right_pack_columns(
+        col,
+        specs,
+        outputs_by_net,
+        inputs_by_net,
+        set(),
+        {},
+        set(),
+        {},
+    )
+    assert col["Lx"] == col["J2"], col
+    assert col["Q8"] < col["Lx"] < col["U_FAR"]
+    assert _direct_load_ids("Lx", outputs_by_net, inputs_by_net, set(), {}) == [
+        "U_FAR"
+    ]
+    assert "Q8" in _direct_driver_ids("Lx", outputs_by_net, inputs_by_net, set(), {})
+
+
+def test_series_peer_stack_stays_contiguous() -> None:
+    """Same-column SERIES peers that share nets pack within a tight Y span."""
+    from fypa.topology.constants import ROW_GAP
+    from fypa.topology.layout.vertical_align import (
+        _spec_layout_height,
+        assign_vertical_positions,
+    )
+    from fypa.topology.metadata.layout_bridge import ResolvedPort
+
+    def make_spec(nid: str, nets: list[str]) -> dict:
+        port_defs = [(f"P{i}", "right", i) for i, _n in enumerate(nets)]
+        resolved = {
+            f"P{i}": ResolvedPort(wnet=n, plabel=n, tooltip="")
+            for i, n in enumerate(nets)
+        }
+        return {
+            "node_id": nid,
+            "label": nid,
+            "designator": nid,
+            "role": "SERIES",
+            "config_label": "",
+            "has_error": False,
+            "terms": {},
+            "port_defs": port_defs,
+            "resolved_ports": resolved,
+            "port_directives": {},
+            "tooltip": "",
+            "directive": {},
+            "directives": [],
+        }
+
+    # Three peers sharing NET_A; one would otherwise chase a far sink.
+    q7 = make_spec("Q7", ["NET_A"])
+    q15 = make_spec("Q15", ["NET_A", "NET_B"])
+    q14 = make_spec("Q14", ["NET_A", "NET_C"])
+    sink_hi = make_spec("U_HI", ["NET_B"])
+    sink_hi["role"] = "SINK"
+    sink_lo = make_spec("U_LO", ["NET_C"])
+    sink_lo["role"] = "SINK"
+    cols = {"Q7": 0, "Q15": 0, "Q14": 0, "U_HI": 1, "U_LO": 1}
+    y = assign_vertical_positions(
+        [q7, q15, q14, sink_hi, sink_lo], cols, max_col=1
+    )
+    peers = ("Q7", "Q15", "Q14")
+    tops = [y[p] for p in peers]
+    heights = [_spec_layout_height(s) for s in (q7, q15, q14)]
+    span = max(t + h for t, h in zip(tops, heights)) - min(tops)
+    tight = sum(heights) + ROW_GAP * 2
+    assert span <= tight + ROW_GAP + 1.0, (span, tight, {p: y[p] for p in peers})
+
+
+def test_compress_empty_bands_closes_gaps() -> None:
+    """Unused vertical gaps within a column collapse to ROW_GAP packing."""
+    from fypa.topology.constants import MARGIN, ROW_GAP
+    from fypa.topology.layout.vertical_align import (
+        _spec_layout_height,
+        compress_empty_bands,
+    )
+    from fypa.topology.metadata.layout_bridge import ResolvedPort
+
+    def make_spec(nid: str) -> dict:
+        return {
+            "node_id": nid,
+            "label": nid,
+            "designator": nid,
+            "role": "SERIES",
+            "config_label": "",
+            "has_error": False,
+            "terms": {},
+            "port_defs": [("P", "right", 0)],
+            "resolved_ports": {"P": ResolvedPort(wnet="VIN", plabel="VIN", tooltip="")},
+            "port_directives": {},
+            "tooltip": "",
+            "directive": {},
+            "directives": [],
+        }
+
+    a = make_spec("A")
+    b = make_spec("B")
+    ha = _spec_layout_height(a)
+    hb = _spec_layout_height(b)
+    y_in = {"A": float(MARGIN), "B": float(MARGIN) + ha + 5 * ROW_GAP}
+    y_out = compress_empty_bands(y_in, [a, b], {"A": 0, "B": 0})
+    assert y_out["A"] == float(MARGIN)
+    assert abs(y_out["B"] - (float(MARGIN) + ha + ROW_GAP)) < 1e-6
 
 
 def test_hub_tap_escape_stays_outward_of_symbol_body() -> None:

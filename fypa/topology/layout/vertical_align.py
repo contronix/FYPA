@@ -134,12 +134,7 @@ def _port_aligned_top_y(
     partner: NodeSpec,
     partner_top: float,
 ) -> float:
-    """Symbol top so a shared-net port lines up with the partner's port.
-
-    Falls back to matching tops when no shared net / offsets are available.
-    Prefers the shared net with the smallest absolute row-offset delta so
-    multi-channel connectors (AX/AY/…) straighten against tall sinks.
-    """
+    """Symbol top so a shared-net port lines up with the partner's port."""
     offs_self = _net_port_offsets(spec)
     offs_part = _net_port_offsets(partner)
     shared = [n for n in _shared_nets(spec, partner) if n in offs_self and n in offs_part]
@@ -172,14 +167,25 @@ def _alloc_free_y(
     *,
     preferred: float | None = None,
 ) -> float:
+    """Pick a free top Y; prefer the free slot nearest ``preferred``."""
     if preferred is not None and not _intervals_overlap(preferred, height, occupied):
         return max(float(MARGIN), preferred)
+
+    candidates: list[float] = [float(MARGIN)]
     y = float(MARGIN)
     for y0, y1 in sorted(occupied):
         if y + height + ROW_GAP <= y0 + WIRE_EPS:
-            return y
+            candidates.append(y)
         y = max(y, y1 + ROW_GAP)
-    return y
+    candidates.append(y)
+
+    free = [c for c in candidates if not _intervals_overlap(c, height, occupied)]
+    if not free:
+        return y
+    if preferred is None:
+        return free[0]
+    pref = max(float(MARGIN), preferred)
+    return min(free, key=lambda c: (abs(c - pref), c))
 
 
 def _direct_alignment_pairs(
@@ -268,13 +274,7 @@ def _primary_non_gnd_net(
     *,
     peer_net_counts: dict[str, int] | None = None,
 ) -> str:
-    """Pack key net: prefer supply rails shared with many column peers.
-
-    Using ``min(all nets)`` floated multi-net LED loads above their drivers
-    (gutter braid). Preferring any supply rail without peer context put
-    ``VDD_1V8`` sinks above the ``VDD_3V3`` cluster. Count co-occurrence on the
-    sink column so shared hub loads stay adjacent in designator order.
-    """
+    """Pack key net: prefer supply rails shared with many column peers."""
     nets = [
         r.wnet
         for r in (spec.get("resolved_ports") or {}).values()
@@ -292,17 +292,6 @@ def _primary_non_gnd_net(
     return min(pool, key=lambda n: (-counts.get(n, 0), n))
 
 
-def _sink_pack_sort_key(
-    spec: NodeSpec,
-    peer_net_counts: dict[str, int],
-) -> tuple:
-    """Order rightmost-column sinks by shared primary net, then designator."""
-    return (
-        _primary_non_gnd_net(spec, peer_net_counts=peer_net_counts),
-        spec.get("designator") or spec["node_id"],
-    )
-
-
 def _peer_net_counts(pending: list[NodeSpec]) -> dict[str, int]:
     counts: dict[str, int] = defaultdict(int)
     for spec in pending:
@@ -314,6 +303,49 @@ def _peer_net_counts(pending: list[NodeSpec]) -> dict[str, int]:
             seen.add(wnet)
             counts[wnet] += 1
     return counts
+
+
+def _sink_pack_sort_key(
+    spec: NodeSpec,
+    peer_net_counts: dict[str, int],
+) -> tuple:
+    """Order sinks by shared primary net, then designator."""
+    return (
+        _primary_non_gnd_net(spec, peer_net_counts=peer_net_counts),
+        spec.get("designator") or spec["node_id"],
+    )
+
+
+def compress_empty_bands(
+    y_assign: dict[str, float],
+    node_specs: list[NodeSpec],
+    columns: dict[str, int],
+    *,
+    protect_ids: set[str] | None = None,
+) -> dict[str, float]:
+    """Close unused vertical gaps within each column (top-down pack)."""
+    protect_ids = protect_ids or set()
+    heights = {s["node_id"]: _spec_layout_height(s) for s in node_specs}
+    out = dict(y_assign)
+    by_col: dict[int, list[NodeSpec]] = defaultdict(list)
+    for spec in node_specs:
+        by_col[columns[spec["node_id"]]].append(spec)
+
+    for _c, specs in by_col.items():
+        ordered = sorted(specs, key=lambda s: (out[s["node_id"]], s["node_id"]))
+        if ordered and all(s["node_id"] in protect_ids for s in ordered):
+            continue
+        y = float(MARGIN)
+        for spec in ordered:
+            nid = spec["node_id"]
+            nh = heights[nid]
+            if nid in protect_ids:
+                y = max(y, out[nid] + nh + ROW_GAP)
+                continue
+            if out[nid] > y + WIRE_EPS:
+                out[nid] = y
+            y = out[nid] + nh + ROW_GAP
+    return out
 
 
 def assign_vertical_positions(
@@ -351,7 +383,9 @@ def assign_vertical_positions(
                 nid = spec["node_id"]
                 nh = heights[nid]
                 downstream = [
-                    o for o in higher_partners.get(nid, []) if columns[o] > c and o in y_assign
+                    o
+                    for o in higher_partners.get(nid, [])
+                    if columns[o] > c and o in y_assign
                 ]
                 if downstream:
                     partner_id = _pick_downstream_align_partner(
@@ -360,7 +394,6 @@ def assign_vertical_positions(
                         columns,
                         specs_by_id,
                     )
-
                     if partner_id is None:
                         continue
                     y = _port_aligned_top_y(
@@ -388,4 +421,138 @@ def assign_vertical_positions(
                     y_assign[nid] = y
                     occupied[c].append((y, y + nh))
                 break
+
+    # Protect port-aligned upstream nodes and multi-channel mid connectors.
+    protect: set[str] = set()
+    for spec in node_specs:
+        nets = {
+            r.wnet
+            for r in (spec.get("resolved_ports") or {}).values()
+            if r.wnet and r.wnet != GND_NET
+        }
+        if len(nets) >= 3 and 0 < columns[spec["node_id"]] < max_col:
+            protect.add(spec["node_id"])
+    for nid, partners in higher_partners.items():
+        if any(p in y_assign for p in partners):
+            protect.add(nid)
+
+    y_assign = compress_empty_bands(
+        y_assign, node_specs, columns, protect_ids=protect
+    )
+
+    peer_repacked: set[str] = set()
+    for c in range(max_col):
+        pending = [s for s in node_specs if columns[s["node_id"]] == c]
+        if len(pending) < 2:
+            continue
+        parent = {s["node_id"]: s["node_id"] for s in pending}
+
+        def find(a: str) -> str:
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        nets_of = {
+            s["node_id"]: {
+                r.wnet
+                for r in (s.get("resolved_ports") or {}).values()
+                if r.wnet and r.wnet != GND_NET
+            }
+            for s in pending
+        }
+        for i, a in enumerate(pending):
+            for b in pending[i + 1 :]:
+                if nets_of[a["node_id"]] & nets_of[b["node_id"]]:
+                    union(a["node_id"], b["node_id"])
+        groups: dict[str, list[NodeSpec]] = defaultdict(list)
+        for s in pending:
+            groups[find(s["node_id"])].append(s)
+        occupied = [
+            (y_assign[s["node_id"]], y_assign[s["node_id"]] + heights[s["node_id"]])
+            for s in pending
+        ]
+        for members in groups.values():
+            if len(members) < 2:
+                continue
+            # Only SERIES/RESISTOR peer stacks (Q15-class); do not re-pack
+            # regulator columns used by hub-escape fixtures.
+            if not all(s.get("role") in ("SERIES", "RESISTOR") for s in members):
+                continue
+            members = sorted(members, key=lambda s: y_assign[s["node_id"]])
+            tops = [y_assign[s["node_id"]] for s in members]
+            bots = [y_assign[s["node_id"]] + heights[s["node_id"]] for s in members]
+            span = max(bots) - min(tops)
+            tight = sum(heights[s["node_id"]] for s in members) + ROW_GAP * (
+                len(members) - 1
+            )
+            if span <= tight + ROW_GAP + WIRE_EPS:
+                continue
+            # Pull the block up toward the highest member (avoid parking at canvas bottom).
+            preferred = min(tops)
+            block_h = tight
+            others = [
+                (a, b)
+                for s, (a, b) in zip(pending, occupied)
+                if s["node_id"] not in {m["node_id"] for m in members}
+            ]
+            top = _alloc_free_y(others, block_h, preferred=preferred)
+            top = _clamp_top_y(top)
+            y = top
+            for spec in members:
+                nid = spec["node_id"]
+                nh = heights[nid]
+                y_assign[nid] = y
+                peer_repacked.add(nid)
+                y += nh + ROW_GAP
+
+    # Re-align west columns to peer-packed SERIES stacks (J13/Q17 → Q7).
+    # Do not move peer-repacked members themselves.
+    for c in range(max_col - 1, -1, -1):
+        pending = [s for s in node_specs if columns[s["node_id"]] == c]
+        col_occ = [
+            (y_assign[s["node_id"]], y_assign[s["node_id"]] + heights[s["node_id"]])
+            for s in pending
+        ]
+        for spec in pending:
+            nid = spec["node_id"]
+            if nid in peer_repacked:
+                continue
+            downstream = [
+                o
+                for o in higher_partners.get(nid, [])
+                if columns[o] > c and o in y_assign
+            ]
+            if not downstream:
+                continue
+            partner_id = _pick_downstream_align_partner(
+                spec, downstream, columns, specs_by_id
+            )
+            if partner_id is None:
+                continue
+            y = _clamp_top_y(
+                _port_aligned_top_y(
+                    spec, specs_by_id[partner_id], y_assign[partner_id]
+                )
+            )
+            nh = heights[nid]
+            others = [
+                (a, b)
+                for a, b in col_occ
+                if abs(a - y_assign[nid]) > WIRE_EPS
+            ]
+            if not _intervals_overlap(y, nh, others):
+                y_assign[nid] = y
+                col_occ = [
+                    (
+                        y_assign[s["node_id"]],
+                        y_assign[s["node_id"]] + heights[s["node_id"]],
+                    )
+                    for s in pending
+                ]
     return y_assign

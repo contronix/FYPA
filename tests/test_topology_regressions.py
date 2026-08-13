@@ -358,8 +358,10 @@ def test_regression_port_horizontal_stub_before_vertical():
             wire.routing_kind == "hub_tap"
             and bus_x is not None
             and stub > bus_x + 1.0
+            and abs(start_x - port.x) >= 1.0
         ):
             # Downstream of the gutter bus: trunk feeds east into the port.
+            # (Port→bus feeds start on the port and fall through to stub checks.)
             assert abs(verts[-1][0] - port.x) < 1.0, (
                 f"{wire.net} bus-fed tap should end on port: {wire.path_d}"
             )

@@ -87,24 +87,30 @@ def _required_gaps(
     *,
     gnd_bus_y: float | None = None,
 ) -> list[float]:
-    """Per-gap widths: each gap only widens for gutters whose span crosses it."""
+    """Per-gap widths: each gap only widens for gutters whose span crosses it.
+
+    When a measured bus plan exists for a gutter, prefer its bus count over the
+    raw port-pair channel estimate so cancelled / unrouted hubs do not keep
+    over-wide gutters.
+    """
     del gnd_bus_y
     gaps = [base_gap] * max_col
     spans = gutter_bus_span_from_plan(bus_plan, all_ports)
     for (x_lo, x_hi), nets_in_gutter in gutter_groups(all_ports).items():
         n_channels = _gutter_channel_count(nets_in_gutter, all_ports)
-        req = base_gap
-        if n_channels > 1:
-            req = max(req, _col_gap_for_gutter_slots(n_channels))
         measured = spans.get((x_lo, x_hi))
+        req = base_gap
         if measured is not None:
             x_min, x_max, n_buses = measured
-            if n_buses > 1:
+            slots = max(n_buses, 1)
+            if slots > 1:
                 req = max(
                     req,
                     _col_gap_for_bus_span(x_min, x_max),
-                    _col_gap_for_gutter_slots(n_buses),
+                    _col_gap_for_gutter_slots(slots),
                 )
+        elif n_channels > 1:
+            req = max(req, _col_gap_for_gutter_slots(n_channels))
         if req <= base_gap + WIRE_EPS:
             continue
         for g in range(max_col):

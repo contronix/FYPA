@@ -8,11 +8,26 @@ Generic designators (`J1`, `U1`, `R1`) and nets (`VIN`, `VOUT`, `GND`, `OUTA`, `
 ## Symbols
 
 1. **Grid** — Components sit on a **column / row** grid.
-2. **SOURCE left** — SOURCE symbols as far **left** as possible (`source_not_leftmost` when a non-SOURCE shares column 0 while a SOURCE is further right — layout invariant).
+2. **SOURCE left** — After column compaction, SOURCE occupies the **leftmost
+   occupied** column (`source_not_leftmost` when a non-SOURCE shares column 0
+   while a SOURCE is further right). Empty indices are removed after placement;
+   SERIES/RESISTOR nodes may first take maximal columns subject to L→R (ALAP),
+   then trailing singletons may merge left when L→R allows.
 3. **SINK right** — Pure SINK symbols occupy the **rightmost** column alone
    (with multi-role parts that include SINK also allowed there). Non-SINK
    symbols must not share that column (`sink_not_rightmost`,
    `non_sink_in_rightmost`).
+3a. **Adjacent singleton pack** — After compacting empty indices, a non-SOURCE
+   singleton (not a connector-family member) may merge into the immediate right
+   neighbour when loads stay strictly right, or into the left neighbour when
+   L→R allows. Far ALAP jumps across mid columns are avoided (they inflate
+   gutters and can fail-close pair nets).
+3b. **Compact columns** — Within a column, unused vertical bands ≫ `ROW_GAP`
+   with no routing need are closed. SERIES/RESISTOR peers that share nets pack
+   contiguously (no orphan at `MARGIN` while siblings sit at the bottom).
+3c. **Port-align vs density** — Straight shared-net ports win for small ΔY;
+   nearest free slot is preferred on collision; peer re-pack may override a
+   far align partner so local stacks stay tight.
 
 ## Current flow
 
