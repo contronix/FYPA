@@ -3,10 +3,7 @@
   "testBranch": "test/combined",
   "deleteTestBranchFirst": true,
   "extraFeatureBranches": [
-    "feature/metric-footprints",
     "feature/area-weighted-pin-coupling",
-    "chore/altium-monkey-2026.8.1",
-    "fix/local-net-channel-alias-scope",
     "feature/sheet-symbol-pdn-overrides",
     "feature/rail-subnet-tree",
     "feature/pdn-channel-templates",
