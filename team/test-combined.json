@@ -3,6 +3,7 @@
   "testBranch": "test/combined",
   "deleteTestBranchFirst": true,
   "extraFeatureBranches": [
-    "feature/topology-rules-foundation"
+    "feature/topology-rules-foundation",
+    "fix/repeat-local-rail-groups"
   ]
 }
