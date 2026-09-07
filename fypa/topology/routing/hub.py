@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
-from fypa.topology.constants import WIRE_EPS
+from fypa.topology.constants import PORT_WIRE_STUB, WIRE_EPS, WIRE_GUTTER_PAD
 from fypa.topology.geometry import parse_wire_path, simplify_wire_path
 from fypa.topology.placement import port_stub_x
 from fypa.topology.routing.context import RoutingContext
 from fypa.topology.routing.paths import (
     _foreign_horizontal_blocks_row,
     _foreign_vertical_blocks_column,
+    _horizontal_corridor_illegal,
     group_ports_by_row,
     hub_row_path,
     hub_row_groups,
@@ -156,21 +158,89 @@ def _trunk_y_at_bus(path_d: str, bus_x: float) -> float | None:
     return on_trunk[-1]
 
 
-def _row_meets_net_vertical(
+def _row_meets_bus_column(
     ctx: RoutingContext,
     plan: _HubRowPlan,
     net: str,
+    bus_x: float,
 ) -> bool:
-    """True when the row span already crosses a same-net vertical at ``plan.y_row``."""
+    """True when a same-net horizontal at the row already reaches ``bus_x``.
+
+    Planned bus verticals are pre-reserved into ``ctx`` for collision avoidance
+    and must not count as a live trunk attachment. Row-local drops (upstream
+    singleton verticals inside the row span) also do not attach to the bus.
+    """
     y = plan.y_row
-    for vx, vy_lo, vy_hi, vnet in ctx.vertical_bands:
-        if vnet != net:
+    for by, blo, bhi, bnet in ctx.horizontal_bands:
+        if bnet != net or abs(by - y) > WIRE_EPS:
             continue
-        if vy_lo > y + WIRE_EPS or vy_hi < y - WIRE_EPS:
-            continue
-        if plan.span_lo - WIRE_EPS <= vx <= plan.span_hi + WIRE_EPS:
+        if min(blo, bhi) - WIRE_EPS <= bus_x <= max(blo, bhi) + WIRE_EPS and (
+            min(blo, bhi) - WIRE_EPS <= plan.span_hi + WIRE_EPS
+            and max(blo, bhi) + WIRE_EPS >= plan.span_lo - WIRE_EPS
+        ):
             return True
     return False
+
+
+def _hub_feed_drop_rtl_ok(edge_x: float, drop_x: float, plan: _HubRowPlan) -> bool:
+    """Reject row-edge hops that would draw illegal RTL (RULES.md §5).
+
+    A westward hop from the feed column is only allowed within the left-face
+    stub channel band at ``edge_x`` — same limit as ``check_right_to_left_wires``.
+    """
+    if drop_x >= edge_x - WIRE_EPS:
+        return True
+    max_stub = PORT_WIRE_STUB + WIRE_GUTTER_PAD + WIRE_EPS
+    if edge_x - drop_x > max_stub + WIRE_EPS:
+        return False
+    for port in plan.group:
+        if abs(port.y - plan.y_row) > WIRE_EPS or port.side != "left":
+            continue
+        if abs(port_stub_x(port) - edge_x) <= WIRE_EPS:
+            return True
+    return False
+
+
+def _hub_feed_bus_leg_ltr_ok(
+    edge_x: float,
+    drop_x: float,
+    y_feed: float,
+    y_row: float,
+    bus_x: float,
+    plan: _HubRowPlan,
+) -> bool:
+    """The row→trunk feed horizontal must not run illegal RTL."""
+    if abs(y_feed - y_row) <= WIRE_EPS:
+        if bus_x >= edge_x - WIRE_EPS:
+            return True
+        return _hub_feed_drop_rtl_ok(edge_x, bus_x, plan)
+    return bus_x >= drop_x - WIRE_EPS
+
+
+def _hub_feed_drop_columns(edge_x: float, bus_x: float, plan: _HubRowPlan) -> list[float]:
+    """Row-edge first, then toward the bus, then away (GND stub pinch).
+
+    Toward-bus steps escape a GND trunk that sits just outside the edge.
+    When a symbol body fills the toward-bus lane and GND is still within
+    ``MIN_PARALLEL_GAP`` of ``edge_x``, one RTL-legal outward column can
+    clear the near-parallel band so a detoured feed can reach the trunk.
+    """
+    from fypa.topology.constants import MIN_PARALLEL_GAP
+
+    toward = MIN_PARALLEL_GAP if bus_x >= edge_x - WIRE_EPS else -MIN_PARALLEL_GAP
+    away = -toward
+    cols = [edge_x]
+    for k in range(1, 8):
+        drop_x = round(edge_x + toward * k, 1)
+        if not _hub_feed_drop_rtl_ok(edge_x, drop_x, plan):
+            break
+        cols.append(drop_x)
+    for k in range(1, 8):
+        drop_x = round(edge_x + away * k, 1)
+        if not _hub_feed_drop_rtl_ok(edge_x, drop_x, plan):
+            break
+        cols.append(drop_x)
+    return cols
 
 
 def _connect_row_to_bus(
@@ -184,35 +254,77 @@ def _connect_row_to_bus(
 
     Returns ``(trunk_y on bus column, optional feed wire)``. When the row can
     reach ``bus_x``, emit a feed wire and the Y where it meets the trunk.
+    Picks the lowest-cost legal feed Y (RULES.md §20), not first-fit.
     """
+    from fypa.topology.routing.cost import corridor_cost
+
     edge_x = hub_row_edge_x(plan.row_lo, plan.row_hi, bus_x)
     if plan.row_lo - WIRE_EPS <= bus_x <= plan.row_hi + WIRE_EPS:
         return plan.y_row, None
-    if _row_meets_net_vertical(ctx, plan, net):
-        return None, None
-    lo, hi = min(edge_x, bus_x), max(edge_x, bus_x)
+    if _row_meets_bus_column(ctx, plan, net, bus_x):
+        return plan.y_row, None
 
     def _clearance_skip(y_feed: float) -> set[str]:
         if abs(y_feed - plan.y_row) <= WIRE_EPS:
             return {p.node_id for p in plan.group}
         return set()
 
-    def _feed_at(y_feed: float) -> str | None:
+    def _feed_ok(y_feed: float, drop_x: float) -> bool:
+        if not _hub_feed_bus_leg_ltr_ok(edge_x, drop_x, y_feed, plan.y_row, bus_x, plan):
+            return False
         skip = _clearance_skip(y_feed)
-        if not horizontal_segment_clear(y_feed, lo, hi, obstacles, skip):
-            return None
-        if _foreign_horizontal_blocks_row(ctx, y_feed, lo, hi, net):
-            return None
+        feed_lo, feed_hi = min(drop_x, bus_x), max(drop_x, bus_x)
+        if not horizontal_segment_clear(y_feed, feed_lo, feed_hi, obstacles, skip):
+            return False
+        if _foreign_horizontal_blocks_row(ctx, y_feed, feed_lo, feed_hi, net):
+            return False
+        if _horizontal_corridor_illegal(ctx, y_feed, feed_lo, feed_hi, net):
+            return False
+        if abs(drop_x - edge_x) > WIRE_EPS:
+            if not _hub_feed_drop_rtl_ok(edge_x, drop_x, plan):
+                return False
+            stub_lo, stub_hi = min(edge_x, drop_x), max(edge_x, drop_x)
+            if not horizontal_segment_clear(
+                plan.y_row, stub_lo, stub_hi, obstacles, {p.node_id for p in plan.group}
+            ):
+                return False
+            if _foreign_horizontal_blocks_row(ctx, plan.y_row, stub_lo, stub_hi, net):
+                return False
+            if _horizontal_corridor_illegal(ctx, plan.y_row, stub_lo, stub_hi, net):
+                return False
         if abs(y_feed - plan.y_row) > WIRE_EPS:
             y_lo, y_hi = min(plan.y_row, y_feed), max(plan.y_row, y_feed)
-            if not trunk_vertical_clear(edge_x, y_lo, y_hi, obstacles, set()):
-                return None
-            if _foreign_vertical_blocks_column(ctx, edge_x, y_lo, y_hi, net):
-                return None
-            ctx.reserve_vertical(edge_x, y_lo, y_hi, net)
-            ctx.reserve_horizontal(y_feed, lo, hi, net)
+            if not trunk_vertical_clear(drop_x, y_lo, y_hi, obstacles, set()):
+                return False
+            if _foreign_vertical_blocks_column(ctx, drop_x, y_lo, y_hi, net):
+                return False
+        return True
+
+    def _emit_feed(y_feed: float, drop_x: float) -> str:
+        if abs(y_feed - plan.y_row) > WIRE_EPS:
+            y_lo, y_hi = min(plan.y_row, y_feed), max(plan.y_row, y_feed)
+            if abs(drop_x - edge_x) > WIRE_EPS:
+                ctx.reserve_horizontal(
+                    plan.y_row, min(edge_x, drop_x), max(edge_x, drop_x), net
+                )
+            ctx.reserve_vertical(drop_x, y_lo, y_hi, net)
+            ctx.reserve_horizontal(y_feed, min(drop_x, bus_x), max(drop_x, bus_x), net)
+            prefix = f"M {edge_x:.1f},{plan.y_row:.1f}"
+            if abs(drop_x - edge_x) > WIRE_EPS:
+                prefix = f"{prefix} H {drop_x:.1f}"
             return simplify_wire_path(
-                f"M {edge_x:.1f},{plan.y_row:.1f} V {y_feed:.1f} H {bus_x:.1f}",
+                f"{prefix} V {y_feed:.1f} H {bus_x:.1f}",
+            )
+        # Same-row feed: honor offset drop_x (GND pinch / blocked edge column).
+        if abs(drop_x - edge_x) > WIRE_EPS:
+            ctx.reserve_horizontal(
+                plan.y_row, min(edge_x, drop_x), max(edge_x, drop_x), net
+            )
+            ctx.reserve_horizontal(
+                plan.y_row, min(drop_x, bus_x), max(drop_x, bus_x), net
+            )
+            return simplify_wire_path(
+                f"M {edge_x:.1f},{plan.y_row:.1f} H {drop_x:.1f} H {bus_x:.1f}",
             )
         ctx.reserve_horizontal(
             y_feed,
@@ -224,42 +336,46 @@ def _connect_row_to_bus(
             f"M {edge_x:.1f},{plan.y_row:.1f} H {bus_x:.1f}",
         )
 
+    probe_lo = min(edge_x, bus_x)
+    probe_hi = max(edge_x, bus_x)
+    best: tuple[float, float, float] | None = None  # cost, y_feed, drop_x
     for y_feed in obstacle_detour_y_candidates(
         ctx,
         plan.y_row,
-        lo,
-        hi,
+        probe_lo,
+        probe_hi,
         obstacles,
         set(),
         net,
     ):
-        path_d = _feed_at(y_feed)
-        if path_d is not None:
-            trunk_y = plan.y_row if abs(y_feed - plan.y_row) <= WIRE_EPS else y_feed
-            return trunk_y, path_d
+        for drop_x in _hub_feed_drop_columns(edge_x, bus_x, plan):
+            if not _feed_ok(y_feed, drop_x):
+                continue
+            bends = 0 if abs(y_feed - plan.y_row) <= WIRE_EPS else 1
+            if abs(drop_x - edge_x) > WIRE_EPS:
+                bends += 1
+            cost = corridor_cost(
+                y_feed,
+                plan.y_row,
+                min(drop_x, bus_x),
+                max(drop_x, bus_x),
+                obstacles,
+                _clearance_skip(y_feed),
+                bends=bends,
+                ctx=ctx,
+                net=net,
+            )
+            if cost == math.inf:
+                continue
+            if best is None or cost < best[0] - WIRE_EPS:
+                best = (cost, y_feed, drop_x)
 
-    # Every clear candidate was blocked by foreign wiring. Leaving the row
-    # detached from the trunk is electrically wrong, so force a connection that
-    # still detours physical symbol bodies. It may cross a foreign wire (a
-    # validation warning), but connectivity must never be silently dropped.
-    y_forced = obstacle_detour_y(ctx, plan.y_row, lo, hi, obstacles, set(), net)
-    if abs(y_forced - plan.y_row) > WIRE_EPS:
-        y_lo, y_hi = min(plan.y_row, y_forced), max(plan.y_row, y_forced)
-        ctx.reserve_vertical(edge_x, y_lo, y_hi, net)
-        ctx.reserve_horizontal(y_forced, lo, hi, net)
-        return y_forced, simplify_wire_path(
-            f"M {edge_x:.1f},{plan.y_row:.1f} V {y_forced:.1f} H {bus_x:.1f}",
-        )
-    ctx.reserve_horizontal(
-        plan.y_row,
-        min(plan.span_lo, bus_x),
-        max(plan.span_hi, bus_x),
-        net,
-    )
-    return plan.y_row, simplify_wire_path(
-        f"M {edge_x:.1f},{plan.y_row:.1f} H {bus_x:.1f}",
-    )
-
+    if best is None:
+        # Fail-closed: no legal channel feed to the trunk (RULES.md).
+        return None, None
+    _cost, y_feed, drop_x = best
+    trunk_y = plan.y_row if abs(y_feed - plan.y_row) <= WIRE_EPS else y_feed
+    return trunk_y, _emit_feed(y_feed, drop_x)
 
 def _route_hub_tap(
     port: TopologyPort,
@@ -301,7 +417,7 @@ def _route_hub_tap(
                 if horizontal_segment_clear(
                     port.y, lo, hi, obstacles, skip
                 ) and not _foreign_horizontal_blocks_row(ctx, port.y, lo, hi, net):
-                    return hub_tap_vertical_to_row(
+                    via_bus = hub_tap_vertical_to_row(
                         port,
                         row_y,
                         bus_x=bus_x,
@@ -310,6 +426,8 @@ def _route_hub_tap(
                         ctx=ctx,
                         net=net,
                     )
+                    if via_bus[0]:
+                        return via_bus
             escaped = hub_row_tap_via_escape_column(
                 port,
                 row_y,
@@ -323,6 +441,9 @@ def _route_hub_tap(
             if escaped is not None:
                 return escaped
             continue
+    # Primary stub→bus route (also used when row joins failed). Full foreign
+    # clearance inside hub_tap_path* remains a follow-up; forced overlay feeds
+    # after blocked corridors were removed above.
     if stub > bus_x + WIRE_EPS:
         return hub_tap_path_from_bus(bus_x, port, obstacles, ctx, net)
     return hub_tap_path(port, bus_x, obstacles, ctx, net)
@@ -491,6 +612,67 @@ def _connect_row_plans(state: _HubRouteState, row_plans: list[_HubRowPlan]) -> N
             _emit_row_bus_feed(state, plan)
 
 
+def _hub_wires_connect_ports(
+    ports: list[TopologyPort],
+    wires: list[TopologyWire],
+) -> bool:
+    """True when every port lies in one connected component of the hub wires."""
+    if len(ports) <= 1:
+        return True
+
+    parent: dict[tuple[float, float], tuple[float, float]] = {}
+
+    def find(pt: tuple[float, float]) -> tuple[float, float]:
+        parent.setdefault(pt, pt)
+        if parent[pt] != pt:
+            parent[pt] = find(parent[pt])
+        return parent[pt]
+
+    def union(a: tuple[float, float], b: tuple[float, float]) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    def on_seg(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> bool:
+        if abs(y1 - y2) <= WIRE_EPS and abs(py - y1) <= WIRE_EPS:
+            return min(x1, x2) - WIRE_EPS <= px <= max(x1, x2) + WIRE_EPS
+        if abs(x1 - x2) <= WIRE_EPS and abs(px - x1) <= WIRE_EPS:
+            return min(y1, y2) - WIRE_EPS <= py <= max(y1, y2) + WIRE_EPS
+        return False
+
+    anchors: list[tuple[float, float]] = []
+    for port in ports:
+        body = (round(port.x, 1), round(port.y, 1))
+        stub = (round(port_stub_x(port), 1), round(port.y, 1))
+        anchors.append(body)
+        union(body, stub)
+
+    segs: list[tuple[float, float, float, float]] = []
+    for wire in wires:
+        pts = parse_wire_path(wire.path_d)
+        for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+            a = (round(x1, 1), round(y1, 1))
+            b = (round(x2, 1), round(y2, 1))
+            union(a, b)
+            segs.append((a[0], a[1], b[0], b[1]))
+
+    endpoints = {(s[0], s[1]) for s in segs} | {(s[2], s[3]) for s in segs}
+    for ex, ey in endpoints:
+        for x1, y1, x2, y2 in segs:
+            if on_seg(ex, ey, x1, y1, x2, y2):
+                union((ex, ey), (x1, y1))
+
+    for port in ports:
+        body = (round(port.x, 1), round(port.y, 1))
+        stub = (round(port_stub_x(port), 1), round(port.y, 1))
+        for x1, y1, x2, y2 in segs:
+            for px, py in (body, stub):
+                if on_seg(px, py, x1, y1, x2, y2):
+                    union((px, py), (x1, y1))
+
+    return len({find(a) for a in anchors}) == 1
+
+
 def _assemble_hub_wires(
     label: str,
     net: str,
@@ -499,6 +681,7 @@ def _assemble_hub_wires(
     row_wires: list[TopologyWire],
     tap_wires: list[TopologyWire],
     tap_ys: list[float],
+    ports: list[TopologyPort],
 ) -> list[TopologyWire]:
     wires: list[TopologyWire] = []
     if tap_ys and (y_hi := max(tap_ys)) - (y_lo := min(tap_ys)) > WIRE_EPS:
@@ -518,6 +701,9 @@ def _assemble_hub_wires(
         tap_wires[0].label = label
     wires.extend(row_wires)
     wires.extend(tap_wires)
+    # Fail-closed: never emit a disconnected hub drawing (RULES.md §18).
+    if ports and wires and not _hub_wires_connect_ports(ports, wires):
+        return []
     return wires
 
 
@@ -531,6 +717,7 @@ def route_hub(
     """Hub as a tree: collinear row buses, one vertical trunk, and row taps."""
     ordered = sorted(ports, key=lambda p: (p.y, p.x))
     label = wire_display_label(ordered, net)
+    mark = ctx.checkpoint()
 
     row_plans, singletons = _plan_hub_rows(ordered, obstacles, ctx, net)
     state = _HubRouteState(
@@ -556,7 +743,7 @@ def route_hub(
     for _group, port in downstream_singletons:
         state.append_singleton_tap(port)
 
-    return _assemble_hub_wires(
+    wires = _assemble_hub_wires(
         label,
         net,
         bus_x,
@@ -564,4 +751,11 @@ def route_hub(
         state.row_wires,
         state.tap_wires,
         state.tap_ys,
+        ordered,
     )
+    if not wires:
+        # Fail-closed drop (or nothing routed): drop phantom bands and the
+        # planned bus column so later nets can reuse the corridor.
+        ctx.rollback(mark)
+        ctx.release_vertical_at(bus_x, net)
+    return wires

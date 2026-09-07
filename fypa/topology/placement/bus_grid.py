@@ -151,6 +151,18 @@ def _separate_from_assigned(
     return x
 
 
+class BusCorridorFull(Exception):
+    """No free vertical bus slot in ``[bus_lo, bus_hi]`` (fail-closed)."""
+
+    def __init__(self, net: str, bus_lo: float, bus_hi: float) -> None:
+        self.net = net
+        self.bus_lo = bus_lo
+        self.bus_hi = bus_hi
+        super().__init__(
+            f"No free bus corridor for {net!r} in [{bus_lo:.1f}, {bus_hi:.1f}]"
+        )
+
+
 def allocate_bus_x(
     nominal: float,
     y_lo: float,
@@ -162,8 +174,14 @@ def allocate_bus_x(
     *,
     outward: float,
     assigned_in_group: list[float] | None = None,
+    attach_xs: list[float] | None = None,
 ) -> float:
-    """Pick the first valid bus x on the MIN_PARALLEL_GAP grid inside [bus_lo, bus_hi]."""
+    """Pick the lowest-attachment-cost valid bus x inside [bus_lo, bus_hi].
+
+    Candidates are ordered by sum of distances to ``attach_xs`` (port stubs),
+    falling back to ``abs(c - nominal)``. Raises :class:`BusCorridorFull` when
+    every candidate collides (no silent clamp).
+    """
     assigned = assigned_in_group or []
     n_slots = max(
         int((bus_hi - bus_lo) / MIN_PARALLEL_GAP) + 1,
@@ -181,7 +199,13 @@ def allocate_bus_x(
         if r not in seen:
             seen.add(r)
             ordered.append(c)
-    ordered.sort(key=lambda c: abs(c - nominal))
+
+    def _attach_cost(c: float) -> float:
+        if attach_xs:
+            return sum(abs(c - ax) for ax in attach_xs)
+        return abs(c - nominal)
+
+    ordered.sort(key=lambda c: (_attach_cost(c), abs(c - nominal)))
 
     for candidate in ordered:
         x = max(bus_lo, min(bus_hi, candidate))
@@ -201,4 +225,4 @@ def allocate_bus_x(
             x = max(bus_lo, min(bus_hi, x))
         if not _vertical_blocks_x(x, y_lo, y_hi, reserved_verticals, net):
             return x
-    return max(bus_lo, min(bus_hi, nominal))
+    raise BusCorridorFull(net, bus_lo, bus_hi)

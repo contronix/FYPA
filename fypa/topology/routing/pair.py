@@ -14,7 +14,7 @@ from fypa.topology.placement import (
     port_stub_x,
     stacked_routing_order,
 )
-from fypa.topology.placement.bus_grid import allocate_bus_x
+from fypa.topology.placement.bus_grid import BusCorridorFull, allocate_bus_x
 from fypa.topology.placement.gutter_corridors import (
     ColumnGap,
     adjust_bus_x_for_column_gaps,
@@ -81,17 +81,20 @@ def _separate_from_assigned_buses(
         elif _in_range(inward_cand):
             bus_x = inward_cand
         else:
-            return allocate_bus_x(
-                bus_x,
-                y_lo,
-                y_hi,
-                lo,
-                hi,
-                reserved,
-                net,
-                outward=outward,
-                assigned_in_group=assigned_bus,
-            )
+            try:
+                return allocate_bus_x(
+                    bus_x,
+                    y_lo,
+                    y_hi,
+                    lo,
+                    hi,
+                    reserved,
+                    net,
+                    outward=outward,
+                    assigned_in_group=assigned_bus,
+                )
+            except BusCorridorFull:
+                raise
     return min(hi, max(lo, bus_x))
 
 
@@ -189,10 +192,15 @@ def signal_wires_from_pairs(
                 bus_x = bus_plan.pair_buses[net]
             elif bus_plan and (col, side, net) in bus_plan.stack_buses:
                 bus_x = bus_plan.stack_buses[(col, side, net)]
+            elif bus_plan is not None:
+                continue
             else:
                 bus_x = column_bus_x(col, side, lane=bus_lane, n_lanes=n_lanes)
             start, end = stacked_routing_order(a, b)
             path_d = stacked_wire_path(a, b, bus_x=bus_x, obstacles=obstacles, ctx=ctx)
+            if not path_d:
+                ctx.release_vertical_at(bus_x, net)
+                continue
             wires.append(
                 TopologyWire(
                     net=net,
@@ -218,25 +226,33 @@ def signal_wires_from_pairs(
         assigned_bus: list[float] = []
         for _y_slot, bus_slot, a, b in slot_items:
             net = a.net
+            if bus_plan is not None and net not in bus_plan.pair_buses:
+                continue
             start, end = stacked_routing_order(a, b)
-            bus_x = _bus_x_for_pair(
-                a,
-                b,
-                bus_plan=bus_plan,
-                ctx=ctx,
-                col=0,
-                side="",
-                lane=0,
-                n_lanes=0,
-                slot=bus_slot,
-                n_slots=n_slots,
-                channel_lo=channel_lo,
-                channel_hi=channel_hi,
-                assigned_bus=assigned_bus,
-                obstacles=obstacles,
-            )
-            assigned_bus.append(bus_x)
+            try:
+                bus_x = _bus_x_for_pair(
+                    a,
+                    b,
+                    bus_plan=bus_plan,
+                    ctx=ctx,
+                    col=0,
+                    side="",
+                    lane=0,
+                    n_lanes=0,
+                    slot=bus_slot,
+                    n_slots=n_slots,
+                    channel_lo=channel_lo,
+                    channel_hi=channel_hi,
+                    assigned_bus=assigned_bus,
+                    obstacles=obstacles,
+                )
+            except BusCorridorFull:
+                continue
             path_d = two_port_wire_path(start, end, bus_x=bus_x, obstacles=obstacles, ctx=ctx)
+            if not path_d:
+                ctx.release_vertical_at(bus_x, net)
+                continue
+            assigned_bus.append(bus_x)
             wires.append(
                 TopologyWire(
                     net=net,

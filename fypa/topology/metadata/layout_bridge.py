@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from fypa.topology.constants import GND_NET, RETURN_PORT_SORT_BASE
 from fypa.topology.metadata.nets import (
@@ -44,6 +44,8 @@ class ParsedLayoutInput:
     driven_nets: set[str]
     needs_gnd: bool
     columns: dict[str, int]
+    loop_return_nets: frozenset[str] = frozenset()
+    loop_parent: dict[str, str] = field(default_factory=dict)
 
 
 def _column_flow_net(term: TerminalDict | None) -> str | None:
@@ -303,116 +305,230 @@ def _assign_face_port_rows(
     return out
 
 
+def _normalize_series_port_faces(node_specs: list[NodeSpec]) -> None:
+    """SERIES/RESISTOR power ports: P* left (in), N* right (out). See RULES.md.
+
+    Multi-role composites only rewrite terminals whose port role is SERIES /
+    RESISTOR — a stacked SINK return ``N`` must stay on the left face.
+    """
+    for s in node_specs:
+        if not spec_has_series_role(s):
+            continue
+
+        def _face(pname: str, side: str) -> str:
+            role = spec_port_role(s, pname)
+            if role not in ("SERIES", "RESISTOR"):
+                return side
+            if pname.startswith("P"):
+                return "left"
+            if pname.startswith("N"):
+                return "right"
+            return side
+
+        s["port_defs"] = [
+            (pname, _face(pname, side), sort_key)
+            for pname, side, sort_key in s["port_defs"]
+        ]
+        for sec in s.get("sections") or []:
+            if sec.get("role") not in ("SERIES", "RESISTOR"):
+                continue
+            sec["port_defs"] = [
+                (
+                    pname,
+                    "left"
+                    if pname.startswith("P")
+                    else "right"
+                    if pname.startswith("N")
+                    else side,
+                    sort_key,
+                )
+                for pname, side, sort_key in sec.get("port_defs") or []
+            ]
+
+
+def _loop_return_nets(
+    loop_parent: dict[str, str],
+    outputs_by_net: dict[str, list[str]],
+    inputs_by_net: dict[str, list[str]],
+) -> set[str]:
+    """Nets where a loop child drives its parent (return path of the pair)."""
+    returns: set[str] = set()
+    for child, parent in loop_parent.items():
+        for net, drivers in outputs_by_net.items():
+            if child not in drivers:
+                continue
+            if parent in inputs_by_net.get(net, []):
+                returns.add(net)
+    return returns
+
+
+def _rewrite_port_faces(
+    port_defs: list[tuple[str, str, int]],
+    flip_to_left: set[str],
+    flip_to_right: set[str],
+) -> list[tuple[str, str, int]]:
+    out: list[tuple[str, str, int]] = []
+    for pname, side, sk in port_defs:
+        if pname in flip_to_left:
+            out.append((pname, "left", sk))
+        elif pname in flip_to_right:
+            out.append((pname, "right", sk))
+        else:
+            out.append((pname, side, sk))
+    return out
+
+
 def _orient_loop_series_ports(
     node_specs: list[NodeSpec],
     col: dict[str, int],
     loop_parent: dict[str, str],
     outputs_by_net: dict[str, list[str]],
     inputs_by_net: dict[str, list[str]],
-) -> None:
-    """Loop child: all channel ports on the parent-facing side (one row each).
+) -> set[str]:
+    """Fixed In=L / Out=R, then loop-return faces toward the peer (RULES.md §19).
 
-    Loop parent: N/P ports on nets shared with the child face the child column.
+    Only nets where the child drives the parent are rewritten: child ``N*`` →
+    left, parent ``P*`` → right. Forward nets keep the default faces so all
+    pair nets share the gutter between the two columns.
     """
+    del col
+    _normalize_series_port_faces(node_specs)
+    return_nets = _loop_return_nets(loop_parent, outputs_by_net, inputs_by_net)
+    if not return_nets or not loop_parent:
+        return return_nets
+
     spec_by_id = {s["node_id"]: s for s in node_specs}
-    loop_children: dict[str, list[str]] = defaultdict(list)
     for child_id, parent_id in loop_parent.items():
-        loop_children[parent_id].append(child_id)
-
-    for s in node_specs:
-        # Multi-role composites lay out their rows from the per-section
-        # port_defs, so rewriting the composite-level sides/sort keys here
-        # would have no visual effect and would corrupt the section-offset
-        # sort-key scheme. The single-role reorder below doesn't apply.
-        if not spec_has_series_role(s) or s.get("sections"):
+        child = spec_by_id.get(child_id)
+        parent = spec_by_id.get(parent_id)
+        if child is None or parent is None:
             continue
-        nid = s["node_id"]
-        if nid not in loop_parent:
+        child_flip: set[str] = set()
+        parent_flip: set[str] = set()
+        for pname, term in spec_series_terms(child):
+            net = _column_flow_net(term)
+            if net in return_nets and pname.startswith("N"):
+                child_flip.add(pname)
+        for pname, term in spec_series_terms(parent):
+            net = _column_flow_net(term)
+            if net in return_nets and pname.startswith("P"):
+                parent_flip.add(pname)
+        if not child_flip and not parent_flip:
             continue
-        parent_col = col.get(loop_parent[nid], 0)
-        child_col = col.get(nid, 0)
-        if parent_col < child_col:
-            face = "left"
-        elif parent_col > child_col:
-            face = "right"
-        else:
-            face = "left"
-        channel_ports = [
-            (pname, side, sort_key)
-            for pname, side, sort_key in s["port_defs"]
-            if pname.startswith(("P", "N"))
-        ]
-        other_ports = [
-            (pname, side, sort_key)
-            for pname, side, sort_key in s["port_defs"]
-            if not pname.startswith(("P", "N"))
-        ]
-        channel_ports.sort(key=lambda t: (t[2], t[0]))
-        s["port_defs"] = [
-            (pname, face, row_i) for row_i, (pname, _side, _sk) in enumerate(channel_ports)
-        ] + other_ports
-
-    for s in node_specs:
-        if not spec_has_series_role(s) or s.get("sections"):
-            continue
-        nid = s["node_id"]
-        children = loop_children.get(nid)
-        if not children:
-            continue
-        child_set = set(children)
-        parent_col = col.get(nid, 0)
-        child_col = min(col.get(c, parent_col) for c in children)
-        if child_col > parent_col:
-            face_child = "right"
-        elif child_col < parent_col:
-            face_child = "left"
-        else:
-            continue
-        terms = s.get("terms") or {}
-        flip_p: set[str] = set()
-        flip_n: set[str] = set()
-        for pname, term in terms.items():
-            if not term or is_ideal_return(term):
-                continue
-            flow_net = _column_flow_net(term)
-            if not flow_net:
-                continue
-            if pname.startswith("N"):
-                if any(c in inputs_by_net.get(flow_net, []) for c in child_set):
-                    flip_n.add(pname)
-            elif pname.startswith("P"):
-                if any(c in outputs_by_net.get(flow_net, []) for c in child_set):
-                    flip_p.add(pname)
-        if not flip_p and not flip_n:
-            continue
-        flipped = [
-            (
-                pname,
-                face_child if pname in flip_p or pname in flip_n else side,
-                sort_key,
+        child["port_defs"] = _rewrite_port_faces(child["port_defs"], child_flip, set())
+        parent["port_defs"] = _rewrite_port_faces(parent["port_defs"], set(), parent_flip)
+        # Multi-role composites place from section port_defs — keep them in sync.
+        for sec in child.get("sections") or []:
+            sec["port_defs"] = _rewrite_port_faces(
+                list(sec.get("port_defs") or []), child_flip, set()
             )
-            for pname, side, sort_key in s["port_defs"]
-        ]
-        child_net_rows: dict[str, int] = {}
-        for child_id in children:
-            child_spec = spec_by_id[child_id]
-            child_col = col.get(child_id, parent_col)
-            if child_col > parent_col:
-                child_face = "left"
-            elif child_col < parent_col:
-                child_face = "right"
-            else:
-                continue
-            child_net_rows.update(_child_facing_net_rows(child_spec, child_face))
-        if child_net_rows:
-            s["port_defs"] = _assign_face_port_rows(
-                flipped,
-                terms,
-                face_child,
-                child_net_rows,
+        for sec in parent.get("sections") or []:
+            sec["port_defs"] = _rewrite_port_faces(
+                list(sec.get("port_defs") or []), set(), parent_flip
             )
-        else:
-            s["port_defs"] = _dedupe_port_rows_on_same_side(flipped)
+        # Align shared-gutter faces so forward/return channels share row order.
+        child_hints = _child_facing_net_rows(child, "left")
+        parent["port_defs"] = _assign_face_port_rows(
+            parent["port_defs"],
+            parent.get("terms") or {},
+            "right",
+            child_hints,
+        )
+        parent_hints = _child_facing_net_rows(parent, "right")
+        child["port_defs"] = _assign_face_port_rows(
+            child["port_defs"],
+            child.get("terms") or {},
+            "left",
+            parent_hints,
+        )
+        child["port_defs"] = _dedupe_port_rows_on_same_side(child["port_defs"])
+        parent["port_defs"] = _dedupe_port_rows_on_same_side(parent["port_defs"])
+        # Mirror top-level row/side onto sections for the rewritten terminals.
+        side_by_name = {pname: side for pname, side, _ in child["port_defs"]}
+        row_by_name = {pname: sk for pname, _, sk in child["port_defs"]}
+        for sec in child.get("sections") or []:
+            sec["port_defs"] = [
+                (pname, side_by_name.get(pname, side), row_by_name.get(pname, sk))
+                for pname, side, sk in sec.get("port_defs") or []
+            ]
+        side_by_name = {pname: side for pname, side, _ in parent["port_defs"]}
+        row_by_name = {pname: sk for pname, _, sk in parent["port_defs"]}
+        for sec in parent.get("sections") or []:
+            sec["port_defs"] = [
+                (pname, side_by_name.get(pname, side), row_by_name.get(pname, sk))
+                for pname, side, sk in sec.get("port_defs") or []
+            ]
+    return return_nets
+
+
+def _connector_family_base(designator: str) -> str | None:
+    """``J14.2`` → ``J14``; plain designators → ``None``."""
+    if "." not in designator:
+        return None
+    return designator.rsplit(".", 1)[0]
+
+
+def _connector_family_groups(
+    node_specs: list[NodeSpec],
+) -> dict[str, frozenset[str]]:
+    """Map each connector channel node to its full ``J*.*`` family."""
+    by_family: dict[str, list[str]] = defaultdict(list)
+    role_by_id = {s["node_id"]: s["role"] for s in node_specs}
+    for spec in node_specs:
+        nid = spec["node_id"]
+        base = _connector_family_base(spec.get("designator") or nid)
+        if not base or role_by_id.get(nid) != "RESISTOR" or not base.startswith("J"):
+            continue
+        by_family[base].append(nid)
+    groups: dict[str, frozenset[str]] = {}
+    for members in by_family.values():
+        if len(members) < 2:
+            continue
+        fam = frozenset(members)
+        for nid in members:
+            groups[nid] = fam
+    return groups
+
+
+def _coalesce_connector_family_columns(
+    node_specs: list[NodeSpec],
+    col: dict[str, int],
+    loop_parent: dict[str, str] | None = None,
+) -> None:
+    """Stack connector channels (``J14.1`` / ``J14.2`` / …) in one column.
+
+    Multi-channel connector resistors are not a left→right power chain; they
+    share one symbol column like merged ``J14`` sections in the spec builder.
+    Use the family's rightmost required column so a later load bump does not
+    split siblings apart again.
+    """
+    by_family: dict[str, list[str]] = defaultdict(list)
+    role_by_id = {s["node_id"]: s["role"] for s in node_specs}
+    for spec in node_specs:
+        nid = spec["node_id"]
+        base = _connector_family_base(spec.get("designator") or nid)
+        if not base:
+            continue
+        if role_by_id.get(nid) != "RESISTOR":
+            continue
+        if not base.startswith("J"):
+            continue
+        by_family[base].append(nid)
+
+    loop_parent = loop_parent or {}
+
+    for _base, members in by_family.items():
+        if len(members) < 2:
+            continue
+        member_set = set(members)
+        if any(
+            loop_parent.get(child) in member_set and loop_parent.get(child) != child
+            for child in members
+        ):
+            continue
+        anchor = max(col.get(nid, 0) for nid in members)
+        for nid in members:
+            col[nid] = anchor
 
 
 def _column_net(
@@ -421,6 +537,7 @@ def _column_net(
     net_to_rail: dict[str, str],
     *,
     terminal: str = "",
+    side: str = "",
 ) -> str | None:
     """Net key for the column-placement graph.
 
@@ -438,6 +555,17 @@ def _column_net(
         return _column_flow_net(term)
     if is_power_input_port(role, terminal):
         return _column_flow_net(term)
+    if side and is_output_port(role, terminal, side):
+        phys = _column_flow_net(term)
+        canon = canonical_net(terminal_net(term), net_to_rail)
+        if phys and canon and phys != canon:
+            if term.get("resolved_via_local"):
+                return phys
+            req = (term.get("requested_net") or "").strip()
+            if req and phys != req:
+                req_canon = canonical_net(req, net_to_rail)
+                if req_canon and req_canon == canon:
+                    return phys
     return canonical_net(terminal_net(term), net_to_rail)
 
 
@@ -500,7 +628,7 @@ def _propagation_edges(
             term = (s["terms"] or {}).get(pname)
             if is_ideal_return(term):
                 continue
-            flow_net = _column_net(port_role, term, net_to_rail, terminal=pname)
+            flow_net = _column_net(port_role, term, net_to_rail, terminal=pname, side=side)
             if not flow_net or flow_net == GND_NET:
                 continue
             for other in inputs_by_net.get(flow_net, []):
@@ -570,11 +698,238 @@ def _mixed_role_node_ids(node_specs: list[NodeSpec]) -> set[str]:
     return {nid for nid, rs in roles_by_id.items() if len(rs) > 1}
 
 
+def _ensure_loads_right_of_net_drivers(
+    col: dict[str, int],
+    outputs_by_net: dict[str, list[str]],
+    inputs_by_net: dict[str, list[str]],
+    back_edges: set[tuple[str, str]],
+    loop_parent: dict[str, str],
+    connector_families: dict[str, frozenset[str]] | None = None,
+) -> None:
+    """Bump every net load strictly right of every driver of that net."""
+    connector_families = connector_families or {}
+    changed = True
+    guard = 0
+    n = max(len(col), 1)
+    while changed and guard < n + 5:
+        guard += 1
+        changed = False
+        for net, drivers in outputs_by_net.items():
+            loads = inputs_by_net.get(net) or []
+            if not drivers or not loads:
+                continue
+            driver_set = set(drivers)
+            max_d = max(col.get(d, 0) for d in drivers)
+            for load in loads:
+                if load in driver_set:
+                    continue
+                if any((d, load) in back_edges for d in drivers):
+                    continue
+                if loop_parent.get(load) in driver_set:
+                    continue
+                # Return nets: child drives parent; do not push the loop parent
+                # right of its child (loop_parent fixups own that pair spacing).
+                if any(loop_parent.get(d) == load for d in drivers):
+                    continue
+                if col.get(load, 0) <= max_d:
+                    target = max_d + 1
+                    family = connector_families.get(load)
+                    if family:
+                        for nid in family:
+                            if col.get(nid, 0) < target:
+                                col[nid] = target
+                                changed = True
+                    else:
+                        col[load] = target
+                        changed = True
+
+
+def _direct_load_ids(
+    nid: str,
+    outputs_by_net: dict[str, list[str]],
+    inputs_by_net: dict[str, list[str]],
+    back_edges: set[tuple[str, str]],
+    loop_parent: dict[str, str],
+) -> list[str]:
+    """Nodes that take an input from ``nid``'s output nets (forward edges only)."""
+    loads: list[str] = []
+    seen: set[str] = set()
+    for net, drivers in outputs_by_net.items():
+        if nid not in drivers:
+            continue
+        for load in inputs_by_net.get(net) or []:
+            if load == nid or load in seen:
+                continue
+            if (nid, load) in back_edges:
+                continue
+            if loop_parent.get(nid) == load:
+                continue
+            seen.add(load)
+            loads.append(load)
+    return loads
+
+
+def _direct_driver_ids(
+    nid: str,
+    outputs_by_net: dict[str, list[str]],
+    inputs_by_net: dict[str, list[str]],
+    back_edges: set[tuple[str, str]],
+    loop_parent: dict[str, str],
+) -> list[str]:
+    """Nodes that drive an input net of ``nid`` (forward edges only)."""
+    drivers: list[str] = []
+    seen: set[str] = set()
+    for net, loads in inputs_by_net.items():
+        if nid not in loads:
+            continue
+        for d in outputs_by_net.get(net) or []:
+            if d == nid or d in seen:
+                continue
+            if (d, nid) in back_edges:
+                continue
+            if loop_parent.get(d) == nid:
+                continue
+            seen.add(d)
+            drivers.append(d)
+    return drivers
+
+
+def _right_pack_columns(
+    col: dict[str, int],
+    node_specs: list[NodeSpec],
+    outputs_by_net: dict[str, list[str]],
+    inputs_by_net: dict[str, list[str]],
+    back_edges: set[tuple[str, str]],
+    loop_parent: dict[str, str],
+    mixed_role_ids: set[str],
+    connector_families: dict[str, frozenset[str]],
+) -> None:
+    """Densify via adjacent singleton merge after compacting empty indices.
+
+    Far ALAP jumps inflate gutters and can fail-close pair nets. Only merge a
+    non-SOURCE singleton into the immediate right or left neighbour when L→R
+    still holds. Connector-family members are not right-merged as singletons;
+    a SERIES singleton may join a connector column on the right.
+    """
+    role_by_id = {s["node_id"]: s["role"] for s in node_specs}
+    pure_sinks = {
+        s["node_id"]
+        for s in node_specs
+        if s["role"] == "SINK" and s["node_id"] not in mixed_role_ids
+    }
+    family_ids: set[str] = set()
+    for members in connector_families.values():
+        family_ids |= set(members)
+    if not col:
+        return
+
+    def _can_place(nid: str, dest: int, by_col: dict[int, list[str]]) -> bool:
+        if dest not in by_col:
+            return False
+        if all(n in pure_sinks for n in by_col[dest]):
+            return False
+        loads = _direct_load_ids(
+            nid, outputs_by_net, inputs_by_net, back_edges, loop_parent
+        )
+        drivers = _direct_driver_ids(
+            nid, outputs_by_net, inputs_by_net, back_edges, loop_parent
+        )
+        if loads and min(col[L] for L in loads) <= dest:
+            return False
+        if drivers and max(col[d] for d in drivers) >= dest:
+            return False
+        if any(L in by_col[dest] for L in loads):
+            return False
+        if any(d in by_col[dest] for d in drivers):
+            return False
+        return True
+
+    def _refresh() -> dict[int, list[str]]:
+        compacted = _compact_columns(col)
+        col.clear()
+        col.update(compacted)
+        by: dict[int, list[str]] = defaultdict(list)
+        for nid, c in col.items():
+            by[c].append(nid)
+        return by
+
+    # --- Singleton right-merge ---
+    guard = 0
+    while guard < len(col) + 5:
+        guard += 1
+        by_col = _refresh()
+        moved = False
+        for c in sorted(by_col.keys()):
+            members = [n for n in by_col[c] if n not in pure_sinks]
+            if len(members) != 1:
+                continue
+            nid = members[0]
+            if role_by_id.get(nid) == "SOURCE" or nid in family_ids:
+                continue
+            dest = c + 1
+            if not _can_place(nid, dest, by_col):
+                continue
+            col[nid] = dest
+            moved = True
+            break
+        if not moved:
+            break
+
+    # --- Singleton left-absorb ---
+    guard = 0
+    while guard < len(col) + 5:
+        guard += 1
+        by_col = _refresh()
+        moved = False
+        for c in sorted(by_col.keys(), reverse=True):
+            members = [n for n in by_col[c] if n not in pure_sinks]
+            if len(members) != 1:
+                continue
+            nid = members[0]
+            if role_by_id.get(nid) == "SOURCE":
+                continue
+            dest = c - 1
+            if dest < 0:
+                continue
+            if any(n in family_ids for n in by_col.get(dest, [])) and nid not in family_ids:
+                continue
+            if not _can_place(nid, dest, by_col):
+                continue
+            col[nid] = dest
+            moved = True
+            break
+        if not moved:
+            break
+
+    _refresh()
+
+    for child_id, parent_id in loop_parent.items():
+        col[child_id] = max(col.get(child_id, 0), col.get(parent_id, 0) + 1)
+
+    _ensure_loads_right_of_net_drivers(
+        col,
+        outputs_by_net,
+        inputs_by_net,
+        back_edges,
+        loop_parent,
+        None,
+    )
+    if pure_sinks:
+        other = [c for nid, c in col.items() if nid not in pure_sinks]
+        need = (max(other) if other else 0) + 1
+        for nid in pure_sinks:
+            col[nid] = need
+    _refresh()
+
+
 def assign_columns(
     node_specs: list[NodeSpec],
     net_to_rail: dict[str, str],
-) -> dict[str, int]:
-    """Place nodes in columns by propagating from SOURCE outputs along nets."""
+) -> tuple[dict[str, int], frozenset[str], dict[str, str]]:
+    """Place nodes in columns by propagating from SOURCE outputs along nets.
+
+    Returns ``(columns, loop_return_nets, loop_parent)``.
+    """
     col: dict[str, int] = {}
     role_by_id = {s["node_id"]: s["role"] for s in node_specs}
     mixed_role_ids = _mixed_role_node_ids(node_specs)
@@ -599,7 +954,7 @@ def assign_columns(
             if is_ideal_return(term):
                 continue
             port_role = spec_port_role(s, pname)
-            flow_net = _column_net(port_role, term, net_to_rail, terminal=pname)
+            flow_net = _column_net(port_role, term, net_to_rail, terminal=pname, side=side)
             if not flow_net or flow_net == GND_NET:
                 continue
             if is_output_port(port_role, pname, side):
@@ -612,6 +967,7 @@ def assign_columns(
                     inputs_by_canonical[cn].append(nid)
 
     loop_parent = _detect_loop_series_parents(node_specs, outputs_by_net, inputs_by_net)
+    connector_families = _connector_family_groups(node_specs)
     back_edges = _detect_propagation_back_edges(
         _propagation_edges(node_specs, outputs_by_net, inputs_by_net, net_to_rail, loop_parent),
         [s["node_id"] for s in sources] + [s["node_id"] for s in node_specs],
@@ -632,7 +988,7 @@ def assign_columns(
                 term = (s["terms"] or {}).get(pname)
                 if is_ideal_return(term):
                     continue
-                flow_net = _column_net(port_role, term, net_to_rail, terminal=pname)
+                flow_net = _column_net(port_role, term, net_to_rail, terminal=pname, side=side)
                 if not flow_net or flow_net == GND_NET:
                     continue
                 for other in inputs_by_net.get(flow_net, []):
@@ -727,7 +1083,7 @@ def assign_columns(
                 term = (s["terms"] or {}).get(pname)
                 if is_ideal_return(term):
                     continue
-                flow_net = _column_net(port_role, term, net_to_rail, terminal=pname)
+                flow_net = _column_net(port_role, term, net_to_rail, terminal=pname, side=side)
                 if not flow_net or flow_net == GND_NET:
                     continue
                 for other in inputs_by_net.get(flow_net, []):
@@ -764,58 +1120,83 @@ def assign_columns(
         node_specs, col, inputs_by_net, loop_parent, role_by_id, outputs_by_net
     )
 
+    _coalesce_connector_family_columns(node_specs, col, loop_parent)
+
+    _ensure_loads_right_of_net_drivers(
+        col,
+        outputs_by_net,
+        inputs_by_net,
+        back_edges,
+        loop_parent,
+        connector_families,
+    )
+
+    _coalesce_connector_family_columns(node_specs, col, loop_parent)
+
+    for child_id, parent_id in loop_parent.items():
+        target = max(col.get(child_id, 0), col.get(parent_id, 0) + 1)
+        col[child_id] = target
+        family = connector_families.get(child_id)
+        if family:
+            for nid in family:
+                if nid == parent_id:
+                    continue
+                col[nid] = max(col.get(nid, 0), target)
+
+    _coalesce_connector_family_columns(node_specs, col, loop_parent)
+
+    # Pure SINKs occupy a dedicated rightmost column *after* loop children and
+    # other non-sinks are placed, so the last column holds only SINK (or
+    # multi-role nodes that include SINK — those keep their propagated column).
     if col:
-        sink_col = max(col.values())
+        other_cols = [
+            col[s["node_id"]]
+            for s in node_specs
+            if not (s["role"] == "SINK" and s["node_id"] not in mixed_role_ids)
+        ]
+        sink_col = (max(other_cols) if other_cols else 0) + 1
         for s in node_specs:
             if s["role"] == "SINK" and s["node_id"] not in mixed_role_ids:
                 col[s["node_id"]] = sink_col
 
-    # Orient each SERIES/RESISTOR so the terminal carrying the downstream loads
-    # faces right. Peers are keyed by *resolved physical net* (not the canonical
-    # rail — 0-Ω bridges merge a resistor's two nets onto one rail, which would
-    # make both terminals look identical). Flip P→right / N→left only when P has
-    # downstream nodes and NO upstream driver (a mid-rail tap keeps its driver on
-    # the P side, so the default P-left is correct and must stay).
-    wnet_cols: dict[str, list[tuple[str, int]]] = defaultdict(list)
-    for s in node_specs:
-        for rp in (s.get("resolved_ports") or {}).values():
-            if rp.wnet and rp.wnet != GND_NET:
-                wnet_cols[rp.wnet].append((s["node_id"], col.get(s["node_id"], 0)))
+    # Densify indices so adjacent singleton merges see real neighbours.
+    compacted = _compact_columns(col)
+    col.clear()
+    col.update(compacted)
 
-    _orient_loop_series_ports(node_specs, col, loop_parent, outputs_by_net, inputs_by_net)
+    _right_pack_columns(
+        col,
+        node_specs,
+        outputs_by_net,
+        inputs_by_net,
+        back_edges,
+        loop_parent,
+        mixed_role_ids,
+        connector_families,
+    )
+    _coalesce_connector_family_columns(node_specs, col, loop_parent)
 
-    for s in node_specs:
-        if not spec_has_series_role(s):
-            continue
-        nid = s["node_id"]
-        if nid in loop_parent:
-            continue
-        rcol = col.get(nid, 0)
-        rports = s.get("resolved_ports") or {}
-
-        def _cols(prefix):
-            return [
-                c
-                for pname, rp in rports.items()
-                if pname.startswith(prefix)
-                for oid, c in wnet_cols.get(rp.wnet, [])
-                if oid != nid
+    # Pure SINKs may need a fresh rightmost index after right-pack merges.
+    if col:
+        pure_sinks = [
+            s
+            for s in node_specs
+            if s["role"] == "SINK" and s["node_id"] not in mixed_role_ids
+        ]
+        if pure_sinks:
+            other_cols = [
+                col[s["node_id"]]
+                for s in node_specs
+                if not (s["role"] == "SINK" and s["node_id"] not in mixed_role_ids)
             ]
+            sink_col = (max(other_cols) if other_cols else 0) + 1
+            for s in pure_sinks:
+                col[s["node_id"]] = sink_col
 
-        p_cols, n_cols = _cols("P"), _cols("N")
-        p_up, p_down = any(c < rcol for c in p_cols), any(c > rcol for c in p_cols)
-        n_down = any(c > rcol for c in n_cols)
-        if p_down and not p_up and not n_down:
-            s["port_defs"] = [
-                (
-                    pname,
-                    "right" if pname.startswith("P") else "left" if pname.startswith("N") else side,
-                    sort_key,
-                )
-                for pname, side, sort_key in s["port_defs"]
-            ]
-
-    return _compact_columns(col)
+    loop_return_nets = _orient_loop_series_ports(
+        node_specs, col, loop_parent, outputs_by_net, inputs_by_net
+    )
+    return _compact_columns(col), frozenset(loop_return_nets), dict(loop_parent)
 
 
 def specs_by_column(
@@ -879,13 +1260,15 @@ def parse_topology_directives(metadata: TopologyMetadata) -> ParsedLayoutInput:
             term = (spec["terms"] or {}).get(pname)
             if canonical_net(terminal_net(term), net_to_rail) == GND_NET:
                 needs_gnd = True
-    columns = assign_columns(node_specs, net_to_rail)
+    columns, loop_return_nets, loop_parent = assign_columns(node_specs, net_to_rail)
     return ParsedLayoutInput(
         node_specs=node_specs,
         net_to_rail=net_to_rail,
         driven_nets=driven_power_nets(node_specs, net_to_rail),
         needs_gnd=needs_gnd,
         columns=columns,
+        loop_return_nets=loop_return_nets,
+        loop_parent=loop_parent,
     )
 
 

@@ -11,6 +11,7 @@ from fypa.topology.validate.labels import check_wire_labels
 from fypa.topology.validate.segments import (
     check_gutter_wire_crossings,
     check_parallel_vertical_gap,
+    check_redundant_parallel_runs,
     check_segment_spacing,
     check_signal_vs_gnd_drop_gap,
     check_vertical_bus_column_gaps,
@@ -18,6 +19,18 @@ from fypa.topology.validate.segments import (
     check_wires_through_foreign_nodes,
 )
 from fypa.topology.validate.hub import check_hub_net_disconnected
+from fypa.topology.validate.rules import (
+    check_driver_left_of_load,
+    check_hub_net_unrouted,
+    check_loop_return_in_pair_gutter,
+    check_port_sides,
+    check_ports_overlapping,
+    check_right_to_left_wires,
+    check_source_sink_columns,
+    check_wire_bends_excessive,
+    check_wire_detour_excessive,
+    check_wire_outside_channel,
+)
 from fypa.topology.validate.stubs import check_open_stub_ends
 from fypa.topology.validate.util import vertical_segment_overlaps_node_body
 from fypa.topology.validate.wires import check_dangling_wire_endpoints
@@ -25,8 +38,19 @@ from fypa.topology.validate.wires import check_dangling_wire_endpoints
 __all__ = [
     "check_conditional_gnd_names",
     "check_dangling_wire_endpoints",
+    "check_driver_left_of_load",
+    "check_hub_net_unrouted",
+    "check_loop_return_in_pair_gutter",
     "check_open_stub_ends",
+    "check_port_sides",
+    "check_ports_overlapping",
+    "check_right_to_left_wires",
     "check_segment_spacing",
+    "check_source_sink_columns",
+    "check_wire_bends_excessive",
+    "check_wire_detour_excessive",
+    "check_wire_outside_channel",
+    "check_redundant_parallel_runs",
     "merge_validation_issues",
     "validate_topology",
     "vertical_segment_overlaps_node_body",
@@ -51,6 +75,15 @@ def validate_topology(
     issues.extend(check_vertical_bus_column_gaps(model))
     issues.extend(check_gutter_wire_crossings(model))
     issues.extend(check_signal_vs_gnd_drop_gap(model))
+    issues.extend(check_port_sides(model))
+    issues.extend(check_ports_overlapping(model))
+    issues.extend(check_right_to_left_wires(model))
+    issues.extend(check_driver_left_of_load(model))
+    issues.extend(check_source_sink_columns(model))
+    issues.extend(check_loop_return_in_pair_gutter(model))
+    issues.extend(check_wire_detour_excessive(model))
+    issues.extend(check_wire_bends_excessive(model))
+    issues.extend(check_hub_net_unrouted(model))
 
     if geo is None:
         geo = compute_schematic_geometry(
@@ -61,12 +94,14 @@ def validate_topology(
 
     issues.extend(check_wire_labels(model, geo))
     issues.extend(check_segment_spacing(geo.segments, geo.junctions, geo.bridges))
+    issues.extend(check_redundant_parallel_runs(geo.segments))
     issues.extend(check_open_stub_ends(model, geo=geo))
     issues.extend(check_dangling_wire_endpoints(model, geo))
     issues.extend(check_hub_net_disconnected(model, geo))
     issues.extend(
         check_vertical_under_node(model, geo, directive_nodes=directive_nodes),
     )
+    issues.extend(check_wire_outside_channel(model, geo))
 
     if model.width > MAX_CANVAS_WIDTH + WIRE_EPS:
         issues.append(

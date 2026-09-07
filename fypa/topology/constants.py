@@ -60,6 +60,20 @@ LABEL_WIRE_OFFSET = 5.0
 LABEL_MIN_SPACING = 18.0
 LABEL_BESIDE_VERTICAL = 7.0
 OBSTACLE_CLEAR = 10.0
+# Soft graze band outside a symbol body (cost penalty; not hard clearance).
+WIRE_GRAZE_BAND = WIRE_GUTTER_PAD + MIN_PARALLEL_GAP
+# Bend penalty for corridor cost (pixels of equivalent length).
+CORRIDOR_BEND_PENALTY = 64.0
+# Soft penalty per foreign H∩V crossing of a candidate corridor.
+CORRIDOR_CROSSING_PENALTY = 80.0
+# Soft penalty per px inside the graze band.
+CORRIDOR_GRAZE_PENALTY = 4.0
+# Drawn length / Manhattan(ends) above this → wire_detour_excessive.
+MAX_DETOUR_RATIO = 3.0
+# Bends above Manhattan minimum (0 or 1) by more than this → wire_bends_excessive.
+MAX_EXTRA_BENDS = 2
+# Soft bonus (cost reduction) when reusing an existing same-net H band.
+CORRIDOR_REUSE_BAND_BONUS = 120.0
 MAX_CANVAS_WIDTH = 2400.0
 MAX_LABEL_DISTANCE = LABEL_WIRE_OFFSET + 36.0
 CANVAS_HEIGHT_PAD_GND = 16.0
@@ -96,7 +110,7 @@ LABEL_VERTICAL_ANCHOR_FRACTIONS = (0.3, 0.45, 0.55, 0.7)
 
 # (terminal_name, side, sort_key) — left = input, right = output
 ROLE_PORTS: dict[str, list[tuple[str, str, int]]] = {
-    "SOURCE": [("N", "left", 1), ("P", "right", 0)],
+    "SOURCE": [("P", "right", 0), ("N", "right", 1)],
     "SINK": [("N", "left", 1), ("P", "left", 0)],
     "REGULATOR": [
         ("IN_N", "left", 3),

@@ -56,29 +56,8 @@ def check_segment_spacing(
                 continue
             if a.net != b.net:
                 gap = abs(a.x1 - b.x1)
-                if GND_NET in (a.net, b.net):
-                    # A signal-vs-GND *gap* is deferred to
-                    # check_signal_vs_gnd_drop_gap, but that check requires
-                    # WIRE_EPS < gap, so a gap of ~0 (coincident different-net
-                    # verticals drawn as one ambiguous line, spans already known
-                    # to overlap) slips through both checks. Flag it here.
-                    if gap <= WIRE_EPS:
-                        issues.append(
-                            make_issue(
-                                "coincident_vertical_x",
-                                (
-                                    f"Vertical segments at x={a.x1:.1f} overlap "
-                                    f"exactly ({a.net} wire {a.wire_index}, "
-                                    f"{b.net} wire {b.wire_index})"
-                                ),
-                                x=round(a.x1, 1),
-                                x2=round(b.x1, 1),
-                                gap=round(gap, 1),
-                                net_a=a.net,
-                                net_b=b.net,
-                            )
-                        )
-                    continue
+                # GND is a normal foreign net for corridor spacing (RULES.md §6 /
+                # §15): no exemption that would allow covering a signal vertical.
                 issues.append(
                     make_issue(
                         "duplicate_vertical_x",
@@ -140,6 +119,74 @@ def check_segment_spacing(
                         bridge_y=by,
                     )
                 )
+    return issues
+
+
+def check_redundant_parallel_runs(
+    segments: list[WireSeg],
+) -> list[dict]:
+    """Same-net H/V pairs closer than MIN_PARALLEL_GAP with overlapping spans."""
+    issues: list[dict] = []
+    verticals = [s for s in segments if s.orient == "V"]
+    horizontals = [s for s in segments if s.orient == "H"]
+
+    for i, a in enumerate(verticals):
+        a_lo, a_hi = segment_span(a)
+        for b in verticals[i + 1 :]:
+            if a.net != b.net or not a.net:
+                continue
+            gap = abs(a.x1 - b.x1)
+            if gap <= WIRE_EPS or gap >= MIN_PARALLEL_GAP - WIRE_EPS:
+                continue
+            b_lo, b_hi = segment_span(b)
+            if not intervals_overlap(a_lo, a_hi, b_lo, b_hi):
+                continue
+            issues.append(
+                make_issue(
+                    "redundant_parallel_run",
+                    (
+                        f"Same-net verticals on {a.net} at x={a.x1:.1f} and "
+                        f"x={b.x1:.1f} are only {gap:.1f}px apart "
+                        f"(wires {a.wire_index}, {b.wire_index})"
+                    ),
+                    net=a.net,
+                    orient="V",
+                    x=round(a.x1, 1),
+                    x2=round(b.x1, 1),
+                    gap=round(gap, 1),
+                    wire_a=a.wire_index,
+                    wire_b=b.wire_index,
+                )
+            )
+
+    for i, a in enumerate(horizontals):
+        a_lo, a_hi = segment_span(a)
+        for b in horizontals[i + 1 :]:
+            if a.net != b.net or not a.net:
+                continue
+            gap = abs(a.y1 - b.y1)
+            if gap <= WIRE_EPS or gap >= MIN_PARALLEL_GAP - WIRE_EPS:
+                continue
+            b_lo, b_hi = segment_span(b)
+            if not intervals_overlap(a_lo, a_hi, b_lo, b_hi):
+                continue
+            issues.append(
+                make_issue(
+                    "redundant_parallel_run",
+                    (
+                        f"Same-net horizontals on {a.net} at y={a.y1:.1f} and "
+                        f"y={b.y1:.1f} are only {gap:.1f}px apart "
+                        f"(wires {a.wire_index}, {b.wire_index})"
+                    ),
+                    net=a.net,
+                    orient="H",
+                    y=round(a.y1, 1),
+                    y2=round(b.y1, 1),
+                    gap=round(gap, 1),
+                    wire_a=a.wire_index,
+                    wire_b=b.wire_index,
+                )
+            )
     return issues
 
 
@@ -391,9 +438,6 @@ def check_gutter_wire_crossings(model: TopologyModel) -> list[dict]:
         if wire.dashed or not wire.net:
             continue
         wires_by_net[wire.net].append(wire)
-    hub_nets = {
-        w.net for w in model.wires if w.net and not w.dashed and w.routing_kind.startswith("hub")
-    }
     issues: list[dict] = []
     for _gkey, nets in gutter_groups(all_ports).items():
         active = sorted(net for net in nets if net in wires_by_net)
@@ -405,8 +449,6 @@ def check_gutter_wire_crossings(model: TopologyModel) -> list[dict]:
         }
         for i, net_a in enumerate(active):
             for net_b in active[i + 1 :]:
-                if net_a in hub_nets and net_b in hub_nets:
-                    continue
                 if foreign_segments_cross(segs_by_net[net_a], segs_by_net[net_b]):
                     issues.append(
                         make_issue(
@@ -425,7 +467,7 @@ def check_vertical_under_node(
     *,
     directive_nodes: list[TopologyNode] | None = None,
 ) -> list[dict]:
-    """Warn when a vertical segment runs under a directive node body."""
+    """Error when a vertical segment runs under a directive node body."""
     nodes = directive_nodes
     if nodes is None:
         nodes = [n for n in model.nodes if n.role != "GND"]
@@ -445,7 +487,6 @@ def check_vertical_under_node(
                             f"Vertical segment at x={x:.1f} ({seg.net}) "
                             f"runs under node {node.designator}"
                         ),
-                        severity="warning",
                         net=seg.net,
                         node_id=node.node_id,
                         x=round(x, 1),

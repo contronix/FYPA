@@ -36,6 +36,24 @@ class RoutingContext:
         lo, hi = min(y_lo, y_hi), max(y_lo, y_hi)
         self._vertical_bands.append((x, lo, hi, net))
 
+    def checkpoint(self) -> tuple[int, int]:
+        """Return lengths of band lists for later :meth:`rollback`."""
+        return len(self._horizontal_bands), len(self._vertical_bands)
+
+    def rollback(self, mark: tuple[int, int]) -> None:
+        """Discard bands appended since ``mark`` (fail-closed hub drop)."""
+        h_n, v_n = mark
+        del self._horizontal_bands[h_n:]
+        del self._vertical_bands[v_n:]
+
+    def release_vertical_at(self, x: float, net: str, *, eps: float = 0.6) -> None:
+        """Drop reserved verticals for ``net`` on column ``x`` (unused plan slot)."""
+        self._vertical_bands = [
+            band
+            for band in self._vertical_bands
+            if not (band[3] == net and abs(band[0] - x) < eps)
+        ]
+
     @property
     def horizontal_bands(self) -> list[tuple[float, float, float, str]]:
         return self._horizontal_bands

@@ -52,41 +52,6 @@ def detour_y_for_horizontal_upward(
     return blocked_top - OBSTACLE_CLEAR
 
 
-def _blocking_nodes(
-    y_nominal: float,
-    x_lo: float,
-    x_hi: float,
-    obstacles: list[TopologyNode],
-    skip: set[str],
-) -> list[TopologyNode]:
-    lo, hi = min(x_lo, x_hi), max(x_lo, x_hi)
-    return [
-        node
-        for node in obstacles
-        if node.node_id not in skip and horizontal_crosses_node(node, y_nominal, lo, hi)
-    ]
-
-
-def _prefer_upward_detour(
-    y_nominal: float,
-    y_up: float,
-    y_down: float,
-    obstacles: list[TopologyNode],
-    x_lo: float,
-    x_hi: float,
-    skip: set[str],
-) -> bool:
-    """Prefer routing above a component when the port row sits on its body."""
-    blockers = _blocking_nodes(y_nominal, x_lo, x_hi, obstacles, skip)
-    if not blockers:
-        return abs(y_up - y_nominal) < abs(y_down - y_nominal) - WIRE_EPS
-    top = min(node.y for node in blockers)
-    bottom = max(node.y + node.height for node in blockers)
-    if top <= y_nominal <= bottom and y_up < top - WIRE_EPS and y_down > bottom + WIRE_EPS:
-        return True
-    return abs(y_up - y_nominal) < abs(y_down - y_nominal) - WIRE_EPS
-
-
 def _obstacle_detour_y_direction(
     ctx: RoutingContext,
     y_nominal: float,
@@ -114,11 +79,18 @@ def _obstacle_detour_y_direction(
         for _ in range(len(ctx.horizontal_bands) + 1):
             blocked = False
             for by, blo, bhi, bnet in ctx.horizontal_bands:
-                if net is not None and bnet == net:
-                    continue
                 if hi <= blo + WIRE_EPS or lo >= bhi - WIRE_EPS:
                     continue
-                if abs(by - y) < MIN_PARALLEL_GAP - WIRE_EPS:
+                gap = abs(by - y)
+                if gap <= WIRE_EPS:
+                    # Exact same-net reuse is legal; foreign on the same y must move.
+                    if net is not None and bnet == net:
+                        continue
+                    y = by + MIN_PARALLEL_GAP if downward else by - MIN_PARALLEL_GAP
+                    blocked = True
+                    break
+                if gap < MIN_PARALLEL_GAP - WIRE_EPS:
+                    # Foreign near-parallel *and* same-net twins (RULES.md §21).
                     y = by + MIN_PARALLEL_GAP if downward else by - MIN_PARALLEL_GAP
                     blocked = True
                     break
@@ -144,7 +116,14 @@ def obstacle_detour_y(
     skip_node_ids: set[str],
     net: str | None = None,
 ) -> float:
-    """Return a Y that clears obstacles and reserved horizontal bands."""
+    """Return a Y that clears obstacles and reserved horizontal bands.
+
+    Chooses the lower-cost of upward vs downward when both clear (RULES.md §20).
+    Prefers an existing same-net horizontal band when one already covers the span
+    (RULES.md §21).
+    """
+    from fypa.topology.routing.cost import corridor_cost
+
     lo, hi = min(x_lo, x_hi), max(x_lo, x_hi)
     y_down = _obstacle_detour_y_direction(
         ctx,
@@ -167,20 +146,127 @@ def obstacle_detour_y(
         downward=False,
     )
     if abs(y_down - y_nominal) < WIRE_EPS:
-        return y_down
-    if abs(y_up - y_nominal) < WIRE_EPS:
-        return y_up
-    if _prefer_upward_detour(
+        y_pick = y_down
+    elif abs(y_up - y_nominal) < WIRE_EPS:
+        y_pick = y_up
+    else:
+        cost_down = corridor_cost(
+            y_down,
+            y_nominal,
+            lo,
+            hi,
+            obstacles,
+            skip_node_ids,
+            bends=1,
+            ctx=ctx,
+            net=net,
+        )
+        cost_up = corridor_cost(
+            y_up,
+            y_nominal,
+            lo,
+            hi,
+            obstacles,
+            skip_node_ids,
+            bends=1,
+            ctx=ctx,
+            net=net,
+        )
+        if cost_up < cost_down - WIRE_EPS:
+            y_pick = y_up
+        elif cost_down < cost_up - WIRE_EPS:
+            y_pick = y_down
+        elif abs(y_up - y_nominal) < abs(y_down - y_nominal) - WIRE_EPS:
+            y_pick = y_up
+        else:
+            y_pick = y_down
+
+    if net is None:
+        return y_pick
+
+    # Snap onto a nearby same-net H band when that is cheaper than a twin corridor.
+    best_y = y_pick
+    best_cost = corridor_cost(
+        y_pick,
         y_nominal,
-        y_up,
-        y_down,
-        obstacles,
         lo,
         hi,
+        obstacles,
         skip_node_ids,
-    ):
-        return y_up
-    return y_down
+        bends=0 if abs(y_pick - y_nominal) < WIRE_EPS else 1,
+        ctx=ctx,
+        net=net,
+    )
+    for by, blo, bhi, bnet in ctx.horizontal_bands:
+        if bnet != net:
+            continue
+        if hi <= blo + WIRE_EPS or lo >= bhi - WIRE_EPS:
+            continue
+        if abs(by - y_nominal) > MIN_PARALLEL_GAP * 2 + WIRE_EPS:
+            continue
+        if not horizontal_segment_clear(by, lo, hi, obstacles, skip_node_ids):
+            continue
+        if _foreign_horizontal_blocks_row_local(ctx, by, lo, hi, net):
+            continue
+        cost = corridor_cost(
+            by,
+            y_nominal,
+            lo,
+            hi,
+            obstacles,
+            skip_node_ids,
+            bends=0 if abs(by - y_nominal) < WIRE_EPS else 1,
+            ctx=ctx,
+            net=net,
+        )
+        if cost < best_cost - WIRE_EPS:
+            best_cost = cost
+            best_y = by
+    if best_cost == float("inf"):
+        # Directional detour landed in an illegal twin gap and reuse was blocked;
+        # force the next legal slot past the nearest same-net band.
+        for by, blo, bhi, bnet in ctx.horizontal_bands:
+            if bnet != net:
+                continue
+            if hi <= blo + WIRE_EPS or lo >= bhi - WIRE_EPS:
+                continue
+            for cand in (by + MIN_PARALLEL_GAP, by - MIN_PARALLEL_GAP):
+                if not horizontal_segment_clear(cand, lo, hi, obstacles, skip_node_ids):
+                    continue
+                if _foreign_horizontal_blocks_row_local(ctx, cand, lo, hi, net):
+                    continue
+                cost = corridor_cost(
+                    cand,
+                    y_nominal,
+                    lo,
+                    hi,
+                    obstacles,
+                    skip_node_ids,
+                    bends=1,
+                    ctx=ctx,
+                    net=net,
+                )
+                if cost < best_cost:
+                    best_cost = cost
+                    best_y = cand
+    return best_y
+
+
+def _foreign_horizontal_blocks_row_local(
+    ctx: RoutingContext,
+    y: float,
+    x_lo: float,
+    x_hi: float,
+    net: str,
+) -> bool:
+    lo, hi = min(x_lo, x_hi), max(x_lo, x_hi)
+    for by, blo, bhi, bnet in ctx.horizontal_bands:
+        if bnet == net or abs(by - y) > WIRE_EPS:
+            continue
+        if hi <= blo + WIRE_EPS or lo >= bhi - WIRE_EPS:
+            continue
+        return True
+    return False
 
 
 def obstacle_detour_y_candidates(
@@ -192,7 +278,9 @@ def obstacle_detour_y_candidates(
     skip_node_ids: set[str],
     net: str | None = None,
 ) -> list[float]:
-    """Distinct Y values to try for a horizontal feed, best-first."""
+    """Distinct Y values to try for a horizontal feed, best-cost first."""
+    from fypa.topology.routing.cost import corridor_cost
+
     lo, hi = min(x_lo, x_hi), max(x_lo, x_hi)
     order: list[float] = []
 
@@ -203,6 +291,14 @@ def obstacle_detour_y_candidates(
 
     add(y_nominal)
     add(obstacle_detour_y(ctx, y_nominal, lo, hi, obstacles, skip_node_ids, net))
+    # Prefer existing same-net horizontal bands that already cover this span.
+    if net is not None:
+        for by, blo, bhi, bnet in ctx.horizontal_bands:
+            if bnet != net:
+                continue
+            if hi <= blo + WIRE_EPS or lo >= bhi - WIRE_EPS:
+                continue
+            add(by)
     add(
         _obstacle_detour_y_direction(
             ctx,
@@ -225,6 +321,22 @@ def obstacle_detour_y_candidates(
             skip_node_ids,
             net,
             downward=False,
+        )
+    )
+    order.sort(
+        key=lambda y: (
+            corridor_cost(
+                y,
+                y_nominal,
+                lo,
+                hi,
+                obstacles,
+                skip_node_ids,
+                bends=0 if abs(y - y_nominal) < WIRE_EPS else 1,
+                ctx=ctx,
+                net=net,
+            ),
+            abs(y - y_nominal),
         )
     )
     return order

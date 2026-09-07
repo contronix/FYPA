@@ -3,6 +3,8 @@
 Abstract PDN flow diagram: components as column layout, orthogonal wire routing,
 junction points and bridge symbols, net labels, and SVG rendering for the FYPA viewer.
 
+Normative layout rules: [`RULES.md`](RULES.md).
+
 The viewer rebuilds the diagram live while editor-mode changes are pending (before
 Resolve), using :func:`fypa.topology.preview.metadata_for_topology`.
 
@@ -212,8 +214,7 @@ render parity, always use `compute_schematic_geometry(...).junctions`.
 | `segment_through_foreign_node` | Horizontal **or vertical** segment intersects foreign node |
 | `parallel_vertical_gap` | Vertical buses in the **same gutter span** closer than `MIN_PARALLEL_GAP` (16 px) |
 | `signal_vs_gnd_drop_gap` | Signal bus too close to GND trunk x |
-| `coincident_vertical_x` | Signal vertical exactly overlays a GND drop (gap ~0, ambiguous single line) |
-| `duplicate_vertical_x` | Foreign (or duplicate same-net) vertical segments share x |
+| `duplicate_vertical_x` | Foreign vertical segments closer than `MIN_PARALLEL_GAP` (GND included) |
 | `duplicate_horizontal_y` | Foreign horizontal segments share y with overlapping x |
 | `junction_near_bridge` | Junction dot within bridge arc clearance on same vertical |
 | `label_not_at_origin` | Label at (0, 0) |

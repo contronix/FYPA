@@ -66,4 +66,6 @@ def build_topology_model(metadata: TopologyMetadata | None) -> TopologyModel:
         height=height,
         gnd_bus_y=layout.gnd_bus_y,
         gnd_symbol_x=gnd_symbol_x,
+        loop_return_nets=layout.loop_return_nets,
+        loop_parent=layout.loop_parent,
     )

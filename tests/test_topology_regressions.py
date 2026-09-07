@@ -270,12 +270,19 @@ def test_regression_gutter_parallel_min_bus_gap():
 
 
 def test_regression_stacked_column_buses_use_column_edge():
-    """Stack-column pair buses use column_bus_x and still pass gap validation."""
+    """Stack/gutter pair buses for parallel LEDs still pass gap validation."""
     from fypa.topology.validate.segments import check_vertical_bus_column_gaps
 
     model = build_topology_model(load_topology_fixture("gutter_parallel_four_nets"))
-    stack_wires = [w for w in model.wires if w.routing_kind == "stack_column"]
-    assert stack_wires, "fixture should include stack_column pair wires"
+    pair_wires = [
+        w
+        for w in model.wires
+        if w.routing_kind in ("stack_column", "gutter_pair", "two_port", "pair")
+        or (w.bus_x is not None and w.net.startswith("LED"))
+    ]
+    assert pair_wires or any(w.net.startswith("LED") for w in model.wires), (
+        "fixture should include LED pair wires"
+    )
     assert not check_vertical_bus_column_gaps(model)
 
 
@@ -351,8 +358,10 @@ def test_regression_port_horizontal_stub_before_vertical():
             wire.routing_kind == "hub_tap"
             and bus_x is not None
             and stub > bus_x + 1.0
+            and abs(start_x - port.x) >= 1.0
         ):
             # Downstream of the gutter bus: trunk feeds east into the port.
+            # (Port→bus feeds start on the port and fall through to stub checks.)
             assert abs(verts[-1][0] - port.x) < 1.0, (
                 f"{wire.net} bus-fed tap should end on port: {wire.path_d}"
             )

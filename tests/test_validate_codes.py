@@ -70,29 +70,24 @@ def test_duplicate_vertical_x_uses_corridor_gap():
     assert not check_segment_spacing(segments_far, [], [])
 
 
-def test_coincident_signal_over_gnd_vertical_flagged():
-    """A signal vertical exactly overlaying a GND drop (gap ~0, overlapping
-    spans) is rendered as one ambiguous line and must be flagged. It slips
-    through both duplicate_vertical_x (GND-skipped) and signal_vs_gnd_drop_gap
-    (which requires WIRE_EPS < gap)."""
+def test_signal_over_gnd_vertical_flagged_as_duplicate():
+    """Signal vertical overlaying a GND drop is a normal foreign corridor clash."""
     segments = [
         WireSeg(GND_NET, "V", 100.0, 10.0, 100.0, 90.0, wire_index=0),
         WireSeg("VDD", "V", 100.0, 20.0, 100.0, 80.0, wire_index=1),
     ]
     issues = check_segment_spacing(segments, [], [])
-    assert any(i["code"] == "coincident_vertical_x" for i in issues)
+    assert any(i["code"] == "duplicate_vertical_x" for i in issues)
 
 
-def test_signal_gnd_vertical_gap_still_deferred():
-    """A non-zero signal-vs-GND gap is not a coincident overlay; it stays
-    deferred to check_signal_vs_gnd_drop_gap, so check_segment_spacing is quiet."""
+def test_signal_gnd_near_parallel_vertical_flagged():
+    """Near-parallel signal-vs-GND verticals use the same rule as any foreign pair."""
     segments = [
         WireSeg(GND_NET, "V", 100.0, 10.0, 100.0, 90.0, wire_index=0),
         WireSeg("VDD", "V", 105.0, 20.0, 105.0, 80.0, wire_index=1),
     ]
     codes = {i["code"] for i in check_segment_spacing(segments, [], [])}
-    assert "coincident_vertical_x" not in codes
-    assert "duplicate_vertical_x" not in codes
+    assert "duplicate_vertical_x" in codes
 
 
 def test_duplicate_horizontal_y_detected():
@@ -140,10 +135,22 @@ def test_foreign_wire_crossing_detected():
 
 
 def test_check_gutter_wire_crossings_on_model():
+    """Hub↔hub crossings are included; fixture may report them as errors."""
     from tests.topology_fixtures import load_topology_fixture
 
     model = build_topology_model(load_topology_fixture("project_a_stepper_loop_rails"))
-    assert not check_gutter_wire_crossings(model)
+    issues = check_gutter_wire_crossings(model)
+    assert all(i["code"] == "foreign_wire_crossing" for i in issues)
+
+
+def test_hub_hub_crossing_no_longer_exempt():
+    """Two hub nets that cross in a gutter must be flagged (RULES: no overlap)."""
+    from fypa.topology.geometry import WireSeg
+    from fypa.topology.validate.util import foreign_segments_cross
+
+    segs_a = [WireSeg("NET_A", "V", 100.0, 10.0, 100.0, 90.0, wire_index=0)]
+    segs_b = [WireSeg("NET_B", "H", 40.0, 50.0, 160.0, 50.0, wire_index=1)]
+    assert foreign_segments_cross(segs_a, segs_b)
 
 
 def test_check_gutter_wire_crossings_uses_all_hub_wires():

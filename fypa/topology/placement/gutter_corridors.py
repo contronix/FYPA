@@ -21,6 +21,29 @@ def column_gaps_from_nodes(nodes: list[TopologyNode]) -> list[ColumnGap]:
     return [(col_xs[i] + NODE_W, col_xs[i + 1]) for i in range(len(col_xs) - 1)]
 
 
+def row_gaps_from_nodes(nodes: list[TopologyNode]) -> list[ColumnGap]:
+    """``(gap_lo, gap_hi)`` between adjacent symbol row bands (exclusive of bodies)."""
+    bands: list[tuple[float, float]] = []
+    for n in nodes:
+        if n.role == "GND":
+            continue
+        bands.append((n.y, n.y + n.height))
+    if len(bands) < 2:
+        return []
+    # Merge overlapping Y bands into contiguous symbol rows.
+    bands.sort()
+    merged: list[tuple[float, float]] = [bands[0]]
+    for top, bottom in bands[1:]:
+        prev_top, prev_bottom = merged[-1]
+        if top <= prev_bottom + WIRE_EPS:
+            merged[-1] = (prev_top, max(prev_bottom, bottom))
+        else:
+            merged.append((top, bottom))
+    if len(merged) < 2:
+        return []
+    return [(merged[i][1], merged[i + 1][0]) for i in range(len(merged) - 1)]
+
+
 def gutter_vertical_corridors(
     channel_lo: float,
     channel_hi: float,
@@ -122,8 +145,10 @@ def pick_gutter_bus_x(
     outward: float,
     reserved: list[tuple[float, float, float, str]],
     assigned_in_group: list[float] | None = None,
+    attach_xs: list[float] | None = None,
 ) -> float:
     """Place a gutter bus x inside a column gap corridor (never on a symbol column)."""
+    attaches = attach_xs if attach_xs is not None else [anchor_x]
     corridor = resolve_gutter_corridor(
         channel_lo,
         channel_hi,
@@ -147,6 +172,7 @@ def pick_gutter_bus_x(
                     net,
                     outward=outward,
                     assigned_in_group=assigned_in_group,
+                    attach_xs=attaches,
                 )
         nominal = nominal_gutter_bus_x(bus_slot, n_slots, channel_lo, channel_hi)
         return allocate_bus_x(
@@ -159,6 +185,7 @@ def pick_gutter_bus_x(
             net,
             outward=outward,
             assigned_in_group=assigned_in_group,
+            attach_xs=attaches,
         )
     bus_lo, bus_hi = corridor
     inner_anchor = anchor_x + outward * MIN_PARALLEL_GAP
@@ -177,6 +204,7 @@ def pick_gutter_bus_x(
         net,
         outward=outward,
         assigned_in_group=assigned_in_group,
+        attach_xs=attaches,
     )
 
 

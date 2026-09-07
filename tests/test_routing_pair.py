@@ -72,3 +72,41 @@ def test_bus_x_for_pair_forwards_reserved_verticals(monkeypatch):
     assert result == 222.0
     assert captured["reserved"] == list(ctx.vertical_bands)
     assert captured["reserved"], "reserved verticals were not forwarded to the picker"
+
+
+def test_gutter_pair_skips_unplanned_net_when_bus_plan_present(monkeypatch):
+    """Gutter pairs must not live-allocate when planning left a net unplanned."""
+    from fypa.topology.placement import BusPlan
+
+    calls: list[str] = []
+
+    def fake_bus_x(*_a, **_k):
+        calls.append("allocate")
+        return 200.0
+
+    monkeypatch.setattr(pair_mod, "_bus_x_for_pair", fake_bus_x)
+
+    a = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="right",
+        x=100.0,
+        y=50.0,
+        node_id="U1",
+        wire_x=120.0,
+    )
+    b = TopologyPort(
+        terminal="P",
+        net="VDD",
+        label="VDD",
+        side="left",
+        x=400.0,
+        y=50.0,
+        node_id="J1",
+        wire_x=380.0,
+    )
+    plan = BusPlan(pair_buses={"OTHER": 180.0})
+    wires = pair_mod.signal_wires_from_pairs([(a, b)], bus_plan=plan)
+    assert wires == []
+    assert calls == []

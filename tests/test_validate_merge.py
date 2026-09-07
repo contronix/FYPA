@@ -29,7 +29,8 @@ def test_merge_validation_issues_preserves_order():
     assert any(i["code"] == "label_not_at_origin" for i in merged)
 
 
-def test_vertical_under_node_is_warning_not_summary_issue():
+def test_vertical_under_node_is_error():
+    """Vertical under a symbol body is an error (RULES.md)."""
     node = TopologyNode(
         node_id="U1",
         label="U1",
@@ -50,6 +51,6 @@ def test_vertical_under_node_is_warning_not_summary_issue():
     )
     model = TopologyModel(nodes=[node], wires=[wire], width=100.0, height=100.0)
     issues = validate_topology(model)
-    warn = next(i for i in issues if i["code"] == "vertical_under_node")
-    assert warn["severity"] == "warning"
+    under = next(i for i in issues if i["code"] == "vertical_under_node")
+    assert under["severity"] == "error"
     assert "segment_through_foreign_node" not in {i["code"] for i in issues}
