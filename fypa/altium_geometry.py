@@ -14,8 +14,11 @@ Units: millimetres everywhere. Conductivity is therefore in S/mm (not S/m).
 
 Geometry rules
 --------------
-* **Tracks** with ``is_keepout`` or ``is_polygon_outline`` are skipped; the
-  remaining tracks are buffered LineStrings of half-width with round caps.
+* **Tracks** with ``is_keepout`` are skipped, as are ``is_polygon_outline``
+  tracks belonging to a *solid* pour (boundary artwork over the region fill).
+  A hatched or outlines-only pour keeps its perimeter — there the tracks are
+  the copper. The remaining tracks are buffered LineStrings of half-width
+  with round caps.
   Tracks on layer id ``MULTI_LAYER_PAD_LAYER_ID`` (74) with an assigned net
   appear on every enabled **signal** copper layer; internal planes are
   excluded. Unassigned (``NO_NET``) ones are omitted.
@@ -41,6 +44,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import math
+import threading
 import time
 from dataclasses import dataclass
 
@@ -73,6 +77,44 @@ log = logging.getLogger(__name__)
 # Padne's convention: conductivity stored in S/mm so that
 #   surface_conductance [S] = thickness [mm] × conductivity [S/mm]
 COPPER_CONDUCTIVITY_S_PER_MM: float = 5.95e4
+
+# Copper weight assumed when the Altium stackup carries no thickness for a
+# layer. altium_monkey initialises ``copper_thickness`` to 0 mils when the
+# .PcbDoc has no COPTHICK field, and a zero thickness means zero sheet
+# conductance — an infinitely resistive layer, which shows up downstream as a
+# nonsense solve or a ZeroDivisionError building the metadata rather than as
+# an obvious "your stackup is missing" error. 35 µm (1 oz) is the overwhelming
+# default for signal layers, so substituting it and saying so loudly is far
+# more useful than either failing or silently solving an open circuit.
+DEFAULT_COPPER_THICKNESS_MM: float = 0.035
+# Designators of layers already warned about, so a board missing its whole
+# stackup logs once per layer instead of once per (layer, net) bucket.
+_thickness_warned: set = set()
+
+
+def _layer_conductance(stackup) -> float:
+    """Sheet conductance (S) for a stackup layer: thickness x conductivity.
+
+    Substitutes :data:`DEFAULT_COPPER_THICKNESS_MM` when the stackup reports
+    no usable thickness, warning once per layer. Without this a stackup-less
+    board silently produces zero-conductance copper.
+    """
+    t_mm = float(getattr(stackup, "copper_thickness_mm", 0.0) or 0.0)
+    if t_mm <= 0.0:
+        key = (getattr(stackup, "layer_id", None), getattr(stackup, "name", ""))
+        if key not in _thickness_warned:
+            _thickness_warned.add(key)
+            log.warning(
+                "Layer %s (id %s) has no copper thickness in the Altium "
+                "stackup - assuming %.0f um (1 oz). Set the layer's copper "
+                "weight in Altium, or override it in Settings > Stackup, "
+                "for a correct IR drop.",
+                getattr(stackup, "name", "?"),
+                getattr(stackup, "layer_id", "?"),
+                DEFAULT_COPPER_THICKNESS_MM * 1000.0,
+            )
+        t_mm = DEFAULT_COPPER_THICKNESS_MM
+    return t_mm * COPPER_CONDUCTIVITY_S_PER_MM
 
 # Altium layer-id sentinels.
 MULTI_LAYER_PAD_LAYER_ID: int = 74
@@ -692,14 +734,28 @@ def _distribute_to_layers(
         add_fn(prim_layer_id, net_index, geom)
 
 
+def _pour_outline_is_artwork(prim: RawTrack | RawArc) -> bool:
+    """True when a polygon-pour outline primitive is display-only boundary
+    artwork rather than copper.
+
+    For a *solid* pour it is: the poured copper lives in the region fill, and
+    including the outline would give a rounded-corner pour a spurious band of
+    copper along its border. A hatched (or outlines-only) pour is the opposite
+    case — its copper *is* tracks and arcs, and the perimeter Altium flags as
+    the polygon outline is the pour's outer conductor. Excluding it dropped
+    the border of every hatched pour from the mesh (GitHub issue #41).
+    """
+    return prim.is_polygon_outline and not prim.polygon_hatched
+
+
 def _track_is_copper(t: RawTrack, plane_layer_ids: set[int]) -> bool:
-    return (not t.is_keepout and not t.is_polygon_outline and t.width_mm > 0
-            and t.layer_id not in plane_layer_ids)
+    return (not t.is_keepout and not _pour_outline_is_artwork(t)
+            and t.width_mm > 0 and t.layer_id not in plane_layer_ids)
 
 
 def _arc_is_copper(a: RawArc, plane_layer_ids: set[int]) -> bool:
-    return (not a.is_keepout and not a.is_polygon_outline and a.width_mm > 0
-            and a.layer_id not in plane_layer_ids)
+    return (not a.is_keepout and not _pour_outline_is_artwork(a)
+            and a.width_mm > 0 and a.layer_id not in plane_layer_ids)
 
 
 def _region_is_copper(
@@ -1118,7 +1174,7 @@ def build_layer_geometry(proj: ExtractedProject, layer_id: int,
             layer_id=layer_id,
             name=stackup.name,
             shape=shape,
-            conductance=stackup.copper_thickness_mm * COPPER_CONDUCTIVITY_S_PER_MM,
+            conductance=_layer_conductance(stackup),
             is_plane=True,
             plane_net_index=_net_index_by_name(proj, stackup.plane_net_name),
         )
@@ -1243,7 +1299,7 @@ def build_layer_geometry(proj: ExtractedProject, layer_id: int,
         layer_id=layer_id,
         name=stackup.name,
         shape=shape,
-        conductance=stackup.copper_thickness_mm * COPPER_CONDUCTIVITY_S_PER_MM,
+        conductance=_layer_conductance(stackup),
         is_plane=False,
         plane_net_index=NO_NET,
     )
@@ -1355,7 +1411,7 @@ def _shapes_to_geometry_layers(
             layer_id=lid,
             name=f"{stackup.name}|{net_name}",
             shape=mp,
-            conductance=stackup.copper_thickness_mm * COPPER_CONDUCTIVITY_S_PER_MM,
+            conductance=_layer_conductance(stackup),
             is_plane=is_plane,
             plane_net_index=net_index if is_plane else NO_NET,
             net_index=net_index,
@@ -1389,11 +1445,17 @@ def build_per_net_geometry_layers_split(
         empty.set_result([])
         return [], empty
 
-    buckets = _build_net_layer_buckets(proj, enabled, include_vias=True)
     if active_nets:
-        active_b = {k: v for k, v in buckets.items() if k[1] in active_nets}
-        rest_b = {k: v for k, v in buckets.items() if k[1] not in active_nets}
+        # Buffer ONLY the active rails synchronously. The other few thousand
+        # (layer, net) pairs feed the viewer's display overlay and are built
+        # on the background thread below, so the FEM never waits for copper
+        # it will not mesh. When the full bucket set is already memoised both
+        # calls are served from it instead (see _build_net_layer_buckets).
+        active_b = _build_net_layer_buckets(
+            proj, enabled, include_vias=True, only_nets=active_nets)
+        rest_b = None   # built lazily in the background union below
     else:
+        buckets = _build_net_layer_buckets(proj, enabled, include_vias=True)
         # No directive touches a net — treat every real net as active, but
         # keep NO_NET copper out of the FEM regardless (it carries no rail
         # current; it exists only for the viewer's "all copper" overlay).
@@ -1409,9 +1471,19 @@ def build_per_net_geometry_layers_split(
     # Union the non-active nets on a background thread (shapely releases the
     # GIL inside union_all, so this genuinely overlaps the caller's work).
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    rest_future = ex.submit(
-        lambda: _shapes_to_geometry_layers(
-            proj, _parallel_union_buckets(rest_b, snap=False)))
+
+    def _build_rest() -> list[GeometryLayer]:
+        # ``rest_b is None`` means the active path filtered the sweep, so the
+        # non-active buckets have not been buffered yet — do that here, off
+        # the caller's critical path, rather than ahead of the FEM.
+        buckets = (rest_b if rest_b is not None
+                   else _build_net_layer_buckets(
+                       proj, enabled, include_vias=True,
+                       exclude_nets=active_nets))
+        return _shapes_to_geometry_layers(
+            proj, _parallel_union_buckets(buckets, snap=False))
+
+    rest_future = ex.submit(_build_rest)
     ex.shutdown(wait=False)   # task still completes; executor frees when done
 
     # The caller awaits ``rest_future.result()`` at the end of a long
@@ -1519,10 +1591,44 @@ def _batch_buffer_arcs(arcs: list[RawArc]) -> list[shapely.geometry.Polygon]:
     return list(polys)
 
 
+# Single-slot memo for the bucketing/buffering pass. Keyed on the identity of
+# the ExtractedProject plus the arguments that change the result.
+#
+# The reference is strong, not weak: ExtractedProject is a frozen slots
+# dataclass without ``__weakref__``, and adding ``weakref_slot=True`` would
+# make it unpicklable — which the design-info cache depends on. A single slot
+# bounds the cost to one extraction, the same one the viewer holds for the
+# session anyway, and clear_net_layer_bucket_cache() releases it on demand.
+#
+# Why it exists: one session runs this pass at least twice over the same
+# extraction — once when the viewer builds its stub metadata and again inside
+# build_problem — and it is the single most expensive step in the geometry
+# pipeline (buffering every track, arc, pad and via on the board). The second
+# run is pure repetition. A single slot is enough: the two calls are
+# back-to-back on the same project, and holding only one keeps a large board's
+# polygon lists from accumulating.
+_bucket_cache_proj: ExtractedProject | None = None
+_bucket_cache_key: tuple | None = None
+_bucket_cache_value: dict | None = None
+_bucket_cache_lock = threading.Lock()
+
+
+def clear_net_layer_bucket_cache() -> None:
+    """Drop the memoised bucketing result. Call when the extraction a cached
+    entry was built from is being replaced and the memory matters."""
+    global _bucket_cache_proj, _bucket_cache_key, _bucket_cache_value
+    with _bucket_cache_lock:
+        _bucket_cache_proj = None
+        _bucket_cache_key = None
+        _bucket_cache_value = None
+
+
 def _build_net_layer_buckets(
     proj: ExtractedProject,
     enabled_layers: list[int],
     include_vias: bool = False,
+    only_nets: set[int] | None = None,
+    exclude_nets: set[int] | None = None,
 ) -> dict[tuple[int, int], list[shapely.geometry.base.BaseGeometry]]:
     """Per-(layer_id, net_index) lists of un-unioned copper primitive
     polygons — the bucketing (and buffering) half of
@@ -1532,8 +1638,62 @@ def _build_net_layer_buckets(
     separately (see :func:`build_per_net_geometry_layers_split`) can share
     this single buffering pass instead of paying for it twice.
 
+    The result is memoised on the project's identity (see
+    :func:`clear_net_layer_bucket_cache`) because a single session calls this
+    at least twice over the same extraction — the viewer's stub-metadata build
+    and ``build_problem`` — and the polygons it returns are a pure function of
+    ``(proj, enabled_layers, include_vias)``. Callers treat the returned dict
+    as read-only; they partition it into new dicts rather than mutating it.
+
+    ``only_nets`` / ``exclude_nets`` restrict the sweep to a subset of net
+    indices *before* any buffering happens. The FEM needs only the handful of
+    rails a directive touches, while the other few thousand (layer, net)
+    pairs exist purely for the viewer's "all copper" overlay — so buffering
+    every track, arc, pad and via on the board to assemble a Problem that
+    will use 0.2 % of them is the single most wasteful step in the pipeline.
+    Filtering is a pure prefilter: the result is exactly the subset of the
+    unfiltered buckets whose net passes, so a filtered and an unfiltered run
+    agree polygon-for-polygon on the buckets they share.
+
+    Only the *unfiltered* result is memoised, and a filtered request is
+    served by subsetting that memo when it is present. That keeps both wins:
+    the session's second full sweep is free, and a caller that wants just
+    the active rails never pays for the rest.
+
     ``include_vias`` — see :func:`build_net_layer_shapes`.
     """
+    global _bucket_cache_proj, _bucket_cache_key, _bucket_cache_value
+    cache_key = (tuple(enabled_layers), bool(include_vias))
+    unfiltered = only_nets is None and exclude_nets is None
+
+    def _passes(net_index: int) -> bool:
+        if only_nets is not None and net_index not in only_nets:
+            return False
+        return not (exclude_nets is not None and net_index in exclude_nets)
+
+    with _bucket_cache_lock:
+        cached = (_bucket_cache_value
+                  if (_bucket_cache_proj is proj
+                      and _bucket_cache_key == cache_key)
+                  else None)
+    if cached is not None:
+        if unfiltered:
+            log.info(
+                "Reusing cached (layer, net) buckets for %s (%d bucket(s))",
+                proj.prjpcb_path.name, len(cached),
+            )
+            return cached
+        # Subsetting the memo is far cheaper than re-buffering; the lists
+        # are shared by reference because every caller treats them as
+        # read-only (they union out of them, never mutate them).
+        subset = {k: v for k, v in cached.items() if _passes(k[1])}
+        log.info(
+            "Reusing cached (layer, net) buckets for %s (%d of %d bucket(s) "
+            "after net filter)",
+            proj.prjpcb_path.name, len(subset), len(cached),
+        )
+        return subset
+
     buckets: dict[tuple[int, int], list[shapely.geometry.base.BaseGeometry]] = {}
     enabled_set = set(enabled_layers)
     # On a negative internal-plane layer, tracks / arcs / regions / fills are
@@ -1557,15 +1717,19 @@ def _build_net_layer_buckets(
         buckets.setdefault((layer_id, net_index), []).append(geom)
 
     # Tracks: batch-buffer all valid tracks in one shapely call, then route.
-    valid_tracks = [t for t in proj.tracks if _track_is_copper(t, plane_layer_ids)]
+    valid_tracks = [t for t in proj.tracks
+                    if _passes(t.net_index)
+                    and _track_is_copper(t, plane_layer_ids)]
     track_polys = _batch_buffer_tracks(valid_tracks)
     for t, poly in zip(valid_tracks, track_polys):
         _distribute_to_layers(t.layer_id, t.net_index, poly, enabled_layers,
                               _add, plane_layer_ids)
 
-    # Arcs: same vectorised-buffer trick. Exclude polygon-pour *outline* arcs
+    # Arcs: same vectorised-buffer trick. Exclude solid-pour *outline* arcs
     # (boundary artwork, not copper) exactly as the track filter above does.
-    valid_arcs = [a for a in proj.arcs if _arc_is_copper(a, plane_layer_ids)]
+    valid_arcs = [a for a in proj.arcs
+                  if _passes(a.net_index)
+                  and _arc_is_copper(a, plane_layer_ids)]
     arc_polys = _batch_buffer_arcs(valid_arcs)
     for a, poly in zip(valid_arcs, arc_polys):
         _distribute_to_layers(a.layer_id, a.net_index, poly, enabled_layers,
@@ -1573,6 +1737,8 @@ def _build_net_layer_buckets(
 
     sbr_poly_indices = _shape_based_polygon_indices(proj)
     for r in proj.regions:
+        if not _passes(r.net_index):
+            continue
         if not _region_is_copper(r, plane_layer_ids, sbr_poly_indices):
             continue
         poly = _region_polygon(r)
@@ -1580,6 +1746,8 @@ def _build_net_layer_buckets(
                               _add, plane_layer_ids)
 
     for r in proj.shape_based_regions:
+        if not _passes(r.net_index):
+            continue
         if not _shape_based_region_is_copper(r, plane_layer_ids):
             continue
         poly = _shape_based_region_polygon(r)
@@ -1587,6 +1755,8 @@ def _build_net_layer_buckets(
                               _add, plane_layer_ids)
 
     for f in proj.fills:
+        if not _passes(f.net_index):
+            continue
         if not _fill_is_copper(f, plane_layer_ids):
             continue
         poly = _fill_polygon(f)
@@ -1595,6 +1765,8 @@ def _build_net_layer_buckets(
                                   _add, plane_layer_ids)
 
     for p in proj.pads:
+        if not _passes(p.net_index):
+            continue
         if p.is_through_hole or p.layer_id == MULTI_LAYER_PAD_LAYER_ID:
             # Through-hole / multi-layer pads sit on every enabled copper layer.
             if getattr(p, "layer_variations", ()):
@@ -1621,7 +1793,12 @@ def _build_net_layer_buckets(
     if include_vias:
         enabled_pos = {lid: i for i, lid in enumerate(enabled_layers)}
         # One vectorised buffer for all via discs, then distribute to layers.
-        for v, poly in _batch_via_polygons(proj.vias):
+        # Filtered before buffering, so a net the caller does not want never
+        # costs a via disc.
+        _vias = ([v for v in proj.vias if _passes(v.net_index)]
+                 if (only_nets is not None or exclude_nets is not None)
+                 else proj.vias)
+        for v, poly in _batch_via_polygons(_vias):
             # Span by physical stack position (not raw layer id): internal
             # planes carry ids 39-54 that fall outside a Top..Bottom id range
             # but sit physically between them, so a raw-id range would skip
@@ -1646,6 +1823,11 @@ def _build_net_layer_buckets(
         net_index = _net_index_by_name(proj, s.plane_net_name)
         if net_index == NO_NET:
             continue
+        if not _passes(net_index):
+            # Building a plane sheet subtracts every anti-pad and thermal
+            # relief on the layer, so skipping an unwanted plane's net here
+            # is the single largest saving the filter makes.
+            continue
         if _through_cache is None:
             _through_cache = _ThroughFeatureCache(proj)
         # Per-plane: pullback and net differ, so the sheet is built per layer.
@@ -1655,6 +1837,15 @@ def _build_net_layer_buckets(
 
     log.info("build_net_layer_shapes: buffered primitives into %d (layer, net) "
              "bucket(s) in %.2fs", len(buckets), time.monotonic() - _t_buckets)
+    # Memoise for the second caller in the session (see the docstring).
+    # Only the unfiltered sweep is stored — a filtered one is a subset and
+    # caching it would let a later full request be served short.
+    # Replacing the slot drops the previous project's polygons.
+    if unfiltered:
+        with _bucket_cache_lock:
+            _bucket_cache_proj = proj
+            _bucket_cache_key = cache_key
+            _bucket_cache_value = buckets
     return buckets
 
 

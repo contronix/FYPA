@@ -169,9 +169,115 @@ directive bridges those nets elsewhere on the board. Name the net that
 the pad actually sits on in the PCB netlist (see 1.8 if the pin is on
 a switching node or pre-inductor net).
 
-To override the inferred pad set (e.g. to exclude a thermal pad), use
-the `PDN_P_PINS` / `PDN_N_PINS` parameters documented in the
-[main README](../../README.md).
+To override the inferred pad set for one terminal (e.g. a single rail on
+a simple part), use `PDN_P_PINS` / `PDN_N_PINS` as documented in the
+[main README](../../README.md). For multi-rail ICs those lists are awkward
+in a SchLib because channel indices (`PDN` / `PDN1` / …) are board-specific.
+
+### Restricting which pins may join (allowlist)
+
+Enable pins hard-tied to a supply, or signal pins pulled to GND, sit on
+the same net as the power pads but should not carry load current. Prefer a
+**part-wide allowlist** in the library — independent of channel indices —
+then let net matching partition pins across rails:
+
+1. **`PDN_PINS_ONLY`** (preferred in the SchLib) — comma/whitespace list of
+   pin designators that may join any SOURCE/SINK/SERIES/REGULATOR terminal.
+   Pads not on the list are never considered, even when they sit on
+   `PDN_P_NET` / `PDN_N_NET`.
+2. **`PDN_EXTRA_PINS`** — always **unioned** into the allowlist. Typical use:
+   library sets `PDN_PINS_ONLY`, the schematic instance adds one forgotten
+   pin via `PDN_EXTRA_PINS` without retyping the list. If **only**
+   `PDN_EXTRA_PINS` is set (no `PDN_PINS_ONLY`), that list **is** the full
+   allowlist — it does *not* mean “all pads plus these”. Because that
+   silently narrows a multi-pin rail to those pins alone, FYPA warns when it
+   sees `PDN_EXTRA_PINS` with no `PDN_PINS_ONLY` on the part.
+3. **Per-terminal override** — `PDN[_n]_P_PINS` / `PDN[_n]_N_PINS` (or
+   single-net `PDN[_n]_PINS`) bypasses the allowlist for that terminal.
+4. **Exclude (fine-tuning)** — pin parameter `PDN_IGNORE` = `1` (also
+   `TRUE` / `YES` / `IGNORE`; alias name `PDN` value `IGNORE`), or
+   component `PDN_IGNORE_PINS` / `PDNn_IGNORE_PINS`, removes pins after
+   matching (including from an explicit include list). Prefer
+   `PDN_IGNORE_PINS` on the part when pin-owned parameters are not visible
+   to FYPA (unusual SchLib hierarchy); the pin-level form needs the
+   parameter's OwnerIndex to point at the pin record.
+
+`PDN_PINS_ONLY` / `PDN_EXTRA_PINS` are **unindexed** (part-wide). Indexed
+forms such as `PDN1_PINS_ONLY` are ignored with a warning.
+
+The pin filters (`PDN_PINS_ONLY`, `PDN_EXTRA_PINS`, `PDN_IGNORE_PINS`) do not
+have to sit on the same document as `PDN_ROLE`. In the Blanket / Parameter-Set
+ECO workflow the role and values end up on the PCB instance while the filters
+stay on the symbol; FYPA reads the symbol's filters for that PCB directive. A
+filter set on the PCB instance wins over the symbol's value for the same key.
+
+Example — multi-rail IC in the SchLib with power pins `1`–`4` and `EP`,
+enable pin `EN` hard-tied to `+3V3` on the board:
+
+| Name | Value |
+|------|-------|
+| `PDN_PINS_ONLY` | `1,2,3,4,EP` |
+| `PDN_ROLE` | `SINK` |
+| `PDN_I` | `500mA` |
+| `PDN_P_NET` | `+3V3` |
+| `PDN_N_NET` | `GND` |
+| `PDN1_I` | `250mA` |
+| `PDN1_P_NET` | `+1V8` |
+| `PDN1_N_NET` | `GND` |
+
+`EN` never joins the `+3V3` terminal. To pick up a forgotten sense pin on one
+board, set `PDN_EXTRA_PINS` = `SNS` on the placed part: it unions with the
+symbol's `PDN_PINS_ONLY`, giving `1,2,3,4,EP,SNS`. Setting `PDN_EXTRA_PINS`
+with no `PDN_PINS_ONLY` anywhere on the part would instead restrict the
+terminal to `SNS` alone, and is warned about.
+
+### Area-weighted multi-pin coupling
+
+By default each pin of a multi-pin terminal couples through the same
+star resistance. For parts with differently sized power pads (or a large
+QFN thermal pad on GND), open **Settings** and enable **Weight multi-pin
+coupling by pad area**. Coupling resistance then scales as
+`R ∝ 1/A`, so larger pads take a larger share of current when copper
+access is similar. Off by default.
+
+Marker hover text uses the same area weights as a quick estimate
+(`I · A_i / ΣA`). Areas come from each pin's pad outline polygon on its
+terminal layer (not a multi-layer copper volume). The FEM can still shift
+current when copper access to the pads differs — the hover value is not a
+guaranteed pin current.
+
+### Multi-connector / banana-style sources
+
+Some bench setups feed power through one connector and return through
+several others (banana jacks, sense returns, distributed ground posts).
+Annotate the SOURCE on the **host** connector that carries the value /
+role, then list the other designators on the terminal that should pull
+pads from them:
+
+| Name         | Value        |
+|--------------|--------------|
+| `PDN_ROLE`   | `SOURCE`     |
+| `PDN_V`      | `5V`         |
+| `PDN_P_NET`  | `VIN`        |
+| `PDN_N_NET`  | `GND`        |
+| `PDN_N_DES`  | `J3,J5,J7`   |
+
+Here J2 is the host (P pads stay on J2). The N terminal uses **only**
+pads on J3, J5, and J7 that sit on `GND` — the host is not
+auto-included. `PDN_P_DES` works the same way on the P side. Optional
+`PDN_P_PINS` / `PDN_N_PINS` still filter pad numbers across the listed
+parts — they narrow the net match rather than replace it, so a pin
+number that exists on a listed part but sits on another net is reported
+as an error instead of quietly moving the terminal onto that net.
+Indexed channels use `PDNn_P_DES` / `PDNn_N_DES`. Without `*_DES`,
+behaviour is unchanged (host pads only).
+
+`*_DES` cannot be used on a **multi-channel** part (one schematic
+component Altium places several times). A designator list has no
+per-channel form, so every placement would resolve the same return pads
+and each channel would drive the identical node; this is refused with an
+error rather than silently multiplying the injected current. Annotate
+each channel's connector on its own component instead.
 
 ### Several rails on one part (multi-channel)
 
@@ -191,11 +297,40 @@ value and its own P/N nets:
 |             |         | `PDN2_N_NET` | `GND`  |
 
 Each channel becomes its own directive; the viewer labels them `U7`,
-`U7#1`, `U7#2`. A channel exists as soon as its value parameter
-(`PDN<n>_I` here) is set. Indices can be sparse (gaps allowed). The same
-scheme works for every role — use `PDN<n>_V` for sources/regulators,
-`PDN<n>_R` for series parts. See the [main README](../../README.md#multi-channel-directives)
-for the full reference.
+`U7#1`, `U7#2`. A channel exists when its value parameter (`PDN<n>_I`
+here) or a channel-defining terminal param is set; the value may be
+inherited from the unindexed template (`PDN_I` when `PDN1_I` is omitted).
+Indices can be sparse (gaps allowed). The same scheme works for every
+role — use `PDN<n>_V` for sources/regulators, `PDN<n>_R` for series parts.
+See the [main README](../../README.md#multi-channel-directives) for the
+full reference.
+
+When indexed channels exist, the unindexed form stays a directive only if
+it is a channel in its own right: its **own** `PDN_I` (or `PDN_V`) *and* a
+complete terminal pair (`PDN_P_NET` **and** `PDN_N_NET`, or single-net
+`PDN_NET`). Otherwise its parameters are template-only — FYPA does not also
+emit a legacy directive. A shared return such as `PDN_N_NET = GND` alone is
+a template, and so is a complete `PDN_P_NET` + `PDN_N_NET` pair whose
+currents live on `PDN1_I` / `PDN2_I`. Keep a full unindexed value **and**
+terminal pair if you want both a legacy channel and indexed ones (as in the
+table above).
+
+> Unindexed `PDN_NET` / `PDN_PINS` plus its own value counts as a complete
+> single-net channel, so that legacy directive is kept — there is no
+> "shared `PDN_NET` template only" mode. Indexed channels beside it are
+> free to use either terminal form: the two forms are mutually exclusive
+> per channel, so a `PDN1_P_NET` / `PDN1_N_NET` channel never inherits the
+> shared `PDN_NET`.
+
+Inheritance follows the part-wide `PDN_ROLE`. A channel that overrides it
+with `PDN<n>_ROLE` reads nothing from the unindexed template — a SERIES
+channel on a SINK part has to name its own nets rather than silently
+borrowing the sink's. Modifiers like `PDN1_MIN_V` tune a channel that
+already exists; they never create one on their own.
+
+Parts that use only `PDNn_ROLE` (no part-wide `PDN_ROLE`) may still put
+shared values on unindexed `PDN_R` / `PDN_V` / `PDN_I`; those stay
+templates for the indexed channels.
 
 > You only need channels for **different** rails. An IC with many pins on
 > the *same* rail is still one directive — FYPA already groups every pad
@@ -283,6 +418,12 @@ placing them on every symbol:
 4. Launch FYPA — it reads the `PDN_*` values from the **PCB component
    parameters** (not from the blanket graphic itself).
 
+A SchLib symbol may already carry part-wide pin filters such as
+`PDN_PINS_ONLY` without a `PDN_ROLE`. That is normal: after ECO the role
+and values live on the PCB instance, and FYPA does not warn about the
+symbol-side pin filter alone. If the PCB still has no role (ECO not
+applied), FYPA logs an informational note so the missing sync is visible.
+
 ### Local net names (hierarchical / reused sheets)
 
 `PDN_P_NET`, `PDN_N_NET`, and `PDN_NET` may use the **local net name
@@ -328,11 +469,87 @@ The same parameters on every instance; FYPA resolves `VCC_EFUSE` to
 `resolved local net 'VCC_EFUSE' via schematic pins ['2'] → PCB net(s) VCC_EFUSE.4`
 is expected and not an error.
 
+#### Per-instance overrides on sheet symbols
+
+When the **same** child sheet is placed more than once and you need a
+**different** current (or voltage / resistance) per placement, put the
+shared role and nets on the child component and override the value on
+each **sheet symbol**:
+
+On `Port.SchDoc`, component `J1`:
+
+| Parameter    | Value   |
+|--------------|---------|
+| `PDN_ROLE`   | `SINK`  |
+| `PDN_I`      | `500mA` |
+| `PDN_P_NET`  | `VBUS`  |
+| `PDN_N_NET`  | `GND`   |
+
+(`PDN_I` on the child is an optional default; each sheet symbol may
+override it.)
+
+On the parent sheet, sheet symbol `CON-A` (file `Port.SchDoc`):
+
+| Parameter   | Value |
+|-------------|-------|
+| `PDN_J1_I`  | `1.5A` |
+
+On sheet symbol `CON-B`:
+
+| Parameter   | Value |
+|-------------|-------|
+| `PDN_J1_I`  | `3A`   |
+
+FYPA binds each override to the PCB instance whose `SOURCEUNIQUEID` path
+contains that sheet symbol's UniqueID (`J1.1`, `J1.2`, …). When
+`SOURCEUNIQUEID` is empty, FYPA falls back to matching sheet-symbol names
+against `SOURCEHIERARCHICALPATH` segments. Only segments that equal a sheet
+symbol name are considered; a leading name is kept when it parents a deeper
+matched symbol (nested sheets), otherwise a root-like leading collision is
+ignored (e.g. a symbol named `main` under path `main\CON-A`). If several
+symbols share a matched name, only one is used (sorted by UniqueID) and a
+warning is emitted — prefer UniqueID binding or unique sheet-symbol names.
+Deeper symbols in a nested UniqueID hierarchy win when both set the same key.
+
+| Form | Meaning |
+|------|---------|
+| `PDN_<Des>_<Key>` | Override for logical designator (e.g. `PDN_J1_I`) |
+| `PDN_<Des>_<n>_<Key>` | Override for indexed PDN channel `n` on that part |
+| `PDN_<Des>_<Key>.N` | REPEAT slot `N` when one sheet symbol expands to several channels |
+
+`<Key>` is any normal PDN suffix (`I`, `V`, `R`, `ROLE`, `P_NET`, …). The
+designator segment must contain a digit (`J1`, `U12`, `U12A`) so ordinary
+keys like `PDN_P_NET` are not misread as overrides.
+
+You can also place a **full** directive on the sheet symbol alone
+(`PDN_J1_ROLE`, `PDN_J1_I`, nets) with no `PDN_*` on the child component.
+A sheet-symbol `PDN_<Des>_ROLE` may also override the child's role for
+that placement only.
+
+Sheet overrides also apply when the shared `PDN_*` parameters live only on
+the **PCB** (Blanket / ECO) and the per-instance value is on the sheet
+symbol — e.g. PCB has `PDN_ROLE=REGULATOR` and nets, sheet symbol has
+`PDN_U1_V=5V`. FYPA merges those into one directive per placement (it does
+not create a second source when both PCB-ECO and a full sheet-symbol
+directive target the same instance). Different `PDN_<Des>_V` values on
+repeated regulator sheets also feed SMPS Vin inference under the
+instance-expanded output nets (see [Section 4](04-regulators.md)).
+
+A *partial coverage* warning (`PDN covers … (sheet symbol) … but not …`)
+is issued only when FYPA synthesises at least one full sheet-symbol-only
+directive and another placement of the same designator still has neither
+PCB-ECO/`PDN_ROLE` nor a complete sheet-symbol directive. Covered
+placements are labelled `(sheet symbol)` or `(PCB-ECO)` in the message.
+Value-only overrides on an ECO'd placement do not trigger that warning for
+bare siblings.
+
 #### PCB-only parameters (Blanket / ECO)
 
 When `PDN_*` parameters are pushed to the PCB only (Blanket rule or ECO),
 FYPA infers the originating schematic sheet from pad ↔ netlist
 connectivity so local-net resolution stays scoped to that instance.
+Combine with sheet-symbol `PDN_<Des>_*` overrides as above when values
+must differ per placement.
 
 #### Troubleshooting local nets
 
@@ -342,6 +559,8 @@ connectivity so local-net resolution stays scoped to that instance.
 | Same message, project compiles | Wrong local label or wrong sheet | Check the net label on the child sheet matches `PDN_*_NET` exactly |
 | `component … has no pad on net FOO` | Slot-qualified name on the wrong instance (e.g. `FOO.3` on channel 1) | Use the local name `FOO` instead of a channel suffix |
 | `resolved local net … via schematic pins` (warning) | Normal for repeated sheets | No action needed — mapping succeeded |
+| `P and N terminals both resolve to pin(s) …` | Compiled netlist aliases the same local label onto both sides of a SERIES part | Set `PDN_P_PINS` / `PDN_N_PINS` to the **pad designators** the message lists (`1`, `2` — not `R5:1`), identical on every channel instance. An explicit pin list outranks a net-name match, so naming one side is enough. Channel-qualified PCB net names also work. |
+| P-terminal resolves to both PCB nets of a two-pin SERIES | Shared bare alias across hierarchy levels (netlist lists the local label on both nets) | Prefer local labels that FYPA can rank by channel token (`VIN` vs `VIN_L`); if the warning persists, add pin overrides |
 
 > If resolution still fails, verify that the component's schematic
 > designator matches the PCB `source_designator` and that the project

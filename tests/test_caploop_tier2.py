@@ -9,8 +9,6 @@ and disconnected cavity islands.
 """
 from __future__ import annotations
 
-import math
-
 import numpy as np
 import pytest
 import shapely.geometry
@@ -21,7 +19,6 @@ from fypa.caploop.constants import MU0_H_PER_MM
 from fypa.caploop.tier1 import spreading_closed_form_h
 from fypa.caploop.tier2_fem import (
     Tier2Error,
-    _Port,
     _make_port,
     build_cavity_problem,
     build_cavity_sheet,
@@ -146,20 +143,32 @@ def test_isolated_cavity_island_yields_nan_row():
 # --- mesh reuse ---------------------------------------------------------------------
 
 
-def test_value_only_resolve_reuses_mesh_assembly(caplog):
-    """Solves 2…N of a cavity differ only in source magnitudes, so the mesh
-    + Laplacian assembly cache must hit — that is what makes an N-cap cavity
-    affordable."""
+def test_cavity_is_meshed_and_solved_once_for_all_ports(caplog):
+    """An N-cap cavity must cost one mesh and one factorisation, not N.
+
+    Ports differ only in which entry of the current vector is driven, so the
+    whole port matrix comes out of a single assembly solved with N
+    right-hand sides. This used to be N separate solves leaning on
+    pdnsolver's mesh-assembly cache; asserting the stronger invariant
+    directly means the test still fails if the per-port loop ever returns.
+    """
     import logging
     sheet = _solid_cavity(size=20.0)
     caps, ic = _ports(sheet, cap_xys=((-SEP / 2, 0.0), (0.0, 6.0)))
+    assert len(caps) >= 2, "need several ports for this to mean anything"
     with caplog.at_level(logging.INFO, logger="pdnsolver.solver"):
         solve_cavity_matrix(sheet, caps, ic,
                             _mesh.Mesher.Config(maximum_size=1.5,
                                                 minimum_angle=25))
-    reuses = sum(1 for r in caplog.records
-                 if "value-only re-solve" in r.getMessage())
-    assert reuses >= 1
+    messages = [r.getMessage() for r in caplog.records]
+    meshings = sum(1 for m in messages
+                   if "Meshing the connected components" in m)
+    solves = sum(1 for m in messages if "Solving the linear system" in m)
+    assert meshings == 1, f"cavity meshed {meshings} times, expected 1"
+    assert solves == 1, (
+        f"{solves} linear solves for {len(caps)} ports — expected 1 "
+        f"(the per-port loop appears to have come back)"
+    )
 
 
 # --- problem construction -------------------------------------------------------------
@@ -324,7 +333,7 @@ def test_a_cap_on_the_targets_own_via_reports_zero_with_a_reason():
     from fypa.caploop.identify import identify_capacitors
     from fypa.caploop.tier2_fem import run_tier2
     from tests.test_caploop_identify import (
-        GND, PWR, RAILS, _directives, _pad, _standard_cap_project, _via,
+        GND, PWR, RAILS, _directives, _pad, _standard_cap_project,
     )
 
     # The sink's pins sit on the capacitor's own escape vias.

@@ -19,9 +19,12 @@ import logging
 import math
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+import shapely
 import shapely.geometry
 import shapely.strtree
 
@@ -143,6 +146,12 @@ COUPLING_RESISTANCE_OHM: float = 100.0e-3
 # the coupling to equalise — at any value).
 SOURCE_COUPLING_RESISTANCE_OHM: float = 1.0e-6
 
+# When True, multi-pin star coupling resistances are scaled inversely with
+# each pin's pad area (R_i = R_base * A_mean / A_i) so larger pads take a
+# larger share of terminal current when copper potentials are similar.
+# Off by default — equal R per pin matches historical behaviour.
+AREA_WEIGHTED_PIN_COUPLING: bool = False
+
 
 log = logging.getLogger(__name__)
 
@@ -192,6 +201,8 @@ class SolveSettings:
     # Conductive-fill override: "auto" (per-via from Altium IPC-4761 data),
     # "all" (force every via filled), or "none" (force none filled).
     conductive_fill_mode: str = CONDUCTIVE_FILL_MODE
+    # Scale multi-pin star coupling R inversely with pad area.
+    area_weighted_pin_coupling: bool = AREA_WEIGHTED_PIN_COUPLING
     # Meshing
     mesh_min_angle_deg: float = 20.0
     mesh_max_size_mm: float = 0.6
@@ -199,6 +210,33 @@ class SolveSettings:
     # coarse in plane interiors. Off by default — it helps boards with
     # large quiet copper but gives little benefit on via-stitched planes.
     adaptive_mesh: bool = False
+    # --- Coupled electro-thermal solve ---------------------------------
+    # Off by default: with it off the solve is bit-identical to an
+    # isothermal run. On, the solver iterates self-heating (copper gets
+    # hotter, so more resistive, so it drops more and heats further) using
+    # a local lumped cooling model — see pdnsolver.solver.ThermalConfig for
+    # exactly what is and is not modelled.
+    electrothermal: bool = False
+    # Combined both-faces heat transfer coefficient, W/(m²·K). ~20 is a bare
+    # board in still air; 50-100 with forced air or a chassis heatsink.
+    heat_transfer_w_per_m2k: float = 20.0
+    electrothermal_max_iterations: int = 8
+    electrothermal_tolerance_c: float = 0.25
+
+    def thermal_config(self):
+        """Build the solver's :class:`~pdnsolver.solver.ThermalConfig` from
+        these settings, reusing the same ambient temperature and copper
+        temperature coefficient the isothermal conductance already uses so
+        the two models never disagree."""
+        from pdnsolver.solver import ThermalConfig
+        return ThermalConfig(
+            enabled=bool(self.electrothermal),
+            ambient_c=float(self.temperature_c),
+            heat_transfer_w_per_m2k=float(self.heat_transfer_w_per_m2k),
+            alpha_per_c=float(self.copper_temp_coefficient_per_c),
+            max_iterations=int(self.electrothermal_max_iterations),
+            tolerance_c=float(self.electrothermal_tolerance_c),
+        )
 
     @property
     def copper_conductivity_s_per_mm(self) -> float:
@@ -234,6 +272,9 @@ class SolveSettings:
             self.conductive_fill_resistivity_ohm_mm
         )
         globals()["CONDUCTIVE_FILL_MODE"] = self.conductive_fill_mode
+        globals()["AREA_WEIGHTED_PIN_COUPLING"] = bool(
+            self.area_weighted_pin_coupling
+        )
 
     @classmethod
     def from_metadata(cls, metadata: dict | None) -> SolveSettings:
@@ -271,6 +312,10 @@ class SolveSettings:
         mode = phys.get("conductive_fill_mode")
         if isinstance(mode, str) and mode in ("auto", "all", "none"):
             s.conductive_fill_mode = mode
+        if "area_weighted_pin_coupling" in phys:
+            s.area_weighted_pin_coupling = bool(
+                phys["area_weighted_pin_coupling"]
+            )
         if "temperature_c" in phys:
             s.temperature_c = float(phys["temperature_c"])
         if "copper_temp_coefficient_per_c" in phys:
@@ -284,6 +329,15 @@ class SolveSettings:
             s.mesh_max_size_mm = float(mesher["maximum_size_mm"])
         if "adaptive_mesh" in mesher:
             s.adaptive_mesh = bool(mesher["adaptive_mesh"])
+        thermal = metadata.get("thermal_config") or {}
+        if "enabled" in thermal:
+            s.electrothermal = bool(thermal["enabled"])
+        if "heat_transfer_w_per_m2k" in thermal:
+            s.heat_transfer_w_per_m2k = float(thermal["heat_transfer_w_per_m2k"])
+        if "max_iterations" in thermal:
+            s.electrothermal_max_iterations = int(thermal["max_iterations"])
+        if "tolerance_c" in thermal:
+            s.electrothermal_tolerance_c = float(thermal["tolerance_c"])
         return s
 
 
@@ -308,6 +362,7 @@ class LoadedProject:
         annotations: AnnotationResult,
         geometry: list[GeometryLayer] | None = None,
         absorbed_bridges: list[_AbsorbedBridge] | None = None,
+        merged_net_names: frozenset[str] | None = None,
     ) -> None:
         self.extracted = extracted
         self.annotations = annotations
@@ -316,6 +371,12 @@ class LoadedProject:
         # locations so the FEM keeps the physical connection between the
         # two formerly-separate-net copper islands.
         self.absorbed_bridges: list[_AbsorbedBridge] = absorbed_bridges or []
+        # Names of nets the low-Ω merge folded away. ``_apply_net_remap``
+        # deliberately leaves ``extracted.nets`` intact so annotations keep
+        # resolving under either name, so these entries survive there while
+        # owning no copper — anything reasoning about "nets that exist" (the
+        # rail list's alias folding, say) has to subtract them.
+        self.merged_net_names: frozenset[str] = merged_net_names or frozenset()
         if geometry is not None:
             # Seed the cached_property's slot so the lazy compute is skipped.
             # Used by altium_viewer._apply_stackup_overrides, which already
@@ -409,6 +470,10 @@ class LoadedProject:
             lines.append(f"  Warnings ({len(self.annotations.warnings)}):")
             for w in self.annotations.warnings:
                 lines.append(f"    ! {w}")
+        if self.annotations.infos:
+            lines.append(f"  Infos ({len(self.annotations.infos)}):")
+            for i in self.annotations.infos:
+                lines.append(f"    i {i}")
         if self.annotations.errors:
             lines.append(f"  Errors ({len(self.annotations.errors)}):")
             for e in self.annotations.errors:
@@ -509,8 +574,12 @@ def clone_loaded_for_edit(loaded: LoadedProject) -> LoadedProject:
     new_annotations.directives = list(loaded.annotations.directives)
     new_annotations.warnings = list(loaded.annotations.warnings)
     new_annotations.errors = list(loaded.annotations.errors)
+    new_annotations.infos = list(getattr(loaded.annotations, "infos", []))
     new_annotations.open_loop_rails = list(
         getattr(loaded.annotations, "open_loop_rails", [])
+    )
+    new_annotations.unannotated_bridges = list(
+        getattr(loaded.annotations, "unannotated_bridges", [])
     )
     new_annotations.connectivity_breaks = list(
         getattr(loaded.annotations, "connectivity_breaks", [])
@@ -551,6 +620,49 @@ def _collect_active_nets(directives, extracted: ExtractedProject) -> set[int]:
     return active
 
 
+def _pin_coupling_resistances(
+    areas_mm2: list[float],
+    r_base: float,
+    *,
+    area_weighted: bool | None = None,
+) -> list[float]:
+    """Per-pin star coupling resistances for a multi-pin terminal.
+
+    When ``area_weighted`` is False (default module flag), every pin gets
+    ``r_base``. When True, ``R_i = r_base * A_mean / A_i`` so conductance
+    scales with pad area. Degenerate / missing areas are replaced by the
+    mean of the valid areas in the terminal; if none are valid, every pin
+    keeps ``r_base`` (equal share).
+    """
+    if area_weighted is None:
+        area_weighted = AREA_WEIGHTED_PIN_COUPLING
+    n = len(areas_mm2)
+    if n == 0:
+        return []
+    if not area_weighted or n == 1:
+        return [float(r_base)] * n
+
+    valid = [a for a in areas_mm2 if a is not None and a > 0.0]
+    if not valid:
+        return [float(r_base)] * n
+    a_mean = sum(valid) / len(valid)
+    out: list[float] = []
+    for a in areas_mm2:
+        ai = a if (a is not None and a > 0.0) else a_mean
+        out.append(float(r_base) * (a_mean / ai))
+    return out
+
+
+def _pin_area_mm2(pin: TerminalPin) -> float:
+    poly = pin.pad_polygon
+    if poly is None or getattr(poly, "is_empty", False):
+        return 0.0
+    try:
+        return float(poly.area)
+    except Exception:
+        return 0.0
+
+
 def _terminal_connections(
     term: TerminalSpec,
     main_node: _pp.NodeID,
@@ -575,6 +687,10 @@ def _terminal_connections(
     :data:`SOURCE_COUPLING_RESISTANCE_OHM` for VOLTAGE-forcing terminals so
     high-current sources don't see a ~1 V drop per pin to their virtual
     hub.
+
+    When :data:`AREA_WEIGHTED_PIN_COUPLING` is on, each star resistor is
+    scaled inversely with that pin's pad area (see
+    :func:`_pin_coupling_resistances`).
 
     Pins whose ``(layer, net)`` pair has no padne Layer (e.g. internal planes
     pending implementation, or a net with no extracted copper on that layer)
@@ -602,9 +718,20 @@ def _terminal_connections(
             region=pin.pad_polygon,
         )], []
 
+    # Areas are only consulted when weighting is on; on the default path
+    # _pin_coupling_resistances discards them immediately, so computing a
+    # shapely polygon area per pin of every multi-pin terminal is pure waste.
+    area_weighted = AREA_WEIGHTED_PIN_COUPLING
+    areas = (
+        [_pin_area_mm2(pin) for _layer, pin in valid]
+        if area_weighted else [0.0] * len(valid)
+    )
+    resistances = _pin_coupling_resistances(
+        areas, coupling_resistance_ohm, area_weighted=area_weighted,
+    )
     conns: list[_pp.Connection] = []
     aux: list[_pp.BaseLumped] = []
-    for layer, pin in valid:
+    for (layer, pin), r_pin in zip(valid, resistances):
         pin_node = _pp.NodeID()
         conns.append(_pp.Connection(
             layer=layer,
@@ -613,9 +740,36 @@ def _terminal_connections(
             region=pin.pad_polygon,
         ))
         aux.append(_pp.Resistor(
-            a=pin_node, b=main_node, resistance=coupling_resistance_ohm,
+            a=pin_node, b=main_node, resistance=r_pin,
         ))
     return conns, aux
+
+
+def _sink_pin_coupling(d) -> float:
+    """Star coupling resistance for a sink's pins, in ohms.
+
+    Defaults to the global :data:`COUPLING_RESISTANCE_OHM`, which stands in
+    for the package's internal pin-to-pin resistance. That is a property of
+    the *part* — a BGA's on-die supply grid and a TO-220's leadframe are
+    nothing alike — so ``PDN_PIN_R`` on the schematic symbol overrides it
+    per part. Left unset, behaviour is unchanged.
+    """
+    override = getattr(d, "pin_coupling_ohm", None)
+    if override is None:
+        return COUPLING_RESISTANCE_OHM
+    try:
+        value = float(override)
+    except (TypeError, ValueError):
+        return COUPLING_RESISTANCE_OHM
+    if value <= 0.0:
+        # A zero/negative coupling would short every pin of the terminal
+        # together through an ideal wire and divide by zero in the stamp.
+        log.warning(
+            "%s: PDN_PIN_R=%s is not positive — using the default %.4g Ω.",
+            getattr(d, "designator", "?"), override, COUPLING_RESISTANCE_OHM,
+        )
+        return COUPLING_RESISTANCE_OHM
+    return value
 
 
 def _directive_to_network(
@@ -731,14 +885,14 @@ def _directive_to_network(
             node_t = _return_ref(return_ref_nodes, d.return_group)
             element = _pp.CurrentSource(f=node_f, t=node_t, current=d.current)
             conns, aux = _gather(
-                (d.p, node_f, COUPLING_RESISTANCE_OHM, "P"),
+                (d.p, node_f, _sink_pin_coupling(d), "P"),
             )
         else:
             node_t = _pp.NodeID()
             element = _pp.CurrentSource(f=node_f, t=node_t, current=d.current)
             conns, aux = _gather(
-                (d.p, node_f, COUPLING_RESISTANCE_OHM, "P"),
-                (d.n, node_t, COUPLING_RESISTANCE_OHM, "N"),
+                (d.p, node_f, _sink_pin_coupling(d), "P"),
+                (d.n, node_t, _sink_pin_coupling(d), "N"),
             )
     elif isinstance(d, ResistorSpec):
         node_a, node_b = _pp.NodeID(), _pp.NodeID()
@@ -856,7 +1010,10 @@ def _barrel_segment_resistance_ohm(
 
     Falls back to :data:`FALLBACK_VIA_RESISTANCE_OHM` when geometry is missing
     or degenerate, so a missing drill size never produces a divide-by-zero or
-    an unrealistic 0 Ω short.
+    an unrealistic 0 Ω short. Each fallback is counted and reported by
+    :func:`_coupling_networks` at INFO — a silently substituted 1 mΩ on a
+    high-current via is exactly the kind of error a user cannot spot in the
+    result.
     """
     if drill_diameter_mm <= 0.0 or hop_length_mm <= 0.0:
         return FALLBACK_VIA_RESISTANCE_OHM
@@ -1048,32 +1205,67 @@ def _coupling_networks(
     if conductive_fill_mode is None:
         conductive_fill_mode = CONDUCTIVE_FILL_MODE
     networks: list[_pp.Network] = []
+    # Sites bucketed by net — the unit the coverage batch works over.
+    _sites_by_net: dict[int, list] = {}
+    for _st in sites:
+        if _st.net_index != NO_NET:
+            _sites_by_net.setdefault(_st.net_index, []).append(_st)
+
     segment_records: list[dict] = []
     skipped_unknown_net = 0
+    # Hops that fell back to the fixed resistance instead of the
+    # physical barrel model — reported at INFO below.
+    fallback_hops = 0
+    fallback_no_drill = 0
+    fallback_no_z = 0
     skipped_missing_layer = 0
     skipped_xy_outside_copper = 0
 
-    # Prepare each (layer, net) copper shape once and reuse it. Every via/PTH on
-    # a net probes the same handful of (layer, net) MultiPolygons with `covers`;
-    # unprepared that is O(boundary_vertices) each (a GND sheet has 10⁴–10⁵), so
-    # on a stitched board (10⁴+ vias × several layers) it was ~10⁶ un-indexed
-    # point-in-polygon calls. A PreparedGeometry builds an edge RTree once, so
-    # each covers drops to O(log n). Same predicate → identical result.
-    import shapely.prepared
-    _prep_covers: dict[tuple[int, int], object] = {}
+    # Coverage test, batched per (layer, net). Every via/PTH on a net probes
+    # the same handful of (layer, net) MultiPolygons with `covers`; done one
+    # point at a time that is 10⁵–10⁶ Python→GEOS round trips on a stitched
+    # board, even with a prepared geometry making each one O(log n).
+    #
+    # Instead, the first probe against a (layer, net) tests EVERY site on that
+    # net at once with a single vectorised ``shapely.covers`` call, and the
+    # result is memoised as a boolean array. ``covers`` is the same predicate
+    # as before — boundary included, which matters because a via whose centre
+    # sits exactly on the edge of a pad must still count — so the answer is
+    # identical, just computed in one C pass instead of thousands.
+    _site_index_by_net: dict[int, dict[int, int]] = {}
+    _site_points_by_net: dict[int, np.ndarray] = {}
+    for _net, _members in _sites_by_net.items():
+        _site_index_by_net[_net] = {id(st): i for i, st in enumerate(_members)}
+        _site_points_by_net[_net] = shapely.points(
+            np.fromiter((st.x_mm for st in _members), dtype=np.float64,
+                        count=len(_members)),
+            np.fromiter((st.y_mm for st in _members), dtype=np.float64,
+                        count=len(_members)),
+        )
 
-    def _covers(key: tuple[int, int], layer, pt) -> bool:
-        prep = _prep_covers.get(key)
-        if prep is None:
-            prep = shapely.prepared.prep(layer.shape)
-            _prep_covers[key] = prep
-        return prep.covers(pt)
+    _covers_cache: dict[tuple[int, int], np.ndarray] = {}
+
+    def _covers(key: tuple[int, int], layer, site) -> bool:
+        hits = _covers_cache.get(key)
+        if hits is None:
+            pts = _site_points_by_net.get(key[1])
+            if pts is None or pts.size == 0:
+                hits = np.zeros(0, dtype=bool)
+            else:
+                hits = np.asarray(
+                    shapely.covers(layer.shape, pts), dtype=bool,
+                )
+            _covers_cache[key] = hits
+        pos = _site_index_by_net[key[1]].get(id(site))
+        return bool(hits[pos]) if pos is not None else False
 
     for site in sites:
         if site.net_index == NO_NET:
             skipped_unknown_net += 1
             continue
         pt = shapely.geometry.Point(site.x_mm, site.y_mm)
+        # ``pt`` is still needed below for the Connection geometry; the
+        # coverage test itself goes through the batched path.
         # Only chain the via through layers where the net's copper
         # actually covers the via's (x, y). Checking "net has copper
         # SOMEWHERE on this layer" isn't enough: a through-hole via
@@ -1090,7 +1282,7 @@ def _coupling_networks(
             lid for lid in site.span
             if (L := layer_by_layer_and_net.get((lid, site.net_index))) is not None
             and not L.shape.is_empty
-            and _covers((lid, site.net_index), L, pt)
+            and _covers((lid, site.net_index), L, site)
         ]
         if len(layers_for_net) < 2:
             # Either the net has copper on <2 layers in the span at
@@ -1126,6 +1318,12 @@ def _coupling_networks(
                 site.drill_diameter_mm, hop_length_mm, plating_thickness_mm,
                 conductive_fill_resistivity_ohm_mm=fill_rho,
             )
+            if r_hop == FALLBACK_VIA_RESISTANCE_OHM:
+                fallback_hops += 1
+                if site.drill_diameter_mm <= 0.0:
+                    fallback_no_drill += 1
+                elif hop_length_mm <= 0.0:
+                    fallback_no_z += 1
             node_a, node_b = _pp.NodeID(), _pp.NodeID()
             element = _pp.Resistor(a=node_a, b=node_b, resistance=r_hop)
             conns = [
@@ -1145,6 +1343,23 @@ def _coupling_networks(
                 "is_conductive_fill": is_conductive_fill,
             })
 
+    if fallback_hops:
+        # INFO, not DEBUG: a substituted fixed resistance on a high-current via
+        # silently changes the answer, and the user has no way to spot it in
+        # the result. The Vias tab shows the same value per hop.
+        detail = []
+        if fallback_no_drill:
+            detail.append(f"{fallback_no_drill} with no drill size")
+        if fallback_no_z:
+            detail.append(f"{fallback_no_z} with no stackup z-data")
+        log.info(
+            "Used the fallback via resistance (%.4g Ω) on %d via hop(s)%s. "
+            "These hops are NOT physically modelled — set the drill size in "
+            "Altium, or the layer thicknesses in Settings > Stackup, for a "
+            "correct barrel resistance.",
+            FALLBACK_VIA_RESISTANCE_OHM, fallback_hops,
+            f" ({', '.join(detail)})" if detail else "",
+        )
     if skipped_unknown_net:
         log.debug("Skipped %d via/TH-pad coupling site(s) with no net assignment.",
                   skipped_unknown_net)
@@ -1591,30 +1806,72 @@ def _gil_yield(i: int, every: int = 4096) -> None:
         time.sleep(0.001)
 
 
-def build_net_canonical_map(netlist) -> dict[str, str]:
+def build_net_canonical_map(
+    netlist,
+    *,
+    pcb_net_names: set[str] | frozenset[str] | None = None,
+) -> dict[str, str]:
     """Map every schematic net label (``Net.name`` or alias) to ``Net.name``.
 
     Altium's compiled netlist stores the top-level / flattened name in
     ``Net.name`` and local or cross-sheet labels in ``aliases``. The viewer
     uses this map so rail lists show the canonical name rather than a local
     sheet label from ``PDN_*_NET``.
+
+    An alias is **not** mapped when another netlist entry (or, when provided,
+    a distinct PCB net) already owns that label as its primary name. The
+    schematic netlist compiler can emit spurious aliases in multi-sheet
+    designs — e.g. two regulator outputs that only meet again at a multi-rail
+    sink may appear as ``Net(name='VDD_1V25A', aliases=['VDD_1V25D'])`` while
+    ``Net(name='VDD_1V25D')`` also exists. Folding that alias would hide one
+    rail and mis-attribute copper even though the nets were never merged.
+
+    ``pcb_net_names`` must therefore list only nets that still own copper.
+    :func:`_apply_net_remap` leaves ``proj.nets`` untouched, so a merged-away
+    name is still in there and would block a legitimate alias from folding —
+    callers pass the merged names in ``LoadedProject.merged_net_names`` and
+    exclude them.
     """
     if netlist is None:
         return {}
+    nets = list(getattr(netlist, "nets", ()) or ())
+    primary_upper = {
+        net.name.upper()
+        for net in nets
+        if getattr(net, "name", None)
+    }
+    pcb_upper = {n.upper() for n in (pcb_net_names or ()) if n}
     out: dict[str, str] = {}
-    for net in getattr(netlist, "nets", ()) or ():
-        canonical = net.name
+    for net in nets:
+        canonical = getattr(net, "name", None)
+        if not canonical:
+            # Same possibility the ``primary_upper`` guard above allows for:
+            # a netlist entry with no usable name contributes nothing.
+            continue
+        canon_upper = canonical.upper()
         for label in (canonical, *getattr(net, "aliases", ())):
-            if label:
-                out[label.upper()] = canonical
+            if not label:
+                continue
+            key = label.upper()
+            if key != canon_upper and (
+                key in primary_upper or key in pcb_upper
+            ):
+                continue
+            out[key] = canonical
     return out
 
 
 # --- adaptive SMPS regulator gain (optional fixed-point iteration) ------------
 
-_ADAPTIVE_GAIN_MAX_ITERATIONS: int = 8
+_ADAPTIVE_GAIN_MAX_ITERATIONS: int = 12
 _ADAPTIVE_GAIN_REL_TOL: float = 1e-3
 _ADAPTIVE_GAIN_VIN_FLOOR_V: float = 0.1
+# Blend toward the measured-Vin target gain once oscillation is detected
+# (1 = full step). Values < 1 stabilise coupled SMPS rails that share a SERIES
+# upstream path, at the cost of extra solves — so damping is switched on by an
+# observed sign-alternating residual, never by the mere presence of several
+# regulators, which are usually independent and converge in one full step.
+_ADAPTIVE_GAIN_BLEND: float = 0.65
 
 
 def has_adaptive_smps_regulators(loaded: LoadedProject) -> bool:
@@ -1719,15 +1976,89 @@ def _replace_regulator_gains(
     loaded.annotations.directives = updated
 
 
+def _retune_problem_regulator_gains(problem, loaded) -> bool:
+    """Push the current ``RegulatorSpec`` gains into an already-built
+    :class:`Problem`, in place. Returns ``True`` on success.
+
+    Why this exists: the adaptive-SMPS-gain loop changes nothing but the
+    regulators' ``gain`` between iterations. Rebuilding the whole Problem to
+    carry that one float re-runs the entire geometry pipeline — copper
+    buffering, per-net unions, meshing inputs, via coupling — which is by far
+    the most expensive part of a solve and is bit-for-bit identical every
+    time. Up to 12 iterations of that is minutes of wasted work.
+
+    ``VoltageRegulator`` is a frozen dataclass, so the element is swapped for
+    a :func:`dataclasses.replace` copy carrying the new gain. That is safe:
+    the copy keeps the *same* ``NodeID`` objects, so every ``Connection``
+    still resolves, and ``Network``'s derived ``nodes`` / ``has_source``
+    depend only on the terminals and ``is_source``, neither of which moves.
+
+    Pairing is positional — :func:`build_problem` emits one
+    ``VoltageRegulator`` per ``RegulatorSpec`` in directive order — but that
+    is only assumed, never trusted: the element's ``voltage`` must also match
+    its spec's. On any count or voltage mismatch this returns ``False`` and
+    the caller falls back to a full rebuild, so a future change to how
+    regulators are stamped can cost performance but cannot produce a wrong
+    answer.
+    """
+    from dataclasses import replace as _dc_replace
+
+    specs = [d for d in loaded.annotations.directives
+             if isinstance(d, RegulatorSpec)]
+    if not specs:
+        return False
+
+    sites: list[tuple[object, int, _pp.VoltageRegulator]] = []
+    for net in problem.networks:
+        for i, elem in enumerate(net.elements):
+            if isinstance(elem, _pp.VoltageRegulator):
+                sites.append((net, i, elem))
+
+    if len(sites) != len(specs):
+        log.info(
+            "Adaptive gain: %d regulator element(s) but %d spec(s) — "
+            "rebuilding the problem instead of retuning in place.",
+            len(sites), len(specs),
+        )
+        return False
+
+    for spec, (_net, _i, elem) in zip(specs, sites):
+        if not math.isclose(float(elem.voltage), float(spec.voltage),
+                            rel_tol=1e-12, abs_tol=1e-12):
+            log.info(
+                "Adaptive gain: regulator pairing mismatch (element %.6g V vs "
+                "spec %.6g V) — rebuilding the problem instead.",
+                elem.voltage, spec.voltage,
+            )
+            return False
+
+    changed = 0
+    for spec, (net, i, elem) in zip(specs, sites):
+        if elem.gain != spec.gain:
+            net.elements[i] = _dc_replace(elem, gain=spec.gain)
+            changed += 1
+    log.debug("Adaptive gain: retuned %d regulator element(s) in place",
+              changed)
+    return True
+
+
 def solve_problem_adaptive(
     loaded: LoadedProject,
     mesher_config,
     *,
     adaptive_regulator_gain: bool = False,
     stage_callback=None,
+    thermal_config=None,
 ) -> tuple[object, _pp.Problem, list[dict],
            dict[tuple[int, int], list], list[GeometryLayer], dict]:
     """Build, solve, and optionally iterate SMPS regulator gains.
+
+    ``thermal_config`` is an optional
+    :class:`pdnsolver.solver.ThermalConfig`. When it is enabled every solve
+    below runs the coupled electro-thermal loop; when it is ``None`` or
+    disabled the solve is bit-identical to an isothermal run. It composes
+    with adaptive SMPS gain — each gain iteration solves to thermal
+    convergence, so the regulator sees the hot rail's real input voltage.
 
     Returns ``(padne_solution, problem, via_segment_records,
     stub_pieces_by_pair, per_net_layers, adaptive_info)``.
@@ -1745,6 +2076,12 @@ def solve_problem_adaptive(
         bool(adaptive_regulator_gain)
         and has_adaptive_smps_regulators(loaded)
     )
+    # Full steps until a residual is seen to alternate sign repeatedly — see
+    # ``_ADAPTIVE_GAIN_BLEND``. Latches on once tripped: a design that
+    # oscillated is not going to stop part-way through.
+    gain_blend = 1.0
+    residual_sign: dict[tuple[str, int | None], int] = {}
+    flip_streak: dict[tuple[str, int | None], int] = {}
 
     problem, via_segment_records, stub_pieces_by_pair, per_net_layers = (
         build_problem(loaded)
@@ -1754,7 +2091,8 @@ def solve_problem_adaptive(
         if stage_callback is not None:
             stage_callback(msg)
         try:
-            return _pdn_solver.solve(problem, mesher_config=mesher_config)
+            return _pdn_solver.solve(problem, mesher_config=mesher_config,
+                                     thermal=thermal_config)
         except _pdn_mesh.MeshingException as exc:
             # Meshing failed after the Problem was already built. Hand the
             # built geometry to the caller's failure path (attributes on the
@@ -1790,8 +2128,8 @@ def solve_problem_adaptive(
         solution = _solve_once(msg)
         adaptive_info["iterations"] = iteration + 1
 
-        new_gains: dict[tuple[str, int | None], float] = {}
-        max_rel_change = 0.0
+        # Pass 1 — sample Vin and derive each regulator's undamped target gain.
+        targets: dict[tuple[str, int | None], tuple[RegulatorSpec, float | None]] = {}
         any_vin_sampled = False
         for d in loaded.annotations.directives:
             if not isinstance(d, RegulatorSpec) or not d.adaptive_gain_eligible:
@@ -1803,16 +2141,54 @@ def solve_problem_adaptive(
                     "Adaptive gain: %s Vin=%s — keeping gain=%.4g",
                     label, vin, d.gain,
                 )
-                new_gain = d.gain
+                targets[(d.designator, d.channel_index)] = (d, None)
             else:
                 any_vin_sampled = True
-                new_gain = d.voltage / (vin * d.efficiency)
-            if d.gain != 0.0:
-                max_rel_change = max(
-                    max_rel_change,
-                    abs(new_gain - d.gain) / abs(d.gain),
+                targets[(d.designator, d.channel_index)] = (
+                    d, d.voltage / (vin * d.efficiency),
                 )
-            new_gains[(d.designator, d.channel_index)] = new_gain
+
+        # Pass 2 — a residual that keeps changing sign means this design
+        # overshoots the fixed point on a full step, so damp from here on. Two
+        # consecutive flips are required: a single one is just a regulator
+        # crossing its target while the whole design converges monotonically,
+        # which damping would only slow down.
+        for key, (d, target) in targets.items():
+            if target is None:
+                continue
+            residual = target - d.gain
+            sign = 1 if residual > 0.0 else -1 if residual < 0.0 else 0
+            if sign == 0:
+                continue
+            previous = residual_sign.get(key)
+            if previous is not None and previous != sign:
+                flip_streak[key] = flip_streak.get(key, 0) + 1
+            else:
+                flip_streak[key] = 0
+            residual_sign[key] = sign
+            if flip_streak[key] >= 2 and gain_blend == 1.0:
+                gain_blend = _ADAPTIVE_GAIN_BLEND
+                log.info(
+                    "Adaptive gain: %s residual is alternating — damping "
+                    "subsequent steps by %.2f",
+                    _channel_label(*key), gain_blend,
+                )
+
+        # Pass 3 — take the (possibly damped) step. Convergence is measured on
+        # the *undamped* residual, so the tolerance means the same thing
+        # whether or not damping is active.
+        new_gains: dict[tuple[str, int | None], float] = {}
+        max_rel_change = 0.0
+        for key, (d, target) in targets.items():
+            if target is None:
+                new_gain = d.gain
+            else:
+                new_gain = (1.0 - gain_blend) * d.gain + gain_blend * target
+            if d.gain != 0.0 and target is not None:
+                max_rel_change = max(
+                    max_rel_change, abs(target - d.gain) / abs(d.gain),
+                )
+            new_gains[key] = new_gain
 
         if not any_vin_sampled:
             # Nothing could be measured — leave ``loaded`` at the gains the
@@ -1838,11 +2214,15 @@ def solve_problem_adaptive(
             )
             break
 
-        # Advance the gains and rebuild so the next iteration solves with them.
+        # Advance the gains so the next iteration solves with them. Only the
+        # regulators' gain changes, so patch the existing Problem rather than
+        # rebuilding it — see _retune_problem_regulator_gains. The rebuild is
+        # kept as the fallback for any case that function declines.
         _replace_regulator_gains(loaded, new_gains)
-        problem, via_segment_records, stub_pieces_by_pair, per_net_layers = (
-            build_problem(loaded)
-        )
+        if not _retune_problem_regulator_gains(problem, loaded):
+            problem, via_segment_records, stub_pieces_by_pair, per_net_layers = (
+                build_problem(loaded)
+            )
 
     adaptive_info["converged"] = converged
     # Report the gains the returned solution was actually solved with — i.e.
@@ -1869,6 +2249,8 @@ def build_solve_metadata(
     per_net_layers: list[GeometryLayer] | None = None,
     regulator_adaptive_gain: dict | None = None,
     mesh_failures: list[dict] | None = None,
+    mesh_failed: bool = False,
+    thermal_config=None,
 ) -> dict:
     """Collect every input the solve depended on into a serialisable dict.
 
@@ -1883,6 +2265,9 @@ def build_solve_metadata(
     import numpy as np
     proj = loaded.extracted
     nets = proj.nets
+    merged_upper = {
+        n.upper() for n in getattr(loaded, "merged_net_names", frozenset())
+    }
     enabled = proj.enabled_copper_layer_ids()
     stackup_by_id = {s.layer_id: s for s in proj.stackup}
 
@@ -1918,6 +2303,26 @@ def build_solve_metadata(
             "is_plane": s.is_plane,
             "plane_net_name": s.plane_net_name,
             "next_layer_id": s.next_layer_id,
+        })
+
+    # Links absorbed by the net merge. Built before the directive summary so
+    # the synthetic marker records can be appended to it below.
+    merged_bridges = []
+    for _b in getattr(loaded, "absorbed_bridges", ()) or ():
+        _p_name = _net_name(_b.p_net_index)
+        _n_name = _net_name(_b.n_net_index)
+        _canon = _net_name(_b.canonical_net_index)
+        merged_bridges.append({
+            "designator": _b.designator,
+            "resistance_ohm": float(_b.resistance),
+            "resistance_str": f"{_b.resistance * 1000.0:.4g} mΩ",
+            "p_net": _p_name,
+            "n_net": _n_name,
+            "canonical_net": _canon,
+            "p_x_mm": float(_b.p_x_mm), "p_y_mm": float(_b.p_y_mm),
+            "p_layer_id": int(_b.p_layer_id),
+            "n_x_mm": float(_b.n_x_mm), "n_y_mm": float(_b.n_y_mm),
+            "n_layer_id": int(_b.n_layer_id),
         })
 
     # Directive summary — what each PDN_* annotation resolved to.
@@ -2375,6 +2780,50 @@ def build_solve_metadata(
     # text for the viewer's Overlays control (Heatmap tab).
     overlay_records = _build_overlay_records(proj, _net_name)
 
+    # Give every absorbed link a directive record so it renders exactly like a
+    # hand-written PDN_ROLE=SERIES: same RESISTOR role, so the same square
+    # marker, the same legend row, the same Setup entry. Without this the user
+    # sees nothing on the canvas for a part FYPA silently shorted, which is
+    # precisely the case they most need to notice. ``auto_bridged`` lets the UI
+    # label it as inferred rather than annotated.
+    for _mb in merged_bridges:
+        _shorted = (f"{_mb['p_net']} \u2194 {_mb['n_net']}"
+                    if _mb["p_net"] != _mb["n_net"] else _mb["canonical_net"])
+        directives.append({
+            # Its own role, not RESISTOR. An absorbed link's two pads both
+            # report the surviving net after the merge, so a RESISTOR record
+            # would be gated by the marker overlay's "is this net on a visible
+            # rail?" test and vanish whenever the user is looking at anything
+            # but that rail — which, for the ground-to-ground merges these
+            # usually are, means always. AUTO_BRIDGE gets its own legend row
+            # and skips that gate, so an inferred short is always visible and
+            # independently toggleable.
+            "role": "AUTO_BRIDGE",
+            "designator": _mb["designator"],
+            "channel_index": None,
+            "label": _mb["designator"],
+            "schdoc": "(auto-bridge)",
+            "value": _mb["resistance_ohm"],
+            "unit": "\u03a9",
+            "value_str": _mb["resistance_str"],
+            "auto_bridged": True,
+            "shorted_nets": _shorted,
+            "terminals": {
+                "P": {"pin_count": 1, "pins": [{
+                    "pad": "1", "layer_id": _mb["p_layer_id"],
+                    "net": _mb["canonical_net"],
+                    "x_mm": _mb["p_x_mm"], "y_mm": _mb["p_y_mm"],
+                    "area_mm2": 0.0,
+                }]},
+                "N": {"pin_count": 1, "pins": [{
+                    "pad": "2", "layer_id": _mb["n_layer_id"],
+                    "net": _mb["canonical_net"],
+                    "x_mm": _mb["n_x_mm"], "y_mm": _mb["n_y_mm"],
+                    "area_mm2": 0.0,
+                }]},
+            },
+        })
+
     return {
         "project_name": proj.prjpcb_path.stem,
         "prjpcb_path": str(proj.prjpcb_path),
@@ -2431,6 +2880,7 @@ def build_solve_metadata(
             "plating_thickness_mm": PLATING_THICKNESS_MM,
             "fallback_via_resistance_ohm": FALLBACK_VIA_RESISTANCE_OHM,
             "coupling_resistance_ohm": COUPLING_RESISTANCE_OHM,
+            "area_weighted_pin_coupling": AREA_WEIGHTED_PIN_COUPLING,
             "conductive_fill_resistivity_ohm_mm":
                 CONDUCTIVE_FILL_RESISTIVITY_OHM_MM,
             "conductive_fill_mode": CONDUCTIVE_FILL_MODE,
@@ -2448,11 +2898,34 @@ def build_solve_metadata(
             "note_coupling_resistance": (
                 "When a directive terminal has multiple pins, each pin attaches "
                 "to a per-pin NodeID coupled back to the main terminal NodeID "
-                "via this resistance (padne star-coupling convention)."
+                "via this resistance (padne star-coupling convention). When "
+                "area_weighted_pin_coupling is true, each pin's resistance is "
+                "scaled as R_i = R * A_mean / A_i so larger pads take more "
+                "current at equal copper potential."
             ),
         },
         "directives": directives,
-        "net_canonical": build_net_canonical_map(proj.compiled_netlist),
+        # Links the net-merge pass absorbed (Net Ties, 0 Ω resistors, wire
+        # jumpers, and any SERIES the user gave a sub-milliohm value). They
+        # are no longer directives — the merge collapsed their two nets into
+        # one — but they ARE still physically modelled as a same-net bridge
+        # resistor, and the user needs to see which nets got shorted and
+        # where. Drives both the SERIES markers and the Setup tab's
+        # "Bridged / shorted nets" table.
+        "merged_bridges": merged_bridges,
+        # Every part that joins two nets, and what FYPA did with it — the
+        # Bridges tab's model. Includes parts nothing models yet, which is
+        # the point: those are the ones whose copper is missing from the FEM.
+        "bridge_candidates": collect_bridge_candidates(loaded),
+        "net_canonical": build_net_canonical_map(
+            proj.compiled_netlist,
+            # Merged-away names are still in ``proj.nets`` but own no copper,
+            # so they must not veto a legitimate alias fold.
+            pcb_net_names={
+                n.name for n in proj.nets
+                if n.name.upper() not in merged_upper
+            },
+        ),
         "active_nets": active_nets,
         "vias": vias,
         "pths": pths,
@@ -2483,7 +2956,19 @@ def build_solve_metadata(
         "connectivity_breaks": list(
             getattr(loaded.annotations, "connectivity_breaks", [])
         ),
+        # Parts joining a solved rail to copper outside the FEM — advisory,
+        # surfaced by the viewer as a non-blocking notice.
+        "unannotated_bridges": list(
+            getattr(loaded.annotations, "unannotated_bridges", [])
+        ),
+        # ``mesh_failures`` carries the records the viewer highlights; it can
+        # legitimately be EMPTY on a real failure, because the degenerate
+        # sliver that makes Triangle abort is the same geometry
+        # ``_build_stub_record`` rejects. Anything asking "did meshing fail?"
+        # must read ``mesh_failed`` — testing the list for truthiness lets a
+        # failed solve pass as a successful one.
         "mesh_failures": list(mesh_failures or []),
+        "mesh_failed": bool(mesh_failed) or bool(mesh_failures),
         "fem_stats": {
             "padne_layer_count": len(problem.layers) if problem is not None else 0,
             "padne_network_count": (
@@ -2497,6 +2982,17 @@ def build_solve_metadata(
                 "maximum_size_mm": mesher_config.maximum_size,
                 "adaptive_mesh": mesher_config.is_variable_density,
             } if mesher_config is not None else None
+        ),
+        # Electro-thermal settings actually used, so reopening a cached
+        # solve restores the checkbox and the reported rise means something.
+        "thermal_config": (
+            {
+                "enabled": bool(thermal_config.enabled),
+                "heat_transfer_w_per_m2k": float(
+                    thermal_config.heat_transfer_w_per_m2k),
+                "max_iterations": int(thermal_config.max_iterations),
+                "tolerance_c": float(thermal_config.tolerance_c),
+            } if thermal_config is not None else None
         ),
         "solver_stats": (
             {
@@ -2519,13 +3015,23 @@ def _terminal_summary(term, nets) -> dict:
     for pin in term.pins:
         net_name = (nets[pin.net_index].name
                     if 0 <= pin.net_index < len(nets) else "(none)")
-        pins.append({
+        # Keep ``pad`` as the raw pad designator so Unlock seeding of
+        # PDN_*_PINS fields stays resolvable (``"1"``, not ``"J2-1"``).
+        # ``component`` + ``pad_label`` cover multi-DES display.
+        entry = {
             "pad": pin.pad_designator,
             "layer_id": pin.layer_id,
             "net": net_name,
             "x_mm": pin.point.x,
             "y_mm": pin.point.y,
-        })
+            "area_mm2": _pin_area_mm2(pin),
+        }
+        if pin.component_designator:
+            entry["component"] = pin.component_designator
+            entry["pad_label"] = (
+                f"{pin.component_designator}-{pin.pad_designator}"
+            )
+        pins.append(entry)
     return {
         "pin_count": len(pins),
         "pins": pins,
@@ -2829,6 +3335,90 @@ def build_mesh_failure_records(
     return [stub]
 
 
+def build_stub_lean_solution_from_loaded(loaded: LoadedProject):
+    """Minimal :class:`~fypa.lean_solution.LeanSolution` so the viewer can open
+    without a successful FEM solve (load-only, mesh failure, missing
+    directives).
+
+    One :class:`~fypa.lean_solution.LeanLayer` per copper layer with real
+    geometry; empty per-layer solution arrays. ``solver_info["stub"]`` is the
+    viewer sentinel for pre-solve messaging.
+    """
+    from fypa.lean_solution import (
+        LeanLayer,
+        LeanLayerSolution,
+        LeanProblem,
+        LeanSolution,
+    )
+
+    geom = loaded.geometry
+    lean_layers = [
+        LeanLayer(
+            name=f"{L.name}|(none)",
+            conductance=L.conductance,
+            shape=L.shape,
+            layer_id=L.layer_id,
+            is_plane=L.is_plane,
+            plane_net_name=None,
+        )
+        for L in geom
+    ]
+    lean_solutions = [
+        LeanLayerSolution(
+            vertex_xys=[], triangles=[], potentials=[], power_densities=[],
+        )
+        for _ in geom
+    ]
+    return LeanSolution(
+        problem=LeanProblem(
+            layers=lean_layers,
+            project_name=loaded.project_name,
+        ),
+        layer_solutions=lean_solutions,
+        solver_info={
+            "stub": True,
+            "ground_node_current": 0.0,
+            "residual_norm": 0.0,
+        },
+    )
+
+
+def package_mesh_failure(
+    loaded: LoadedProject,
+    mesh_exc,
+    mesher_config=None,
+    settings: SolveSettings | None = None,
+) -> tuple[object, dict]:
+    """Turn a :class:`~pdnsolver.mesh.MeshingException` into a viewer-ready stub.
+
+    Used by the GUI :class:`~fypa.altium_viewer._SolveWorker` and the headless
+    CLI ``solve`` path so a bad copper island opens (or pickles) with markers
+    instead of aborting. CLI ``gui`` reaches this via the same solve worker.
+    """
+    problem = getattr(mesh_exc, "built_problem", None)
+    via_segment_records = getattr(mesh_exc, "built_via_segment_records", None)
+    stub_pieces_by_pair = getattr(mesh_exc, "built_stub_pieces_by_pair", None)
+    per_net_layers = getattr(mesh_exc, "built_per_net_layers", None)
+    if problem is None or per_net_layers is None:
+        (problem, via_segment_records,
+         stub_pieces_by_pair, per_net_layers) = build_problem(loaded)
+    mesh_failures = build_mesh_failure_records(
+        mesh_exc, problem, loaded, per_net_layers,
+    )
+    stub = build_stub_lean_solution_from_loaded(loaded)
+    metadata = build_solve_metadata(
+        loaded, problem,
+        mesher_config=mesher_config,
+        settings=settings,
+        via_segment_records=via_segment_records or [],
+        stub_pieces_by_pair=stub_pieces_by_pair,
+        per_net_layers=per_net_layers,
+        mesh_failures=mesh_failures,
+        mesh_failed=True,
+    )
+    return stub, metadata
+
+
 def _drop_unreachable_layers(
     pp_layers: list[_pp.Layer],
     layer_by_layer_and_net: dict[tuple[int, int], _pp.Layer],
@@ -3038,6 +3628,204 @@ def _analyze_open_loop_rails(
     return excluded_idx, warnings
 
 
+# Designator prefixes for parts that can carry DC between two nets. An IC
+# spanning two nets is not a conduction path, so the sweep is restricted to
+# these rather than reporting every multi-net component on the board.
+_BRIDGE_DESIGNATOR_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("FB", "ferrite bead"),
+    ("JP", "jumper"),
+    ("TP", "test point"),
+    ("R", "resistor"),
+    ("F", "fuse"),
+    ("L", "inductor / ferrite"),
+    ("J", "connector"),
+    ("P", "connector"),
+    ("CN", "connector"),
+    ("SW", "switch"),
+)
+# A bridging part has two terminals. Allow a few more pads for Kelvin-sense
+# shunts and multi-pin connectors that still only span two nets.
+_BRIDGE_MAX_PADS: int = 8
+
+
+def _bridge_part_kind(designator: str) -> str | None:
+    """Human-readable part kind for a designator, or ``None`` when the
+    prefix isn't one that conducts between nets."""
+    des = (designator or "").strip().upper()
+    if not des:
+        return None
+    # Longest prefix first so FB / JP / CN win over F / J / C.
+    for prefix, kind in sorted(_BRIDGE_DESIGNATOR_PREFIXES,
+                               key=lambda kv: -len(kv[0])):
+        if des.startswith(prefix) and des[len(prefix):len(prefix) + 1].isdigit():
+            return kind
+    return None
+
+
+def collect_bridge_candidates(loaded: LoadedProject) -> list[dict]:
+    """Every part that electrically joins two nets, and what FYPA did with it.
+
+    One record per candidate, whatever its current state — annotated as
+    SERIES, auto-bridged (Net Tie / 0 Ω link), or not modelled at all. This
+    is the single source of truth behind the Bridges tab, the load-time
+    advisory, and the Setup summary, so those three can never disagree.
+
+    A "candidate" is a part whose pads touch exactly **two** distinct nets
+    and whose designator prefix is one that conducts at DC (see
+    :data:`_BRIDGE_DESIGNATOR_PREFIXES`). Note the test is two *nets*, not
+    two *pins*: a 4-pad Kelvin shunt or a 2-position jumper block bridges
+    two nets and matters, while a 2-pin part with both pads on one net does
+    not.
+
+    ``impact`` is the field worth sorting on. The FEM only meshes nets a
+    directive touches, so a part joining a solved rail to an un-annotated
+    net is a real parallel current path the model cannot see, and the rail's
+    return resistance reads high. Those are the rows that change an answer.
+    """
+    from fypa.altium.annotations import (
+        _component_value_text,
+        _zero_ohm_bridge_reason,
+    )
+
+    proj = loaded.extracted
+    directives = loaded.annotations.directives
+    active = _collect_active_nets(directives, proj)
+
+    # Designator -> the SERIES directive that already models it, if any.
+    series_by_des: dict[str, object] = {}
+    for d in directives:
+        if isinstance(d, ResistorSpec) and d.designator:
+            series_by_des[d.designator.strip().upper()] = d
+    # Designator -> the link the net merge absorbed, if any.
+    absorbed_by_des = {
+        b.designator.strip().upper(): b
+        for b in (getattr(loaded, "absorbed_bridges", ()) or ())
+        if b.designator
+    }
+
+    sch_by_des: dict[str, object] = {}
+    for sch in proj.sch_components:
+        sch_by_des.setdefault(sch.designator.strip().upper(), sch)
+
+    pads_by_comp: dict[int, list] = {}
+    for pad in proj.pads:
+        idx = getattr(pad, "component_index", None)
+        if idx is not None and idx >= 0:
+            pads_by_comp.setdefault(int(idx), []).append(pad)
+
+    def _net_name(idx: int) -> str:
+        return (proj.nets[idx].name
+                if 0 <= idx < len(proj.nets) else "(none)")
+
+    out: list[dict] = []
+    for comp_idx, pads in pads_by_comp.items():
+        if not (0 <= comp_idx < len(proj.pcb_components)):
+            continue
+        comp = proj.pcb_components[comp_idx]
+        des = (comp.source_designator or comp.designator or "").strip()
+        if not des:
+            continue
+        key = des.upper()
+        kind = _bridge_part_kind(des)
+        absorbed = absorbed_by_des.get(key)
+        series = series_by_des.get(key)
+        # A part the tool already models counts even if its prefix is not on
+        # the conducting list — the user's own annotation outranks the
+        # heuristic.
+        if kind is None and series is None and absorbed is None:
+            continue
+
+        net_idxs = sorted({
+            int(pd.net_index) for pd in pads
+            if pd.net_index != NO_NET and 0 <= pd.net_index < len(proj.nets)
+        })
+        if absorbed is not None:
+            # Post-merge both pads report the surviving net; the original
+            # pair is only recoverable from the bridge record.
+            pair = [absorbed.p_net_index, absorbed.n_net_index]
+        else:
+            pair = net_idxs
+        if len(pair) != 2:
+            continue
+
+        sch = sch_by_des.get(key)
+        params = getattr(sch, "parameters", None) or comp.parameters
+        value = _component_value_text(params)
+
+        if series is not None:
+            state = "series"
+            resistance = float(series.resistance)
+            why = "annotated PDN_ROLE=SERIES"
+        elif absorbed is not None:
+            state = "auto"
+            resistance = float(absorbed.resistance)
+            why = (_zero_ohm_bridge_reason(params, comp.footprint)
+                   or "Altium ComponentKind marks it a Net Tie")
+        else:
+            state = "unmodelled"
+            resistance = None
+            why = ""
+
+        a_active = pair[0] in active
+        b_active = pair[1] in active
+        if state == "unmodelled" and (a_active != b_active):
+            impact = (
+                f"joins the solved rail {_net_name(pair[0] if a_active else pair[1])!r} "
+                f"to {_net_name(pair[1] if a_active else pair[0])!r}, which no "
+                f"directive touches — that copper is left out of the FEM, so "
+                f"the rail's return resistance reads high"
+            )
+        else:
+            impact = ""
+
+        anchor = pads[0]
+        out.append({
+            "designator": des,
+            "kind": kind or "part",
+            "value": value,
+            "footprint": str(comp.footprint or ""),
+            "pin_count": len(pads),
+            "net_a": _net_name(pair[0]),
+            "net_b": _net_name(pair[1]),
+            "state": state,
+            "resistance_ohm": resistance,
+            "why": why,
+            "impact": impact,
+            "touches_active_rail": bool(a_active or b_active),
+            "x_mm": float(anchor.center.x),
+            "y_mm": float(anchor.center.y),
+            "layer_id": int(anchor.layer_id),
+        })
+
+    out.sort(key=lambda r: (not r["impact"], r["designator"]))
+    return out
+
+
+def _flag_unannotated_bridges(loaded: LoadedProject) -> list[str]:
+    """Advisory messages for parts that conduct between a solved rail and
+    copper the FEM never sees.
+
+    A thin presentation layer over :func:`collect_bridge_candidates` — the
+    Bridges tab renders the same records as an editable table, so the two
+    can never disagree about what was found.
+    """
+    messages: list[str] = []
+    for rec in collect_bridge_candidates(loaded):
+        if not rec["impact"]:
+            continue
+        messages.append(
+            f"{rec['designator']} ({rec['kind']}) {rec['impact']}. If it "
+            f"conducts at DC, give it a resistance in the Bridges tab (or "
+            f"annotate it in Altium with PDN_ROLE=SERIES and PDN_R set to "
+            f"its actual DC resistance — a ferrite's DCR, a fuse's cold "
+            f"resistance, a shunt's marked value); the return path through "
+            f"{rec['net_b']!r} is then solved too. Ignore this if the part "
+            f"is genuinely open at DC."
+        )
+    messages.sort()
+    return messages
+
+
 def _flag_open_loop_rails(loaded: LoadedProject) -> list[str]:
     """Find rails that can't carry current — an analysis group holding only
     sources (``SourceSpec`` / ``RegulatorSpec``) or only sinks (``SinkSpec``)
@@ -3091,6 +3879,99 @@ def _flag_open_loop_rails(loaded: LoadedProject) -> list[str]:
     for w in warnings:
         log.warning("%s", w)
     return warnings
+
+
+class _LazyGeometryLayers(Sequence):
+    """The active-net :class:`GeometryLayer` objects, plus the non-active ones
+    appended on first use — joining the background union only when something
+    actually reads them.
+
+    ``build_problem`` used to end with ``active + rest_future.result()``,
+    which put the *display-only* overlay geometry on the FEM's critical path:
+    the solve waited for copper it never meshes. Nothing between that join
+    and the return touched the list, and most consumers only pass it along,
+    so the join belongs at the point of use.
+
+    This is a real immutable ``Sequence`` rather than a future so every
+    existing consumer keeps working unchanged — they index, iterate and
+    ``len()`` it exactly as before, and the first of those resolves the rest.
+    ``active_layers`` is available without blocking, which is what the
+    diagnostics inside ``build_problem`` need.
+    """
+
+    __slots__ = ("_active", "_future", "_all")
+
+    def __init__(self, active: list, future) -> None:
+        self._active = list(active)
+        self._future = future
+        self._all: list | None = None
+
+    def _resolve(self) -> list:
+        if self._all is None:
+            try:
+                rest = self._future.result()
+            except Exception as exc:
+                # The overlay is cosmetic; a failure there must not sink a
+                # solve that has already succeeded. It is logged by the
+                # future's own done-callback too.
+                log.warning(
+                    "Non-active-net overlay geometry unavailable (%s) — "
+                    "showing active rails only.", exc,
+                )
+                rest = []
+            self._all = self._active + list(rest)
+        return self._all
+
+    @property
+    def active_only(self) -> list:
+        """The active-net layers, without joining the background union."""
+        return self._active
+
+    def __getitem__(self, index):
+        return self._resolve()[index]
+
+    def __len__(self) -> int:
+        return len(self._resolve())
+
+    def __iter__(self):
+        return iter(self._resolve())
+
+    def __repr__(self) -> str:
+        state = "resolved" if self._all is not None else "pending"
+        return (f"<_LazyGeometryLayers {len(self._active)} active "
+                f"+ rest ({state})>")
+
+    def __reduce__(self):
+        # A Future is not picklable. No current caller pickles this (the
+        # metadata builder consumes it and stores only derived values), but
+        # if one ever does, resolving to a plain list is the graceful answer
+        # rather than an opaque "cannot pickle _thread.RLock".
+        return (list, (self._resolve(),))
+
+
+def _log_build_timings(stages: list[tuple[str, float]], total: float) -> None:
+    """Log a build_problem stage breakdown, slowest first.
+
+    Mirrors :func:`pdnsolver.solver._log_timing_breakdown` so a solve log
+    reads consistently across the geometry and FEM halves. Before this,
+    build_problem reported a single geometry line and everything else — via
+    coupling, stub filtering, the background-union join — was invisible,
+    which is why the largest remaining costs in the pipeline could only be
+    found by reading wall-clock gaps between log lines.
+    """
+    if not stages:
+        return
+    lines = [f"build_problem breakdown (total {total:.2f}s):"]
+    accounted = 0.0
+    for name, dt in sorted(stages, key=lambda kv: -kv[1]):
+        accounted += dt
+        pct = (100.0 * dt / total) if total > 0 else 0.0
+        lines.append(f"    {dt:7.2f}s  {pct:5.1f}%  {name}")
+    other = total - accounted
+    if other > 0.005:
+        pct = (100.0 * other / total) if total > 0 else 0.0
+        lines.append(f"    {other:7.2f}s  {pct:5.1f}%  (untimed)")
+    log.info("\n".join(lines))
 
 
 def build_problem(
@@ -3160,10 +4041,20 @@ def build_problem(
     # other ~thousands of nets (the viewer's "all copper" overlay) are
     # unioned on a background thread that overlaps the rest of this
     # function. _rest_geom_future is joined just before the return.
+    _build_t0 = time.monotonic()
+    _build_stages: list[tuple[str, float]] = []
+
+    def _stage(name: str, since: float) -> float:
+        """Record a stage and return a fresh timestamp for the next one."""
+        now = time.monotonic()
+        _build_stages.append((name, now - since))
+        return now
+
     _t_geom = time.monotonic()
     active_layers, _rest_geom_future = build_per_net_geometry_layers_split(
         loaded.extracted, active_nets,
     )
+    _t_mark = _stage("Active-net geometry (union)", _t_geom)
     log.info("build_problem: active-net geometry built in %.2fs "
              "(non-active nets unioning in background)",
              time.monotonic() - _t_geom)
@@ -3485,6 +4376,22 @@ def build_problem(
     loaded.annotations.connectivity_breaks = list(connectivity_warnings)
     loaded.annotations.warnings.extend(connectivity_warnings)
 
+    # Parts that conduct between a solved rail and copper the active-net
+    # filter excluded. Re-derived from scratch every build_problem call and
+    # assigned (not appended) for the same reason as the breaks above:
+    # annotating the part must make the notice disappear on the next Resolve.
+    prev_bridges = set(getattr(loaded.annotations, "unannotated_bridges", []))
+    if prev_bridges:
+        loaded.annotations.warnings = [
+            w for w in loaded.annotations.warnings if w not in prev_bridges
+        ]
+    bridge_warnings = _flag_unannotated_bridges(loaded)
+    loaded.annotations.unannotated_bridges = list(bridge_warnings)
+    loaded.annotations.warnings.extend(bridge_warnings)
+    if bridge_warnings:
+        log.info("Found %d unannotated net bridge(s) touching solved rails",
+                 len(bridge_warnings))
+
     # Log every resolved directive at INFO level so the solve log always
     # shows what's in the FEM — makes it easy to spot wrong resistance
     # values, unexpected net connections, or missing elements.
@@ -3703,7 +4610,12 @@ def build_problem(
     # Join the backgrounded non-active-net union — it has been running while
     # the FEM assembly above ran. per_net_layers must carry every net: the
     # viewer's "all copper" overlay needs the non-active ones too.
-    per_net_layers = active_layers + _rest_geom_future.result()
+    _t_mark = _stage("Problem assembly (layers, vias, networks)", _t_mark)
+    # NOT joined here: the background union produces the viewer's display-only
+    # overlay, so blocking on it would put geometry the FEM never meshes on
+    # the solve's critical path. The wrapper joins on first read instead.
+    per_net_layers = _LazyGeometryLayers(active_layers, _rest_geom_future)
+    _log_build_timings(_build_stages, time.monotonic() - _build_t0)
     return problem, segment_records, stub_pieces_by_pair, per_net_layers
 
 
@@ -3748,6 +4660,12 @@ class _AbsorbedBridge:
     n_x_mm: float
     n_y_mm: float
     canonical_net_index: int
+    # The two nets this link originally joined, before the merge collapsed
+    # them onto ``canonical_net_index``. Kept so the viewer can tell the user
+    # *what* got shorted — after the merge both pads report the canonical
+    # name, so the original pair is otherwise unrecoverable.
+    p_net_index: int = NO_NET
+    n_net_index: int = NO_NET
 
 
 def _build_net_merge_map(
@@ -3868,8 +4786,30 @@ def _build_net_merge_map(
             n_x_mm=n_pin.point.x,
             n_y_mm=n_pin.point.y,
             canonical_net_index=canonical,
+            p_net_index=p_pin.net_index,
+            n_net_index=n_pin.net_index,
         ))
     return remap, skipped, bridges
+
+
+def _carry_absorbed_notes(first: AnnotationResult,
+                          second: AnnotationResult) -> None:
+    """Copy pass-1 warnings that pass 2 can no longer raise.
+
+    The post-merge re-parse is told to skip every designator the merge
+    absorbed, so anything the first pass said about them — notably a Net
+    Tie's "auto-bridged X ↔ Y", the only record that two rails were shorted
+    together — is otherwise dropped on the floor along with the rest of the
+    first result. Order is preserved and nothing pass 2 did manage to say is
+    duplicated.
+    """
+    already = set(second.warnings)
+    for note in first.absorbed_notes:
+        if note in already:
+            continue
+        already.add(note)
+        second.warnings.append(note)
+        second.absorbed_notes.append(note)
 
 
 def _apply_net_remap(
@@ -3942,6 +4882,7 @@ def _apply_net_remap(
 
 def load_project(prjpcb_path: str | Path,
                  pcbdoc_selector: str | Path | None = None,
+                 no_auto_bridge: set[str] | None = None,
                  ) -> LoadedProject:
     """Load and prepare an Altium project for PDN analysis.
 
@@ -3954,6 +4895,13 @@ def load_project(prjpcb_path: str | Path,
 
     ``pcbdoc_selector`` picks one of several ``.PcbDoc`` files when the
     project contains more than one (see :func:`fypa.altium.extract.extract_project`).
+
+    ``no_auto_bridge`` is the set of designators the user has told the tool
+    not to short automatically (the Bridges tab, persisted in the ``.fypa``).
+    It has to arrive here rather than with the editor directives: the
+    auto-bridge and the net merge it triggers both happen during annotation
+    parsing, so by the time editor directives are applied the two nets have
+    already been collapsed into one.
 
     Auto-merge pass: SERIES directives below
     :data:`NET_MERGE_RESISTANCE_THRESHOLD_OHM` are detected as electrical
@@ -3970,7 +4918,8 @@ def load_project(prjpcb_path: str | Path,
 
     log.info("Stage 2/2: parsing PDN_* annotations (pass 1: discover merges)")
     _t = time.monotonic()
-    initial_annotations = parse_annotations(extracted, enabled_layers=enabled)
+    initial_annotations = parse_annotations(
+        extracted, enabled_layers=enabled, no_auto_bridge=no_auto_bridge)
     log.info("Stage 2/2: annotations (pass 1) done in %.2fs",
              time.monotonic() - _t)
 
@@ -4002,9 +4951,11 @@ def load_project(prjpcb_path: str | Path,
             extracted, enabled_layers=enabled,
             skip_designators=skipped_designators,
             net_remap=net_remap,
+            no_auto_bridge=no_auto_bridge,
         )
         log.info("Stage 2/2: annotations (pass 2) done in %.2fs",
                  time.monotonic() - _t)
+        _carry_absorbed_notes(initial_annotations, annotations)
     else:
         annotations = initial_annotations
 
@@ -4017,11 +4968,18 @@ def load_project(prjpcb_path: str | Path,
         log.warning("Annotation: %s", w)
     for e in annotations.errors:
         log.error("Annotation error: %s", e)
+    for i in getattr(annotations, "infos", []):
+        log.info("Annotation: %s", i)
 
     return LoadedProject(
         extracted=extracted,
         annotations=annotations,
         absorbed_bridges=absorbed_bridges if net_remap else [],
+        merged_net_names=frozenset(
+            extracted.nets[old].name
+            for old in net_remap
+            if 0 <= old < len(extracted.nets)
+        ),
     )
 
 

@@ -29,6 +29,9 @@ log = logging.getLogger(__name__)
 _EDITOR_RETURN_GROUP_BASE = 9001
 
 _EDITOR_SCHDOC = "(editor)"
+# Stands in for a pad designator when a terminal couples at a free marker's
+# anchor instead of a real pad.
+_ANCHOR_PAD = "(editor)"
 
 
 def apply_editor_directives(loaded, editor_directives) -> list[str]:
@@ -46,6 +49,8 @@ def apply_editor_directives(loaded, editor_directives) -> list[str]:
         SourceSpec,
         TerminalPin,
         TerminalSpec,
+        _overlap_pad_names,
+        _terminal_pin_overlap_key,
     )
     from fypa.altium.extract import Pt2D
 
@@ -62,11 +67,32 @@ def apply_editor_directives(loaded, editor_directives) -> list[str]:
         if nm:
             net_index.setdefault(nm.upper(), i)
 
-    # physical PCB designator -> pcb_components index
-    comp_index: dict[str, int] = {}
-    for i, comp in enumerate(extracted.pcb_components):
-        if comp.designator:
-            comp_index.setdefault(comp.designator, i)
+    def _comp_indices(designator: str | None) -> list[int]:
+        """All PCB placements matching ``designator``.
+
+        Mirrors schematic :func:`~fypa.altium.annotations._find_pcb_instances`:
+        prefer ``source_designator`` (multi-channel logical name), then fall
+        back to physical ``designator``. Returns every matching index so
+        multi-DES terminals merge pads from all channel placements.
+        """
+        if not designator:
+            return []
+        target = designator.upper()
+        hits = [
+            i for i, c in enumerate(extracted.pcb_components)
+            if getattr(c, "source_designator", None)
+            and str(c.source_designator).upper() == target
+        ]
+        if hits:
+            return hits
+        return [
+            i for i, c in enumerate(extracted.pcb_components)
+            if (getattr(c, "designator", None) or "").upper() == target
+        ]
+
+    def _comp_idx(designator: str | None) -> int | None:
+        indices = _comp_indices(designator)
+        return indices[0] if indices else None
 
     # --- Per-rail return groups for single-net editor directives ----------
     # Each electrically-connected rail needs its OWN ideal-0 V return node.
@@ -129,7 +155,7 @@ def apply_editor_directives(loaded, editor_directives) -> list[str]:
         return gid
 
     def _component_center(designator: str | None) -> tuple[float, float] | None:
-        ci = comp_index.get(designator) if designator else None
+        ci = _comp_idx(designator)
         if ci is None:
             return None
         pts = [p.center for p in extracted.pads if p.component_index == ci]
@@ -137,6 +163,28 @@ def apply_editor_directives(loaded, editor_directives) -> list[str]:
             return None
         return (sum(p.x for p in pts) / len(pts),
                 sum(p.y for p in pts) / len(pts))
+
+    def _pads_on_component(ci: int, nidx: int, wanted_pins):
+        """Pads of component ``ci`` on net ``nidx``, optionally pin-filtered."""
+        out: list = []
+        pcb_des = extracted.pcb_components[ci].designator or None
+        for p in extracted.pads:
+            if p.component_index != ci or p.net_index != nidx:
+                continue
+            if wanted_pins is not None and \
+                    (p.designator or "").upper() not in wanted_pins:
+                continue
+            through = getattr(p, "is_through_hole", False)
+            lid = top_layer if through else p.layer_id
+            out.append(TerminalPin(
+                pad_designator=p.designator or _ANCHOR_PAD,
+                layer_id=lid,
+                net_index=nidx,
+                point=p.center,
+                pad_polygon=None,
+                component_designator=pcb_des,
+            ))
+        return out
 
     def _resolve_terminal(net_name, *, designator, fallback_xy,
                           fallback_layer_id, pin_filter=None):
@@ -157,35 +205,85 @@ def apply_editor_directives(loaded, editor_directives) -> list[str]:
         wanted_pins = ({str(p).upper() for p in pin_filter}
                        if pin_filter else None)
         pins: list = []
-        ci = comp_index.get(designator) if designator else None
+        ci = _comp_idx(designator)
         if ci is not None:
-            for p in extracted.pads:
-                if p.component_index != ci or p.net_index != nidx:
-                    continue
-                if wanted_pins is not None and \
-                        (p.designator or "").upper() not in wanted_pins:
-                    continue
-                through = getattr(p, "is_through_hole", False)
-                lid = top_layer if through else p.layer_id
-                pins.append(TerminalPin(
-                    pad_designator=p.designator or "(editor)",
-                    layer_id=lid,
-                    net_index=nidx,
-                    point=p.center,
-                    pad_polygon=None,
-                ))
+            pins = _pads_on_component(ci, nidx, wanted_pins)
         if not pins:
             # Free marker, or a component with no pad on this net — couple
             # at the supplied fallback point on the net's copper.
             fx, fy = fallback_xy
             pins.append(TerminalPin(
-                pad_designator="(editor)",
+                pad_designator=_ANCHOR_PAD,
                 layer_id=fallback_layer_id or top_layer,
                 net_index=nidx,
                 point=Pt2D(float(fx), float(fy)),
                 pad_polygon=None,
+                component_designator=designator or None,
             ))
         return TerminalSpec(pins=tuple(pins), requested_net=net_name)
+
+    def _resolve_terminal_multi_des(net_name, *, designators, pin_filter=None,
+                                    label="", side=""):
+        """Resolve a terminal from pads on the listed designators only.
+
+        Mirrors schematic ``PDN_*_DES`` semantics: the host is not
+        auto-included. Returns ``(TerminalSpec | None, warning | None)``.
+        """
+        if not net_name:
+            return None, f"{label}: {side} net is empty; skipped."
+        nidx = net_index.get(net_name.upper())
+        if nidx is None:
+            return None, (
+                f"{label}: {side} net {net_name!r} not found on the board; "
+                "skipped."
+            )
+        if not designators:
+            return None, (
+                f"{label}: {side}-DES list is empty; skipped."
+            )
+        wanted_pins = ({str(p).upper() for p in pin_filter}
+                       if pin_filter else None)
+        # Preserve author order; ignore duplicate names (case-insensitive).
+        seen: set[str] = set()
+        unique: list[str] = []
+        for des in designators:
+            key = des.upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(des)
+
+        all_pins: list = []
+        for des in unique:
+            indices = _comp_indices(des)
+            if not indices:
+                return None, (
+                    f"{label}: designator {des!r} not found on the board; "
+                    "skipped."
+                )
+            des_pins: list = []
+            for ci in indices:
+                des_pins.extend(_pads_on_component(ci, nidx, wanted_pins))
+            if not des_pins:
+                return None, (
+                    f"{label}: designator {des!r} has no pad on net "
+                    f"{net_name!r}; skipped."
+                )
+            all_pins.extend(des_pins)
+        # Mirror schematic ``_resolve_terminal_multi``: every *_PINS entry
+        # must appear on at least one listed designator.
+        if wanted_pins and all_pins:
+            found = {p.pad_designator.upper() for p in all_pins}
+            missing = wanted_pins - found
+            if missing:
+                return None, (
+                    f"{label}: pin overrides not found on listed "
+                    f"designators: {sorted(missing)}; skipped."
+                )
+        return (
+            TerminalSpec(pins=tuple(all_pins), requested_net=net_name),
+            None,
+        )
 
     warnings: list[str] = []
 
@@ -234,21 +332,41 @@ def apply_editor_directives(loaded, editor_directives) -> list[str]:
 
         # Pin restrictions only apply to a component-bound terminal that
         # actually has pads to pick from; a free marker couples at its anchor.
+        # Multi-DES lists (PDN_*_DES) likewise apply only to component-bound
+        # two-net SOURCE/SINK — listed designators only, host not included.
         p_pins = getattr(ed, "p_pins", None) if ed.kind != "free" else None
         n_pins = getattr(ed, "n_pins", None) if ed.kind != "free" else None
-        p_term = _resolve_terminal(
-            ed.p_net, designator=ed.designator,
-            fallback_xy=fallback_xy, fallback_layer_id=fallback_lid,
-            pin_filter=p_pins,
-        )
-        if p_term is None:
-            warnings.append(
-                f"{label}: P net {ed.p_net!r} not found on the board; skipped."
-            )
-            continue
+        p_des = getattr(ed, "p_des", None) if ed.kind != "free" else None
+        n_des = getattr(ed, "n_des", None) if ed.kind != "free" else None
         # SERIES always bridges two real nets; SOURCE / SINK honour the
         # directive's single-net flag.
         two_net = (not ed.single_net) or ed.role == "SERIES"
+        # *_DES is SOURCE/SINK two-net only (mirrors schematic).
+        use_des = two_net and ed.role in ("SOURCE", "SINK")
+        if not use_des:
+            p_des = None
+            n_des = None
+
+        if p_des is not None:
+            p_term, des_warn = _resolve_terminal_multi_des(
+                ed.p_net, designators=p_des, pin_filter=p_pins,
+                label=label, side="P",
+            )
+            if des_warn:
+                warnings.append(des_warn)
+                continue
+        else:
+            p_term = _resolve_terminal(
+                ed.p_net, designator=ed.designator,
+                fallback_xy=fallback_xy, fallback_layer_id=fallback_lid,
+                pin_filter=p_pins,
+            )
+            if p_term is None:
+                warnings.append(
+                    f"{label}: P net {ed.p_net!r} not found on the board; "
+                    "skipped."
+                )
+                continue
         n_term = None
         if two_net:
             if ed.role == "SERIES" and not ed.n_net:
@@ -257,15 +375,55 @@ def apply_editor_directives(loaded, editor_directives) -> list[str]:
                     "skipped."
                 )
                 continue
-            n_term = _resolve_terminal(
-                ed.n_net, designator=ed.designator,
-                fallback_xy=fallback_xy, fallback_layer_id=fallback_lid,
-                pin_filter=n_pins,
+            if n_des is not None:
+                n_term, des_warn = _resolve_terminal_multi_des(
+                    ed.n_net, designators=n_des, pin_filter=n_pins,
+                    label=label, side="N",
+                )
+                if des_warn:
+                    warnings.append(des_warn)
+                    continue
+            else:
+                n_term = _resolve_terminal(
+                    ed.n_net, designator=ed.designator,
+                    fallback_xy=fallback_xy, fallback_layer_id=fallback_lid,
+                    pin_filter=n_pins,
+                )
+                if n_term is None:
+                    warnings.append(
+                        f"{label}: N net {ed.n_net!r} not found on the "
+                        "board; skipped."
+                    )
+                    continue
+            # The same short the annotation path arbitrates, which this path
+            # never called: a lumped element with both terminals on one node.
+            # Two shapes reach it — both terminals on one real pad (overlapping
+            # pin filters), or both on one net (a free marker whose P and N
+            # nets are the same). Anchor pins carry the ``_ANCHOR_PAD``
+            # placeholder rather than a pad name, so comparing designators
+            # alone would flag every legitimate free marker.
+            #
+            # Compare on the annotation path's composite component+pad key,
+            # not the bare pad name: with *_DES the two terminals sit on
+            # different components, and single-pin lab jacks all call their
+            # one pad "1". Bare names made every banana-jack return look like
+            # a short with the host's own pin 1.
+            p_keys = {_terminal_pin_overlap_key(pin) for pin in p_term.pins
+                      if pin.pad_designator != _ANCHOR_PAD}
+            n_keys = {_terminal_pin_overlap_key(pin) for pin in n_term.pins
+                      if pin.pad_designator != _ANCHOR_PAD}
+            shared_pads = _overlap_pad_names(p_term, p_keys & n_keys)
+            same_net = (
+                {pin.net_index for pin in p_term.pins}
+                == {pin.net_index for pin in n_term.pins}
             )
-            if n_term is None:
+            if shared_pads or same_net:
+                where = (f"pad(s) {', '.join(shared_pads)}" if shared_pads
+                         else f"net {ed.p_net!r}")
                 warnings.append(
-                    f"{label}: N net {ed.n_net!r} not found on the board; "
-                    "skipped."
+                    f"{label}: P ({ed.p_net!r}) and N ({ed.n_net!r}) both "
+                    f"resolve to {where}, which would short the element; "
+                    f"give them different nets or pin filters. Skipped."
                 )
                 continue
         # Single-net directives get their rail's own return group; two-net
@@ -327,6 +485,138 @@ def apply_editor_directives(loaded, editor_directives) -> list[str]:
     return warnings
 
 
+# ``p_net`` / ``n_net`` value the editor writes for copper that has no net.
+_UNNAMED_NET = "(none)"
+
+
+def has_closed_pdn_loop(loaded, editor_directives, *,
+                        p_net_resolver=None) -> bool:
+    """True when the schematic + editor directives together form at least
+    one **closed** rail — a connected group of nets carrying both a source
+    (schematic ``SourceSpec`` / ``RegulatorSpec`` or an editor SOURCE) and a
+    sink (``SinkSpec`` or an editor SINK). This is the condition
+    :attr:`fypa.altium.loader.LoadedProject.is_solveable` checks *after*
+    :func:`apply_editor_directives` has run, evaluated here without mutating
+    ``loaded`` so the viewer can grey out ↻ Solve when a click would only
+    produce the "Project is not solveable" dialog.
+
+    Mirrors the two functions it stands in for:
+
+    * like :func:`apply_editor_directives`, it drops schematic directives an
+      editor directive overrides (``overrides_designator``) and skips editor
+      directives the re-solve would skip — unsupported roles, a SOURCE with
+      no voltage, a SINK with no current, a SERIES with no positive
+      resistance, or a terminal still on unnamed ``"(none)"`` copper;
+    * like :func:`fypa.altium.loader._analyze_open_loop_rails`, it unions
+      the nets each directive touches (a SERIES / ``ResistorSpec`` and a
+      ``RegulatorSpec`` bridge their terminals' rails) and looks for a group
+      with both roles.
+
+    ``p_net_resolver(ed) -> str | None`` may supply a net name for a free
+    marker whose ``p_net`` is still ``"(none)"`` — the viewer passes its
+    :class:`~fypa.project_file.CopperName` lookup so copper the user named
+    after placing the marker still counts, exactly as the resolve path
+    promotes it.
+    """
+    from fypa.altium.annotations import (
+        RegulatorSpec,
+        ResistorSpec,
+        SinkSpec,
+        SourceSpec,
+    )
+    from fypa.altium.extract import NO_NET
+    from fypa.altium.loader import _directive_terminals
+
+    extracted = loaded.extracted
+    if not extracted.enabled_copper_layer_ids():
+        return False
+    nets = list(getattr(extracted, "nets", ()) or ())
+
+    def _net_key(name) -> str | None:
+        if not name or name == _UNNAMED_NET:
+            return None
+        return str(name).upper()
+
+    # (role, touched-net keys) per directive; role in {source, sink, bridge}.
+    items: list[tuple[str, set[str]]] = []
+
+    override_desigs = {
+        ed.overrides_designator for ed in editor_directives
+        if getattr(ed, "overrides_designator", None)
+    }
+    for d in getattr(loaded.annotations, "directives", ()):
+        if getattr(d, "designator", None) in override_desigs:
+            continue
+        if isinstance(d, (SourceSpec, RegulatorSpec)):
+            role = "source"
+        elif isinstance(d, SinkSpec):
+            role = "sink"
+        elif isinstance(d, ResistorSpec):
+            role = "bridge"
+        else:
+            continue
+        keys: set[str] = set()
+        for term in _directive_terminals(d):
+            for pin in getattr(term, "pins", ()) or ():
+                idx = pin.net_index
+                if idx != NO_NET and 0 <= idx < len(nets):
+                    k = _net_key(getattr(nets[idx], "name", None))
+                    if k:
+                        keys.add(k)
+        if keys:
+            items.append((role, keys))
+
+    for ed in editor_directives:
+        if ed.role == "SOURCE":
+            if ed.voltage is None:
+                continue
+            role = "source"
+        elif ed.role == "SINK":
+            if ed.current is None:
+                continue
+            role = "sink"
+        elif ed.role == "SERIES":
+            if ed.resistance is None or ed.resistance <= 0:
+                continue
+            role = "bridge"
+        else:
+            continue  # REGULATOR etc. — apply_editor_directives skips these
+        p_name = ed.p_net
+        if p_name == _UNNAMED_NET and p_net_resolver is not None:
+            try:
+                p_name = p_net_resolver(ed) or p_name
+            except Exception:  # lookup is best-effort
+                log.debug("p_net_resolver failed for %s", ed.id, exc_info=True)
+        two_net = ed.role == "SERIES" or not ed.single_net
+        names = [p_name] + ([ed.n_net] if two_net else [])
+        keys = {k for k in (_net_key(n) for n in names) if k}
+        # A terminal on unnamed copper can't be solved — treat the whole
+        # directive as unresolved, as apply_editor_directives drops it.
+        if len(keys) != len(names):
+            continue
+        items.append((role, keys))
+
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for _role, keys in items:
+        ordered = sorted(keys)
+        for other in ordered[1:]:
+            ra, rb = find(ordered[0]), find(other)
+            if ra != rb:
+                parent[rb] = ra
+
+    roles_by_group: dict[str, set[str]] = {}
+    for role, keys in items:
+        roles_by_group.setdefault(find(min(keys)), set()).add(role)
+    return any({"source", "sink"} <= roles for roles in roles_by_group.values())
+
+
 def apply_copper_names(loaded, copper_names) -> list[str]:
     """Promote user-named unnamed-copper pieces into real nets on
     ``loaded.extracted``, in place.
@@ -363,6 +653,7 @@ def apply_copper_names(loaded, copper_names) -> list[str]:
     from fypa.altium_geometry import (
         _arc_polygon,
         _fill_polygon,
+        _pour_outline_is_artwork,
         _region_polygon,
         _shape_based_region_polygon,
         _track_polygon,
@@ -445,7 +736,7 @@ def apply_copper_names(loaded, copper_names) -> list[str]:
 
     for t in extracted.tracks:
         if (t.layer_id in enabled_set and t.net_index == NO_NET
-                and not t.is_keepout and not t.is_polygon_outline
+                and not t.is_keepout and not _pour_outline_is_artwork(t)
                 and t.width_mm > 0):
             try:
                 _take(t, _track_polygon(t))

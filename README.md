@@ -49,7 +49,7 @@ or voltage), point this tool at the `.PrjPcb`, and it:
 
 If you just want to run the tool — no Python install, no git clone — grab the
 latest packaged build from the
-[Releases page](https://github.com/cutreedesigns/FYPA/releases/latest):
+[Releases page](https://github.com/anarthrous-eda/FYPA/releases/latest):
 
 1. Download `FYPA_v<version>.zip` from the latest release's *Assets*.
 2. Extract it anywhere permanent (e.g. `C:\Tools\FYPA\`).
@@ -74,10 +74,17 @@ management. Install uv once (Windows):
 winget install astral-sh.uv          # or: pip install uv
 ```
 
+> **First-time install: restart your terminal.** The installer adds `uv` to
+> your `PATH`, but shells that are already open don't see the change — you'll
+> get `uv : The term 'uv' is not recognized`. Close and reopen the terminal.
+> If you ran the install from the VS Code terminal, close and reopen **VS Code
+> itself** (it caches the environment it was launched with; a new terminal tab
+> isn't enough). `uv --version` should then work.
+
 Then clone and sync:
 
 ```sh
-git clone git@github.com:cutreedesigns/FYPA.git
+git clone git@github.com:anarthrous-eda/FYPA.git
 cd FYPA
 uv sync
 ```
@@ -85,15 +92,12 @@ uv sync
 That's it. `uv sync` reads `pyproject.toml` + `uv.lock`, fetches Python 3.12
 if it isn't already available (the version is pinned in `.python-version`),
 creates a `.venv\` inside the repo, and installs every runtime + dev
-dependency — including `altium_monkey`, which uv pulls from
-[upstream](https://github.com/wavenumber-eng/altium_monkey) at the tag pinned
-in `pyproject.toml`'s `[tool.uv.sources]`.
+dependency — including `altium_monkey`, which uv pulls from PyPI at the
+version pinned in `pyproject.toml`.
 
-> **Python version: 3.11 or 3.12 only.** The `altium_monkey` upstream pins
-> `requires-python = ">=3.11,<3.13"`, and its `numpy==2.2.3` dependency
-> does not yet ship wheels for 3.13/3.14. `.python-version` pins 3.12, which
-> uv fetches automatically; to use 3.11 instead, edit that file before
-> running `uv sync`.
+> **Python version: 3.12 only.** Both FYPA and `altium_monkey` pin
+> `requires-python = ">=3.12,<3.13"`. `.python-version` selects 3.12, which
+> uv fetches automatically.
 
 Day-to-day commands:
 
@@ -121,12 +125,29 @@ define the power-delivery topology:
 | `SERIES`     | `PDN_R`, `PDN_P_NET`\*, `PDN_N_NET`\*                                                                   | Series resistance / fuse / ferrite / inductor DCR (rail bridge)       |
 | `REGULATOR`  | `PDN_V`, `PDN_REGULATOR_TYPE`, `PDN_REGULATOR_EFFICIENCY`, optional `PDN_QUIESCENT` — *or* `PDN_GAIN`, plus `PDN_OUT_*` / `PDN_IN_*` nets | On-board regulator (LDO / buck) — models BOTH input and output rails  |
 
+Optional two-terminal helpers (SOURCE / SINK):
+
+| Parameter | Purpose |
+|-----------|---------|
+| `PDN_P_PINS` / `PDN_N_PINS` | Restrict which pads on the host (or DES-listed parts) couple |
+| `PDN_P_DES` / `PDN_N_DES` | Pull that terminal's pads from other designators only (host not auto-included); for multi-connector / banana-style sources |
+| `PDN_PIN_R` (`SINK`) | Package pin-to-pin resistance in ohms, used to share current between a multi-pin terminal's pads. Defaults to 100 mΩ — see *Settings → Multi-pin coupling resistance*. Set it per part when you know the package: a large BGA's supply grid is far lower than a leadframe's. |
+
 \* `PDN_P_NET` and `PDN_N_NET` are optional for `SERIES` on a 2-pin part — the
 tool auto-infers them from the component's pad connectivity.
 
 Add `PDN_ROLE` on the component (e.g. `PDN_ROLE=SOURCE`) and the required parameters for that role. 
 For 2-pin parts the tool can auto-infer `PDN_P_NET` /
 `PDN_N_NET` from connectivity; for ICs you'll need to set them explicitly.
+
+Pads on a rail net are collected automatically. To keep enable/signal ties
+off the terminal — especially on multi-rail ICs in a SchLib — set part-wide
+`PDN_PINS_ONLY` (optional `PDN_EXTRA_PINS` adds to that list on the instance;
+EXTRA alone is the full allowlist). Per-terminal `PDN_P_PINS` / `PDN_N_PINS`
+still override one terminal; `PDN_IGNORE` / `PDN_IGNORE_PINS` fine-tune
+exclusions. See
+[Restricting which pins may join](docs/user-guide/01-sources-and-sinks.md#restricting-which-pins-may-join-allowlist)
+in the user guide.
 
 ### `SINK` — minimum-voltage check (`PDN_MIN_V`)
 
@@ -194,16 +215,44 @@ a positive integer to `PDN` in the parameter prefix:
 | 2       | `PDN2_V` | `PDN2_I` | `PDN2_R` | `PDN2_P_NET`, … |
 | …       | … | … | … | … |
 
-REGULATOR channels also require `PDN<n>_GAIN` and the four `PDN<n>_OUT_*` /
-`PDN<n>_IN_*` net (or pin) parameters per channel.
+REGULATOR channels also require the four `PDN<n>_OUT_*` / `PDN<n>_IN_*` net
+(or pin) parameters per channel (IN may be inherited from unindexed
+`PDN_IN_*`; see templates below).
 
-The legacy unindexed channel and any number of indexed channels coexist
-as independent directives. Indices are sparse — gaps are allowed (e.g.
-just `PDN_V` + `PDN2_V`). A channel is "present" iff its value parameter
-is set; the per-channel `*_NET` and `*_PINS` parameters use the matching
-index. The part-wide `PDN_ROLE` is the **default** role for every channel —
-a channel can override it with `PDN<n>_ROLE` (see [Mixed-role
+The legacy unindexed channel and any number of indexed channels can coexist
+as independent directives when the unindexed form has its own terminals.
+Indices are sparse — gaps are allowed (e.g. just `PDN_V` + `PDN2_V`). A
+channel is present when its value parameter or a channel-defining terminal
+is set; unset indexed params inherit from the matching unindexed
+`PDN_*` template. The part-wide `PDN_ROLE` is the **default** role for every
+channel — a channel can override it with `PDN<n>_ROLE` (see [Mixed-role
 parts](#mixed-role-parts-a-source-and-a-sink-on-one-component) below).
+
+**Templates:** the unindexed form stays a real directive alongside indexed
+channels only when it is a channel in its own right — its **own** value
+parameter *and* a *complete* terminal set (both P and N for
+SOURCE/SINK/SERIES; both `OUT_*` sides for REGULATOR). Otherwise unindexed
+`PDN_*` values are defaults only and no legacy directive is emitted. A
+shared `PDN_N_NET = GND` or `PDN_IN_*` alone is a template, and so is a
+complete `PDN_P_NET` + `PDN_N_NET` pair with the values on `PDN1_I` /
+`PDN2_I`. Unindexed `PDN_NET` / `PDN_PINS` with its own value is a complete
+single-net channel and is kept alongside indexed channels.
+Indexed-only parts (`PDNn_ROLE` without `PDN_ROLE`) always treat unindexed
+values as templates when indexed channels exist.
+
+Inheritance is scoped to the part-wide role: a channel that overrides it
+with `PDN<n>_ROLE` reads nothing from the template, so a SERIES channel on
+a SINK part cannot pick up the sink's nets. The two terminal forms are also
+atomic — a channel that names `PDN1_P_NET` / `PDN1_N_NET` never inherits a
+shared `PDN_NET`, and vice versa. Example — shared SERIES resistance:
+
+```text
+SW1:
+  PDN_ROLE   = SERIES
+  PDN_R      = 0.05
+  PDN1_P_NET = VIN_A     PDN1_N_NET = VOUT_A
+  PDN2_P_NET = VIN_B     PDN2_N_NET = VOUT_B
+```
 
 Example — a SINK with three independent supply rails:
 
@@ -239,6 +288,11 @@ On **repeated schematic sheets** (Altium `REPEAT`), `PDN_*_NET` may use
 the local child-sheet net label; FYPA maps each PCB instance to its slot
 net via pin connectivity (not via `ChannelDesignatorFormatString`). See
 [User guide — Local net names](docs/user-guide/01-sources-and-sinks.md#local-net-names-hierarchical--reused-sheets).
+Different values per placement use sheet-symbol parameters
+`PDN_<Designator>_*` (e.g. `PDN_J1_I`) — see
+[Per-instance overrides on sheet symbols](docs/user-guide/01-sources-and-sinks.md#per-instance-overrides-on-sheet-symbols).
+The same overrides apply when the shared role/nets live only on the PCB
+(Blanket / ECO) and the per-instance value is on the sheet symbol.
 
 ### Mixed-role parts (a source and a sink on one component)
 
@@ -506,14 +560,30 @@ FYPA\
 
 ### Distributing
 
-The standard distribution channel is **GitHub Releases** — tag a version
-(e.g. `v0.02`), draft a release on GitHub, and upload `dist\FYPA.zip`
-(rename it to include the version, e.g. `FYPA_v0.02.zip`) as a release
-asset. Users follow the
+The standard distribution channel is **GitHub Releases**, and publishing one
+is automated — pushing a version tag runs
+[`.github/workflows/release.yml`](.github/workflows/release.yml), which lints,
+tests, stamps the tag into `__version__`, builds the PyInstaller bundle, and
+uploads `FYPA_v<version>.zip` with auto-generated release notes:
+
+```
+git tag -a v1.7.0 -m "FYPA v1.7.0"
+git push origin v1.7.0
+```
+
+Run `uv run ruff check .` and `uv run pytest` **before** tagging — the
+workflow runs the same gate, and a failure there means no release is created
+and the tag has to be deleted locally and on GitHub before the version number
+can be reused. Everything in the release must already be merged to `main`;
+the tag is only a pointer to a commit. The release publishes live immediately
+(add `--draft` to the `gh release create` step if you'd rather review first).
+
+Users follow the
 [Download (prebuilt Windows binary)](#download-prebuilt-windows-binary)
 instructions above.
 
-The zip can also be sent directly if you don't want to publish a release.
+To build and share a zip without publishing a release, run
+`packaging\build_dist.bat` and send `dist\FYPA.zip` directly.
 
 Cached solves (`.cache\`) are written next to `FYPA.exe`, so they survive
 re-extracting a new build over the old folder.

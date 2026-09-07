@@ -80,6 +80,13 @@ class EditorDirective:
     # with ``p_net`` (PDN_PINS in single-net mode), ``n_pins`` with ``n_net``.
     p_pins: list[str] | None = None
     n_pins: list[str] | None = None
+    # Optional multi-connector designator lists (schematic ``PDN_P_DES`` /
+    # ``PDN_N_DES``). When set on a two-net SOURCE/SINK, that terminal's pads
+    # come only from the listed designators — the host is not auto-included.
+    # ``None`` keeps host-only resolution (backward compatible). Ignored for
+    # free markers and single-net / SERIES directives.
+    p_des: list[str] | None = None
+    n_des: list[str] | None = None
     voltage: float | None = None
     current: float | None = None
     resistance: float | None = None       # SERIES only, ohms
@@ -101,11 +108,13 @@ class EditorDirective:
             d["anchor_xy"] = [float(self.anchor_xy[0]), float(self.anchor_xy[1])]
         d["p_pins"] = list(self.p_pins) if self.p_pins is not None else None
         d["n_pins"] = list(self.n_pins) if self.n_pins is not None else None
+        d["p_des"] = list(self.p_des) if self.p_des is not None else None
+        d["n_des"] = list(self.n_des) if self.n_des is not None else None
         return d
 
     @staticmethod
     def _coerce_pins(raw: Any) -> list[str] | None:
-        """Normalise a stored pin list to ``list[str]`` (or ``None``).
+        """Normalise a stored pin / designator list to ``list[str]`` (or ``None``).
 
         Drops blanks / whitespace; an empty result collapses to ``None`` so
         "no restriction" and "explicitly empty" are the same thing."""
@@ -131,6 +140,8 @@ class EditorDirective:
             n_net=d.get("n_net"),
             p_pins=cls._coerce_pins(d.get("p_pins")),
             n_pins=cls._coerce_pins(d.get("n_pins")),
+            p_des=cls._coerce_pins(d.get("p_des")),
+            n_des=cls._coerce_pins(d.get("n_des")),
             voltage=(None if d.get("voltage") is None else float(d["voltage"])),
             current=(None if d.get("current") is None else float(d["current"])),
             resistance=(None if d.get("resistance") is None
@@ -202,6 +213,13 @@ class CapOverride:
     carries no case-size code — a tantalum brick, an electrolytic — since no
     table can predict those.
 
+    ``capacitance_f`` replaces the value parsed from the part's Altium
+    parameters, for the part whose ``Comment`` no heuristic can read and for
+    the DC-bias / temperature derating the nameplate value ignores.
+    ``package`` replaces the case size detected from the footprint name; it
+    holds the **canonical imperial key** ("0402"), never a metric display
+    label, so the choice survives a change of case-size convention.
+
     An override with every field ``None`` is meaningless and is dropped on
     upsert.
     """
@@ -211,11 +229,14 @@ class CapOverride:
     target_label: str | None = None
     esl_h: float | None = None
     esr_ohm: float | None = None
+    capacitance_f: float | None = None
+    package: str | None = None
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
     def is_empty(self) -> bool:
         return (self.include is None and self.target_label is None
-                and self.esl_h is None and self.esr_ohm is None)
+                and self.esl_h is None and self.esr_ohm is None
+                and self.capacitance_f is None and self.package is None)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -225,6 +246,8 @@ class CapOverride:
             "target_label": self.target_label,
             "esl_h": self.esl_h,
             "esr_ohm": self.esr_ohm,
+            "capacitance_f": self.capacitance_f,
+            "package": self.package,
         }
 
     @classmethod
@@ -246,6 +269,9 @@ class CapOverride:
                           else str(d["target_label"])),
             esl_h=_float("esl_h"),
             esr_ohm=_float("esr_ohm"),
+            capacitance_f=_float("capacitance_f"),
+            package=(None if d.get("package") is None
+                     else str(d["package"]) or None),
         )
 
 
@@ -265,6 +291,13 @@ class ProjectFile:
     copper_names: list[CopperName] = field(default_factory=list)
     cap_overrides: list[CapOverride] = field(default_factory=list)
     net_renames: dict[str, str] = field(default_factory=dict)   # reserved
+    # Designators the user has told FYPA NOT to auto-bridge. A Net Tie, 0 Ω
+    # resistor or wire jumper is normally shorted automatically and its two
+    # nets merged; listing it here leaves it open at DC instead. Needed
+    # because the auto-bridge runs during annotation parsing, long before
+    # editor directives are applied, so an editor directive cannot veto one
+    # — this list is the only thing that can. Case-insensitive on use.
+    no_auto_bridge: list[str] = field(default_factory=list)
     viewer_settings: dict[str, Any] = field(default_factory=dict)
 
     # ---- Gerber-import fields (schema v2) --------------------------------
@@ -305,6 +338,7 @@ class ProjectFile:
             "copper_names": [c.to_dict() for c in self.copper_names],
             "cap_overrides": [c.to_dict() for c in self.cap_overrides],
             "net_renames": dict(self.net_renames),
+            "no_auto_bridge": list(self.no_auto_bridge),
             "viewer_settings": dict(self.viewer_settings),
             "source_kind": self.source_kind,
             "gerber_files": [_rel(p, base) for p in self.gerber_files],
@@ -352,6 +386,7 @@ class ProjectFile:
                 CapOverride.from_dict(c)
                 for c in doc.get("cap_overrides", [])
             ],
+            no_auto_bridge=[str(d) for d in doc.get("no_auto_bridge", [])],
             net_renames=dict(doc.get("net_renames", {})),
             viewer_settings=dict(doc.get("viewer_settings", {})),
             source_kind=str(doc.get("source_kind", "altium")),
@@ -440,13 +475,15 @@ class ProjectFile:
         target_label: str | None = ...,
         esl_h: float | None = ...,
         esr_ohm: float | None = ...,
+        capacitance_f: float | None = ...,
+        package: str | None = ...,
     ) -> None:
         """Merge the given fields into the designator's override (one
         override per designator). A field passed as the ``...`` sentinel is
-        left untouched, so the include toggle, the target picker and the two
-        parasitic editors each update their own part independently. An
-        override whose fields are all back at ``None`` is removed entirely —
-        the .fypa doesn't accumulate no-op entries."""
+        left untouched, so the include toggle, the target picker and the
+        value / package / parasitic editors each update their own part
+        independently. An override whose fields are all back at ``None`` is
+        removed entirely — the .fypa doesn't accumulate no-op entries."""
         existing = self.cap_override_for(designator)
         merged = existing or CapOverride(designator=designator)
         if include is not ...:
@@ -457,6 +494,10 @@ class ProjectFile:
             merged.esl_h = esl_h
         if esr_ohm is not ...:
             merged.esr_ohm = esr_ohm
+        if capacitance_f is not ...:
+            merged.capacitance_f = capacitance_f
+        if package is not ...:
+            merged.package = package or None
         if merged.is_empty():
             if existing is not None:
                 self.cap_overrides = [
@@ -492,6 +533,25 @@ class ProjectFile:
             if c.esr_ohm is not None:
                 esrs[c.designator] = c.esr_ohm
         return esls, esrs
+
+    def cap_value_overrides(
+        self,
+    ) -> tuple[dict[str, float], dict[str, str]]:
+        """(capacitance_overrides, package_overrides) keyed by designator.
+
+        Separate from :meth:`cap_parasitic_overrides` because these two
+        replace values the *extraction* produced (the parsed part value, the
+        case size read off the footprint name), where the parasitics replace
+        values the package library supplied.
+        """
+        caps: dict[str, float] = {}
+        packages: dict[str, str] = {}
+        for c in self.cap_overrides:
+            if c.capacitance_f is not None:
+                caps[c.designator] = c.capacitance_f
+            if c.package:
+                packages[c.designator] = c.package
+        return caps, packages
 
 
 # --- path helpers -------------------------------------------------------------

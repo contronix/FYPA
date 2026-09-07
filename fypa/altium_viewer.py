@@ -38,9 +38,11 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import matplotlib
 import matplotlib.cm as _mpl_cm
+import matplotlib.colors
 import numpy as np
 import shapely.geometry as _sg
 import shapely.prepared as _sp
@@ -247,7 +249,8 @@ def _load_fypa_text_pixmap(height: int) -> QPixmap | None:
 
 
 from PySide6.QtCore import (
-    QByteArray, QEvent, QObject, QPointF, QRectF, QSize, Qt, QThread, QTimer, QUrl, Signal,
+    QByteArray, QEvent, QLocale, QMetaMethod, QObject, QPointF, QRectF, QSize,
+    Qt, QThread, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
     QAction,
@@ -298,6 +301,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -1325,9 +1329,10 @@ def _eye_icon_color(theme: dict, *, open_: bool, partial: bool) -> QColor:
 def _make_eye_pixmap(open_: bool, *, partial: bool = False, size: int = 16) -> QPixmap:
     """Draw an Altium-style eye icon.
 
-    ``open_`` = True  → full-contrast open eye (all children visible).
-    ``partial`` = True → same open-eye shape, muted (some children visible).
-    ``open_`` = False → muted eye with a diagonal slash (all hidden).
+    ``open_`` drives the silhouette: an open eye, or a slashed one when this
+    item's own copper is hidden. ``partial`` only mutes the colour, so all
+    four combinations stay distinguishable — in particular hidden-with-
+    visible-descendants keeps its slash instead of reading as visible.
     """
     px = QPixmap(size, size)
     px.fill(Qt.transparent)
@@ -1357,7 +1362,7 @@ def _make_eye_pixmap(open_: bool, *, partial: bool = False, size: int = 16) -> Q
     r = size * 0.17
     p.drawEllipse(QPointF(size / 2.0, cy), r, r)
 
-    if not open_ and not partial:
+    if not open_:
         slash = QPen(color)
         slash.setWidthF(max(1.2, size * 0.11))
         slash.setCapStyle(Qt.RoundCap)
@@ -1379,6 +1384,100 @@ def _eye_pixmap(open_: bool, size: int = 16, *, partial: bool = False) -> QPixma
     return cached
 
 
+# Capacitor traces beyond this many carry no legend label. A rail with dozens
+# of decoupling caps otherwise produces a legend taller than the axes, hiding
+# the |Z| trace and the anti-resonance markers the tab exists to show; the
+# unlabelled traces stay identifiable by colour and the hover tooltip.
+_IMP_MAX_LEGEND_BRANCHES = 8
+
+
+class _ImpBranch(NamedTuple):
+    """One capacitor's |Z| trace, plus everything the hover hit-test needs.
+
+    ``log_f`` / ``log_z`` are precomputed per replot: the hit-test runs on
+    every mouse-move, and recomputing ``log10`` over the whole sweep there made
+    each event O(branches x samples) on the GUI thread. ``color`` is kept so
+    the highlight can be undone without re-deriving the palette.
+    """
+
+    line: object
+    designator: str
+    freqs: object
+    z: object
+    log_f: object
+    log_z: object
+    color: str
+
+
+def _branch_colors(n: int) -> list[str]:
+    """Distinct colours for the per-capacitor traces.
+
+    They were all one muted grey, which made the per-designator legend N
+    identical swatches — no way to map a designator to a trace, which is the
+    whole point of the "Show individual capacitors" checkbox. tab20 reads
+    acceptably on both the light and the dark theme.
+    """
+    cmap = matplotlib.colormaps["tab20"]
+    return [matplotlib.colors.to_hex(cmap(i % cmap.N)) for i in range(n)]
+
+
+def _floating_tooltip_qss(font_family: str | None = None,
+                          font_size: str = "9pt",
+                          padding: str = "4px 8px") -> str:
+    t = _T()
+    family = f" font-family: {font_family};" if font_family else ""
+    return (
+        "QLabel {"
+        f" background-color: {t['bg']};"
+        f" color: {t['fg']};"
+        f" border: 1px solid {t['border']};"
+        f" padding: {padding};"
+        f"{family}"
+        f" font-size: {font_size};"
+        "}"
+    )
+
+
+def _make_floating_tooltip(parent, *, font_family: str | None = None,
+                           font_size: str = "9pt",
+                           padding: str = "4px 8px") -> QLabel:
+    """A frameless, non-focusing tooltip label positioned in GLOBAL coordinates.
+
+    ``Qt.ToolTip`` makes the label a top-level window, so it is never clipped
+    to its parent's rect and is placed from :meth:`QCursor.pos`. Going through
+    the cursor also sidesteps two traps in putting a label over a matplotlib
+    canvas: mpl mouse events are bottom-origin where ``QWidget.move`` is
+    top-origin, and they carry physical device pixels where ``move`` takes
+    logical ones — so using ``event.x``/``event.y`` directly mirrors the label
+    about the canvas midline and displaces it by the device-pixel ratio.
+
+    ``WA_TransparentForMouseEvents`` stops the label stealing the very hover
+    events that drive it when it slides under the cursor.
+    """
+    label = QLabel(parent, Qt.ToolTip | Qt.FramelessWindowHint)
+    label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+    label.setAttribute(Qt.WA_ShowWithoutActivating, True)
+    label.setFocusPolicy(Qt.NoFocus)
+    label.setStyleSheet(_floating_tooltip_qss(font_family, font_size, padding))
+    label.hide()
+    return label
+
+
+def _move_tooltip_to_cursor(label) -> None:
+    """Anchor below-right of the cursor (Windows convention), clamped to the
+    current screen so the label stays fully visible near an edge."""
+    gx = QCursor.pos().x() + 16
+    gy = QCursor.pos().y() + 20
+    screen = label.screen() or QApplication.primaryScreen()
+    if screen is not None:
+        geo = screen.availableGeometry()
+        gx = min(gx, geo.right() - label.width() - 2)
+        gy = min(gy, geo.bottom() - label.height() - 2)
+        gx = max(gx, geo.left() + 2)
+        gy = max(gy, geo.top() + 2)
+    label.move(gx, gy)
+
+
 def _qt_widget_alive(widget) -> bool:
     """True when ``widget`` is a live Qt C++ object (not already deleted)."""
     if widget is None:
@@ -1394,18 +1493,54 @@ class EyeButton(QToolButton):
     """Altium-style eye-icon toggle for layer visibility."""
 
     toggled_visible = Signal(bool)
+    shift_clicked = Signal()
+    # Ctrl+Click — the rail-tree subnet eyes use this for SERIES-subtree
+    # fan-out. Opt-in like Shift: an eye whose owner never connects it keeps
+    # the plain toggle rather than turning Ctrl+Click into a dead click.
+    ctrl_clicked = Signal()
+
+    _SHIFT_TIP = (
+        "\nShift+Click: show only this item; again to invert (hide this, show others)"
+    )
+    # Appended to a badge eye's own tip so the muted icon has an explanation.
+    _MIXED_TIP = "\nThis SERIES subtree is partly hidden"
 
     def __init__(self, parent=None, *, visible: bool = True,
                  icon_size: int = 16,
                  tip_show: str = "Show layer",
-                 tip_hide: str = "Hide layer") -> None:
+                 tip_hide: str = "Hide layer",
+                 shift_isolatable: bool = False,
+                 partial_is_badge: bool = False) -> None:
         super().__init__(parent)
         self._visible = bool(visible)
         self._partial = False
         self._icon_size = icon_size
         self._tip_show = tip_show
         self._tip_hide = tip_hide
-        self._tip_partial = "Some subnet nets visible — click to show all"
+        # Only eyes whose owner connects ``shift_clicked`` may claim Shift: on
+        # any other eye, swallowing the modifier turns a Shift+click into a
+        # dead click and the advertised tip would be a lie.
+        self._shift_isolatable = bool(shift_isolatable)
+        shift_tip = self._SHIFT_TIP if self._shift_isolatable else ""
+        # Two kinds of eye share this class:
+        #
+        # * Aggregate ("All layers", a rail row) — owns no copper of its own,
+        #   so partial means "some children on" and a click means "show them
+        #   all".
+        # * Badge (a rail-tree subnet node) — owns this net's copper. Partial
+        #   is information *about its descendants*; it must never veto the
+        #   plain toggle, or the node's own copper cannot be hidden while any
+        #   descendant differs. Subtree fan-out is Ctrl+Click's job.
+        self._partial_is_badge = bool(partial_is_badge)
+        self._tip_partial = (
+            "Some subnet nets visible — click to show all" + shift_tip
+        )
+        self._shift_tip = shift_tip
+        # Set by the owner after construction (an unsolved rail explaining why
+        # it is disabled, say). Once set, state changes must not overwrite it.
+        self._custom_tip = False
+        self._setting_own_tip = False
+        self._press_mods: Qt.KeyboardModifiers = Qt.NoModifier
         self.setAutoRaise(True)
         self.setCursor(Qt.PointingHandCursor)
         self.setIconSize(QSize(icon_size, icon_size))
@@ -1424,7 +1559,10 @@ class EyeButton(QToolButton):
         self, on: bool, *, partial: bool = False, emit: bool = True,
     ) -> None:
         on = bool(on)
-        partial = bool(partial) and on
+        # Partial may sit on an off badge eye (this net hidden, descendants
+        # shown). An aggregate eye has no such state — its owner only ever
+        # passes partial together with on.
+        partial = bool(partial)
         if on == self._visible and partial == self._partial:
             return
         self._visible = on
@@ -1433,20 +1571,76 @@ class EyeButton(QToolButton):
         if emit:
             self.toggled_visible.emit(self._visible)
 
+    def setToolTip(self, tip: str) -> None:
+        if not self._setting_own_tip:
+            self._custom_tip = True
+        super().setToolTip(tip)
+
+    def _set_own_tooltip(self, tip: str) -> None:
+        self._setting_own_tip = True
+        try:
+            self.setToolTip(tip)
+        finally:
+            self._setting_own_tip = False
+
     def _apply_icon(self) -> None:
+        # The slash tracks this eye's *own* state; partial only mutes the
+        # colour. An off badge eye whose descendants are on must not borrow
+        # the open silhouette, or hidden copper looks exactly like drawn
+        # copper.
         self.setIcon(QIcon(_eye_pixmap(
             self._visible, self._icon_size, partial=self._partial,
         )))
+        if self._custom_tip:
+            return
+        if self._partial and not self._partial_is_badge:
+            self._set_own_tooltip(self._tip_partial)
+            return
+        base = self._tip_hide if self._visible else self._tip_show
         if self._partial:
-            self.setToolTip(self._tip_partial)
-        else:
-            self.setToolTip(self._tip_hide if self._visible else self._tip_show)
+            base += self._MIXED_TIP
+        self._set_own_tooltip(base + self._shift_tip)
+
+    def mousePressEvent(self, event) -> None:
+        # Capture modifiers at press time — clicked fires on release and
+        # QApplication.keyboardModifiers() may already be cleared.
+        self._press_mods = event.modifiers()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        # ``clicked`` is emitted from inside the base implementation, so
+        # ``_on_clicked`` still sees the press modifiers. Clearing afterwards
+        # stops a press that never produced a click (drag off the button, a
+        # cancelled press) from leaking Shift/Ctrl into the next click —
+        # including programmatic ``click()`` and accessibility activation,
+        # which never go through ``mousePressEvent`` at all.
+        try:
+            super().mouseReleaseEvent(event)
+        finally:
+            self._press_mods = Qt.NoModifier
+
+    def _signal_connected(self, signal) -> bool:
+        return self.isSignalConnected(QMetaMethod.fromSignal(signal))
 
     def _on_clicked(self) -> None:
-        if self._partial:
+        mods = self._press_mods
+        self._press_mods = Qt.NoModifier
+        if self._shift_isolatable and mods & Qt.ShiftModifier:
+            self.shift_clicked.emit()
+            return
+        if (mods & Qt.ControlModifier) and self._signal_connected(
+            self.ctrl_clicked,
+        ):
+            self.ctrl_clicked.emit()
+            return
+        if self._partial and not self._partial_is_badge:
+            # Aggregate eye: partial → show every child.
             self.setVisibleState(True, partial=False)
-        else:
-            self.setVisibleState(not self._visible, partial=False)
+            return
+        # Badge eye (and any plain eye): toggle this eye's own copper. The
+        # partial badge is recomputed by the owner from the new subtree
+        # state, so it is carried across rather than cleared here.
+        self.setVisibleState(not self._visible, partial=self._partial)
 
 
 # --- Wire-mesh / solid fill toggle icons -----------------------------------
@@ -2431,18 +2625,25 @@ def _overlay_hole_ring(rec: dict) -> np.ndarray:
 
 
 class SidebarToggleButton(QToolButton):
-    """Slim vertical splitter handle that collapses / expands the heatmap
-    side panel. Paints a crisp anti-aliased triangle pointing in the
-    direction the panel will travel on the next click, instead of relying
-    on Unicode arrow glyphs (which render fuzzy at this size on Windows).
+    """Slim vertical splitter between the heatmap side panel and the plot.
+
+    * **Click** — collapse / expand the side panel (hotkey ``B``).
+    * **Drag horizontally** — resize the side panel width.
     """
+
+    # Delta (px) from the press position while dragging; positive = wider panel.
+    resizedBy = Signal(int)
+
+    _DRAG_THRESHOLD_PX = 4
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._collapsed = False
+        self._press_global_x: float | None = None
+        self._dragging = False
         self.setAutoRaise(True)
         self.setFocusPolicy(Qt.NoFocus)
-        self.setCursor(Qt.PointingHandCursor)
+        self.setCursor(Qt.SizeHorCursor)
         self.setFixedWidth(14)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
 
@@ -2451,10 +2652,53 @@ class SidebarToggleButton(QToolButton):
         if collapsed == self._collapsed:
             return
         self._collapsed = collapsed
+        self.setCursor(
+            Qt.PointingHandCursor if collapsed else Qt.SizeHorCursor,
+        )
         self.update()
 
     def isCollapsed(self) -> bool:
         return self._collapsed
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self._press_global_x = float(event.globalPosition().x())
+            self._dragging = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if (
+            self._press_global_x is not None
+            and event.buttons() & Qt.LeftButton
+            and not self._collapsed
+        ):
+            dx = int(round(float(event.globalPosition().x()) - self._press_global_x))
+            if not self._dragging and abs(dx) >= self._DRAG_THRESHOLD_PX:
+                self._dragging = True
+            if self._dragging:
+                self.resizedBy.emit(dx)
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        was_drag = event.button() == Qt.LeftButton and self._dragging
+        self._press_global_x = None
+        self._dragging = False
+        if was_drag:
+            # Swallow the click (a drag must not also toggle the panel) but
+            # still let QAbstractButton finish its press: returning early
+            # here left its internal ``down`` flag latched and ``released``
+            # never emitted.
+            self.setDown(False)
+            self.blockSignals(True)
+            try:
+                super().mouseReleaseEvent(event)
+            finally:
+                self.blockSignals(False)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def paintEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         t = _T()
@@ -3012,9 +3256,17 @@ def _slider_data_max(vs_arr: np.ndarray, mode: str, raw_max: float) -> float:
 def _face_to_vertex_average(tris: np.ndarray, face_values: np.ndarray,
                             n_verts: int) -> np.ndarray:
     """Average face-defined values onto vertices (each vertex gets the mean
-    of the values of its incident faces). Vectorised via ``np.bincount`` —
-    same result as a Python loop, and 5–10× faster than ``np.add.at`` on
-    large meshes (bincount is a single C pass instead of six scatter-adds)."""
+    of the values of its incident faces). Vectorised via ``np.bincount``.
+
+    A note on the "bincount is faster than np.add.at" claim this docstring
+    used to make: it is no longer true. numpy grew a fast scatter path for
+    ``np.add.at`` in 1.24, and measured on numpy 2.2 the ``add.at`` form is
+    1.4-2.3x FASTER here (65 ms vs 103 ms on a 2M-triangle mesh). The two
+    also differ by up to ~6 ULP because they accumulate in different orders.
+    Kept as bincount because this is the viewer's hot path and changing the
+    accumulation order would shift rendered values; see
+    ``pdnsolver/vtu_fields.py`` for the same measurement written down where
+    the export path made the same choice in reverse."""
     if tris.size == 0:
         return np.zeros(n_verts, dtype=np.float64)
     # tris.ravel() is [f0v0, f0v1, f0v2, f1v0, …]; each vertex slot's weight is
@@ -4151,7 +4403,7 @@ class ScaleController(QWidget):
             f"QLabel {{ color: {_t['fg_muted']}; font-size: 8pt; }}"
         )
         self.min_edit = QLineEdit()
-        self.min_edit.setValidator(QDoubleValidator())
+        self.min_edit.setValidator(_numeric_validator(self, bottom=None))
         self.min_edit.editingFinished.connect(self._on_edits_committed)
         min_col.addWidget(min_lbl)
         min_col.addWidget(self.min_edit)
@@ -4164,7 +4416,7 @@ class ScaleController(QWidget):
             f"QLabel {{ color: {_t['fg_muted']}; font-size: 8pt; }}"
         )
         self.max_edit = QLineEdit()
-        self.max_edit.setValidator(QDoubleValidator())
+        self.max_edit.setValidator(_numeric_validator(self, bottom=None))
         self.max_edit.editingFinished.connect(self._on_edits_committed)
         max_col.addWidget(max_lbl)
         max_col.addWidget(self.max_edit)
@@ -4316,8 +4568,8 @@ class ScaleController(QWidget):
 
     def _on_edits_committed(self) -> None:
         try:
-            low = float(self.min_edit.text())
-            high = float(self.max_edit.text())
+            low = _parse_numeric_text(self.min_edit.text())
+            high = _parse_numeric_text(self.max_edit.text())
         except ValueError:
             return
         if high <= low:
@@ -4660,10 +4912,16 @@ class _SolveWorker(QThread):
                   loaded_project: object | None = None,
                   load_only: bool = False,
                   adaptive_regulator_gain: bool = False,
+                  no_auto_bridge: set[str] | None = None,
                   parent=None) -> None:
         super().__init__(parent)
         self._prjpcb_path = prjpcb_path
         self._settings = settings
+        # Designators the user has told the tool not to short automatically
+        # (Bridges tab). Has to reach load_project, not the editor-directive
+        # path: the auto-bridge and the net merge it triggers both happen
+        # while annotations are parsed, before editor directives exist.
+        self._no_auto_bridge = set(no_auto_bridge or ())
         # ``{(designator, schdoc, channel_index): current_amperes}`` —
         # substituted into the parsed AnnotationResult before build_problem
         # so the FEM sees the new currents. ``channel_index`` is None for
@@ -4734,11 +4992,18 @@ class _SolveWorker(QThread):
         self, loaded, pristine_loaded, _timer,
         *, needs_directives: bool = False,
         stage_message: str | None = None,
-        mesh_failures: list | None = None,
         stub_pieces_by_pair=None,
         per_net_layers=None,
     ) -> None:
-        """Package a stub LeanSolution + metadata and finish the worker."""
+        """Package a stub LeanSolution + metadata and finish the worker.
+
+        For the load-only and needs-directives stubs. A *mesh-failure* stub
+        goes through :func:`~fypa.altium.loader.package_mesh_failure` instead,
+        which additionally records ``mesher_config`` and per-via segment
+        resistances. That difference is deliberate, not drift: nothing was
+        meshed on this path, so there is no mesher run or via segmentation to
+        record, and inventing values would misreport the Setup tab.
+        """
         from fypa.altium.loader import build_solve_metadata
         from fypa.altium_geometry import build_per_net_geometry_layers
 
@@ -4757,7 +5022,6 @@ class _SolveWorker(QThread):
                 settings=self._settings,
                 per_net_layers=per_net_layers,
                 stub_pieces_by_pair=stub_pieces_by_pair,
-                mesh_failures=mesh_failures,
             )
         _timer.log_breakdown()
         self.finished_ok.emit(stub_solution, metadata, pristine_loaded)
@@ -4855,7 +5119,6 @@ class _SolveWorker(QThread):
             # computed against the on-disk project and would be wrong.
             if (self._try_solve_cache_first
                     and not self._load_only
-                    and not self._adaptive_regulator_gain
                     and pcbdoc_resolved is not None
                     and not self._stackup_overrides
                     and not self._sink_overrides
@@ -4869,6 +5132,14 @@ class _SolveWorker(QThread):
                     logging.getLogger(__name__).warning(
                         "Solve-cache check failed (%s: %s); will re-solve.",
                         type(e).__name__, e,
+                    )
+                    cached = None
+                if cached is not None and not _cache_serves_adaptive_request(
+                        cached[1], self._adaptive_regulator_gain):
+                    logging.getLogger(__name__).info(
+                        "Solve cache entry was not solved with adaptive SMPS "
+                        "gain and this design has eligible regulators — "
+                        "re-solving.",
                     )
                     cached = None
                 if cached is not None:
@@ -4941,8 +5212,10 @@ class _SolveWorker(QThread):
             if loaded is None:
                 self.stage_changed.emit("Loading project from disk…")
                 with _timer.stage("Extract + load project"):
-                    loaded = load_project(self._prjpcb_path,
-                                          pcbdoc_selector=self._pcbdoc_selector)
+                    loaded = load_project(
+                        self._prjpcb_path,
+                        pcbdoc_selector=self._pcbdoc_selector,
+                        no_auto_bridge=self._no_auto_bridge or None)
                 # Persist the freshly-loaded design info so the next run
                 # (e.g. a Re-run that only changes physics) can skip the
                 # extract step. Failures are non-fatal.
@@ -5010,6 +5283,20 @@ class _SolveWorker(QThread):
             # current, compounding). ``clone_loaded_for_edit`` copies only the
             # annotations (fresh directives list) and shares the override'd
             # extracted/geometry, so the override is preserved.
+            # "Adaptive SMPS gain" is a global preference, so it arrives set on
+            # boards it cannot affect. Collapse it to its effective value now
+            # that the design is loaded: the clone below and the cache-write
+            # guard later must not fire for a flag ``solve_problem_adaptive``
+            # will short-circuit anyway.
+            if self._adaptive_regulator_gain:
+                from fypa.altium.loader import has_adaptive_smps_regulators
+                if not has_adaptive_smps_regulators(loaded):
+                    logging.getLogger(__name__).info(
+                        "Adaptive SMPS gain requested but no regulator is "
+                        "eligible — treating as off (keeps the solve cache).",
+                    )
+                    self._adaptive_regulator_gain = False
+
             if (self._sink_overrides or self._editor_directives
                     or self._copper_names or self._adaptive_regulator_gain):
                 loaded = clone_loaded_for_edit(loaded)
@@ -5144,8 +5431,7 @@ class _SolveWorker(QThread):
                     loaded, mesher_config, _timer)
             else:
                 _packaged = self._solve_and_package_inprocess(
-                    loaded, mesher_config, _timer,
-                    pristine_loaded=pristine_loaded)
+                    loaded, mesher_config, _timer)
             if _packaged is None:
                 return
             new_solution, metadata = _packaged
@@ -5161,6 +5447,11 @@ class _SolveWorker(QThread):
                 _cache_log.warning(
                     "Solve cache NOT written: pcbdoc_resolved is None "
                     "(see earlier warning from _resolve_pcbdoc).",
+                )
+            elif (metadata or {}).get("mesh_failed"):
+                _cache_log.info(
+                    "Solve cache NOT written: meshing failed "
+                    "(stub only).",
                 )
             elif (self._stackup_overrides or self._sink_overrides
                     or self._editor_directives
@@ -5235,15 +5526,16 @@ class _SolveWorker(QThread):
         can kill it directly on cancel."""
         self._solve_child = proc
 
-    def _solve_and_package_inprocess(self, loaded, mesher_config, _timer, *,
-                                      pristine_loaded=None):
+    def _solve_and_package_inprocess(self, loaded, mesher_config, _timer):
         """Mesh + solve + build metadata + convert to lean, on this thread.
 
         Returns ``(new_solution, metadata)``, or ``None`` if a cancel was
-        requested at a stage boundary or meshing failed (stub viewer opened).
-        This is the original in-process path, unchanged except that the cancel
-        checks return ``None`` (so the caller returns) instead of returning
-        from ``run`` directly."""
+        requested at a stage boundary. A meshing failure also returns a
+        ``(stub, metadata)`` pair — with ``metadata["mesh_failed"]`` set — so
+        the caller's single emit path handles it, exactly as the subprocess
+        path already did. This is the original in-process path, unchanged
+        except that the cancel checks return ``None`` (so the caller returns)
+        instead of returning from ``run`` directly."""
         from fypa.altium.loader import build_solve_metadata, solve_problem_adaptive
         from fypa.lean_solution import to_lean_solution
         from pdnsolver import mesh as _pdn_mesh
@@ -5280,39 +5572,43 @@ class _SolveWorker(QThread):
                     mesher_config,
                     adaptive_regulator_gain=self._adaptive_regulator_gain,
                     stage_callback=self.stage_changed.emit,
+                    thermal_config=self._settings.thermal_config(),
                 )
             except _pdn_mesh.MeshingException as mesh_exc:
-                from fypa.altium.loader import build_mesh_failure_records
+                from fypa.altium.loader import package_mesh_failure
 
-                # solve_problem_adaptive built the Problem before meshing
-                # failed and attaches it to the exception — reuse it instead
-                # of rebuilding the whole geometry a second time. Fall back to
-                # a rebuild only if the artifacts are absent (e.g. the failure
-                # came from a path that did not attach them).
-                problem = getattr(mesh_exc, "built_problem", None)
-                per_net_layers = getattr(mesh_exc, "built_per_net_layers", None)
-                stub_pieces_by_pair = getattr(
-                    mesh_exc, "built_stub_pieces_by_pair", None,
-                )
-                if problem is None or per_net_layers is None:
-                    from fypa.altium.loader import build_problem
-                    (problem, _via_segment_records,
-                     stub_pieces_by_pair, per_net_layers) = build_problem(
-                        loaded,
-                    )
-                mesh_failures = build_mesh_failure_records(
-                    mesh_exc, problem, loaded, per_net_layers,
-                )
-                if pristine_loaded is not None:
-                    self._emit_stub_and_finish(
-                        loaded, pristine_loaded, _timer,
-                        mesh_failures=mesh_failures,
-                        stub_pieces_by_pair=stub_pieces_by_pair,
-                        per_net_layers=per_net_layers,
-                        stage_message="Meshing failed — opening design…",
-                    )
+                # Same stub packaging as CLI ``gui <PrjPcb>`` (Altium launcher):
+                # open the board with mesh-failure markers instead of dying.
+                if self._cancel_requested():
+                    # Every other exit in run() returns without emitting so a
+                    # cancelled solve does not open a stale viewer. Meshing
+                    # failing after Cancel is no different.
                     return None
-                raise
+                # Emit first so the progress dialog updates before the
+                # (potentially slow) stub + metadata packaging.
+                self.stage_changed.emit("Meshing failed — opening design…")
+                # Packaging may re-run build_problem and triangulate every
+                # stub piece — a long pure-Python phase holding the GIL. Mark
+                # it so a Cancel here waits instead of calling
+                # QThread.terminate() and deadlocking the app.
+                self._in_python_packaging = True
+                try:
+                    with _timer.stage("Package mesh failure"):
+                        stub, fail_md = package_mesh_failure(
+                            loaded, mesh_exc, mesher_config,
+                            settings=self._settings,
+                        )
+                finally:
+                    self._in_python_packaging = False
+                if self._cancel_requested():
+                    return None
+                # Return like any other packaged result rather than emitting
+                # here. run()'s tail already skips the cache on mesh_failed,
+                # logs the timing breakdown OUTSIDE the "Mesh + solve" stage
+                # (so the meshing and packaging time is attributed rather than
+                # landing in "(other / untimed)"), and emits with
+                # pristine_loaded.
+                return stub, fail_md
             finally:
                 _solver_log.removeHandler(_substage_handler)
                 _mesh_log.removeHandler(_substage_handler)
@@ -5453,6 +5749,31 @@ class _SolveWorker(QThread):
         """Backward-compatible alias — see :func:`clone_loaded_for_edit`."""
         from fypa.altium.loader import clone_loaded_for_edit
         return clone_loaded_for_edit(loaded)
+
+
+def _cache_serves_adaptive_request(metadata, adaptive_requested: bool) -> bool:
+    """Whether a cached solve may answer a request with this adaptive setting.
+
+    "Adaptive SMPS gain" is persisted *globally*, so a user who ticks it once
+    for one board carries it into every later import. On a design with no
+    eligible regulator the flag is a no-op — ``solve_problem_adaptive``
+    short-circuits on :func:`has_adaptive_smps_regulators` — so refusing the
+    cache there costs a full 10-60 s re-solve on every import for a result
+    that would be bit-identical.
+
+    The cached metadata records ``adaptive_gain_eligible`` per regulator
+    directive, which is exactly what decides whether the flag could have
+    mattered.
+    """
+    if not adaptive_requested:
+        return True
+    info = (metadata or {}).get("regulator_adaptive_gain") or {}
+    if info.get("enabled"):
+        return True          # the cached solve is itself an adaptive solve
+    return not any(
+        d.get("adaptive_gain_eligible")
+        for d in ((metadata or {}).get("directives") or [])
+    )
 
 
 def _try_solve_cache(prjpcb_path: Path,
@@ -5924,22 +6245,57 @@ def _open_solution_at(window, path: Path) -> None:
     )
 
 
+def _headless_platform() -> bool:
+    """True when Qt has no interactive display (``offscreen`` / ``minimal``).
+
+    A modal dialog on such a platform can never be dismissed, so a CI job
+    invoking ``FYPA gui`` would block indefinitely rather than fail.
+    """
+    app = QApplication.instance()
+    name = app.platformName() if app is not None else ""
+    return name in ("offscreen", "minimal", "")
+
+
+def _consume_cli_adaptive_flag(window) -> bool:
+    """Resolve the adaptive-gain setting for one import, then clear it.
+
+    A CLI ``--adaptive-regulator-gain`` / ``--no-adaptive-regulator-gain``
+    value belongs to the import it was passed with. A failed or cancelled CLI
+    import leaves the launcher open, and latching the value there would
+    override the user's Settings-tab choice for every later File > Import in
+    the session. Unset falls back to the persisted preference.
+    """
+    adaptive = getattr(window, "_cli_adaptive_regulator_gain", None)
+    if adaptive is None:
+        return load_adaptive_regulator_gain()
+    window._cli_adaptive_regulator_gain = None
+    return bool(adaptive)
+
+
 def _start_launcher_altium_solve(
     window, prjpcb_path: Path, pcbdoc_path: Path | None, *, clean: bool,
-    from_recent: bool = False,
+    from_recent: bool = False, force_solve: bool = False,
 ) -> None:
-    """Launcher-only: run :class:`_SolveWorker` for an Altium import."""
+    """Launcher-only: run :class:`_SolveWorker` for an Altium import.
+
+    Uses the launcher's :attr:`_solve_settings` (Settings tab / CLI ``gui``
+    overrides) and the persisted adaptive-gain preference — same inputs as
+    File > Import from an already-open viewer.
+    """
     if _reject_if_solve_running(window):
         return
     if _reject_if_background_load_running(window):
         return
     from fypa.altium.loader import SolveSettings
 
-    settings = SolveSettings()
+    settings = getattr(window, "_solve_settings", None)
+    if settings is None:
+        settings = SolveSettings()
+        window._solve_settings = settings
     settings.apply_to_modules()
     imp = _altium_import_worker_options(
         prjpcb_path.name, clean=clean,
-        auto_solve=load_auto_solve_on_import(),
+        auto_solve=True if force_solve else load_auto_solve_on_import(),
     )
     dlg = QProgressDialog(imp["dialog_text"], "Cancel", 0, 0, window)
     dlg.setWindowTitle(imp["dialog_title"])
@@ -5954,12 +6310,15 @@ def _start_launcher_altium_solve(
     _sz = dlg.size()
     dlg.setFixedSize(int(_sz.width() * 1.44), _sz.height())
 
+    adaptive = _consume_cli_adaptive_flag(window)
+
     worker = _SolveWorker(
         prjpcb_path, settings,
         pcbdoc_selector=str(pcbdoc_path) if pcbdoc_path else None,
         use_design_cache=imp["use_design_cache"],
         try_solve_cache_first=imp["try_solve_cache_first"],
         load_only=imp["load_only"],
+        adaptive_regulator_gain=bool(adaptive),
         parent=window,
     )
     _stash_pending_altium_recent(
@@ -5978,6 +6337,53 @@ def _start_launcher_altium_solve(
     worker.start()
 
 
+def _resync_settings_fields(window, values: dict) -> None:
+    """Push ``{settings_attr: value}`` into the matching Settings-tab edits."""
+    for key, value in values.items():
+        edit = getattr(window, f"settings_edit_{key}", None)
+        if edit is None:
+            continue
+        edit.setText(_SettingsTabMixin._fmt_settings_value(value))
+    refresh = getattr(window, "_update_settings_field_styles", None)
+    if callable(refresh):
+        refresh()
+
+
+def _schedule_cli_altium_import(window, target: dict) -> None:
+    """Apply CLI ``gui`` overrides, then import like File > Import Altium."""
+    settings = getattr(window, "_solve_settings", None)
+    overrides = {
+        key: target[key]
+        for key in ("mesh_min_angle_deg", "mesh_max_size_mm")
+        if target.get(key) is not None
+    }
+    if overrides and settings is None:
+        logging.getLogger(__name__).warning(
+            "Ignoring CLI mesh override(s) %s: this window has no solve "
+            "settings to apply them to.", ", ".join(sorted(overrides)),
+        )
+    elif overrides:
+        for key, value in overrides.items():
+            setattr(settings, key, float(value))
+        # The Settings tab was populated from ``settings`` during __init__, so
+        # its line edits still show the pre-override values — they would read
+        # as user edits (dirty red outline) and would overwrite the CLI values
+        # if the user pressed Apply. Push the new values into the widgets.
+        _resync_settings_fields(window, overrides)
+    adaptive = target.get("adaptive_regulator_gain")
+    if adaptive is not None:
+        window._cli_adaptive_regulator_gain = bool(adaptive)
+    pcbdoc = target.get("pcbdoc_path")
+    window._cli_import_pending = True
+    _open_altium_project_at(
+        window,
+        Path(target["prjpcb_path"]),
+        Path(pcbdoc) if pcbdoc else None,
+        clean=bool(target.get("clean", False)),
+        force_solve=bool(target.get("force_solve", False)),
+    )
+
+
 def _open_altium_project_at(
     window,
     prjpcb_path: Path,
@@ -5985,8 +6391,15 @@ def _open_altium_project_at(
     *,
     clean: bool = False,
     from_recent: bool = False,
+    force_solve: bool = False,
 ) -> None:
-    """Import an Altium ``.PrjPcb`` without a file dialog when possible."""
+    """Import an Altium ``.PrjPcb`` without a file dialog when possible.
+
+    ``force_solve`` overrides the persisted "Solve automatically on Altium
+    import" preference. The CLI sets it when the user passed a mesh or
+    adaptive-gain flag: those mean nothing without a solve, so deferring to a
+    GUI checkbox there parses the flags and silently discards them.
+    """
     if _reject_if_solve_running(window):
         return
     if _reject_if_background_load_running(window):
@@ -6017,7 +6430,7 @@ def _open_altium_project_at(
     if hasattr(window, "_open_viewer_and_close"):
         _start_launcher_altium_solve(
             window, prjpcb_path, selected_pcbdoc, clean=clean,
-            from_recent=from_recent,
+            from_recent=from_recent, force_solve=force_solve,
         )
         return
 
@@ -6027,7 +6440,7 @@ def _open_altium_project_at(
     window._solve_settings.apply_to_modules()
     imp = _altium_import_worker_options(
         prjpcb_path.name, clean=clean,
-        auto_solve=load_auto_solve_on_import(),
+        auto_solve=True if force_solve else load_auto_solve_on_import(),
     )
     window._start_solve_worker(
         prjpcb_path, window._solve_settings,
@@ -6036,6 +6449,7 @@ def _open_altium_project_at(
         use_design_cache=imp["use_design_cache"],
         try_solve_cache_first=imp["try_solve_cache_first"],
         load_only=imp["load_only"],
+        adaptive_regulator_gain=load_adaptive_regulator_gain(),
         is_import=True,
         dialog_title=imp["dialog_title"],
         dialog_text=imp["dialog_text"],
@@ -6112,6 +6526,144 @@ def _build_help_menu(window) -> None:
     help_menu.addAction(about)
 
 
+# Decimal places a numeric field accepts. Must be at least the widest fixed-
+# form output ``_fmt_settings_value``'s ``%.6g`` can produce (9 places, e.g.
+# 0.000123457), or the app writes text its own validator marks Invalid.
+_SETTINGS_VALUE_DECIMALS = 12
+
+
+class _CLocaleDoubleValidator(QDoubleValidator):
+    """QDoubleValidator that keeps a typed comma visible instead of eating it.
+
+    Qt validates the *resulting string* and silently drops any keystroke that
+    would make it Invalid. So a validator that simply refuses the comma turns a
+    German user's ``0,5`` into ``05`` — 5.0, a silent 10x error, which is no
+    improvement on the 1.234 that rewriting the comma to a dot produced.
+
+    Returning Intermediate instead lets the character land: the field still
+    reads ``0,5``, ``hasAcceptableInput()`` is False, and the commit path's
+    :func:`float` raises the ValueError callers already turn into a "not a
+    number" dialog. The entry is refused *loudly*, which is the only outcome
+    that cannot quietly scale a value by 10 or 1000.
+    """
+
+    def validate(self, text, pos):
+        if "," in text:
+            state, _text, _pos = super().validate(text.replace(",", ""), pos)
+            if state == QDoubleValidator.Invalid:
+                return QDoubleValidator.Invalid, text, pos
+            # Typeable, never committable — see the class docstring.
+            return QDoubleValidator.Intermediate, text, pos
+        return super().validate(text, pos)
+
+
+def _numeric_validator(parent=None, *, bottom: float | None = 0.0,
+                       top: float | None = None,
+                       decimals: int = _SETTINGS_VALUE_DECIMALS):
+    """A QDoubleValidator that accepts exactly what this app reads back.
+
+    Qt gives a validator the *system* locale, while ``_fmt_settings_value``
+    and :func:`float` both use the C locale. On a comma-decimal system that
+    inverts the intended behaviour — the field accepts ``0,5`` and rejects
+    ``0.5`` — which is the bug the German-locale report describes. Pinning the
+    validator to C, and refusing the group separator, makes a comma wrong *at
+    the keystroke* instead of silently readable as something else later.
+
+    ``ScientificNotation`` is required, not optional: ``_fmt_settings_value``
+    formats with ``%g`` and emits exponent form for small magnitudes, so a
+    standard-notation validator would reject the app's own output — and would
+    eat the ``e`` and ``-`` out of scientific input the user types, committing
+    ``1e-3`` as 13.
+
+    ``bottom=None`` leaves the field unbounded below (a signed coordinate or
+    scale limit); ``top=None`` leaves it unbounded above.
+    """
+    v = _CLocaleDoubleValidator(parent)
+    v.setNotation(QDoubleValidator.ScientificNotation)
+    if bottom is not None:
+        v.setBottom(bottom)
+    if top is not None:
+        v.setTop(top)
+    v.setDecimals(decimals)
+    loc = QLocale.c()
+    loc.setNumberOptions(QLocale.RejectGroupSeparator)
+    v.setLocale(loc)
+    return v
+
+
+class _NumericCellDelegate(QStyledItemDelegate):
+    """Give an editable table cell the same numeric validator the line edits
+    use, so a comma decimal is caught while typing rather than only on commit.
+    """
+
+    def __init__(self, parent=None, *, bottom: float | None = 0.0,
+                 top: float | None = None):
+        super().__init__(parent)
+        self._bottom = bottom
+        self._top = top
+
+    def createEditor(self, parent, option, index):
+        editor = super().createEditor(parent, option, index)
+        if isinstance(editor, QLineEdit):
+            editor.setValidator(
+                _numeric_validator(editor, bottom=self._bottom, top=self._top),
+            )
+        return editor
+
+
+def _parse_numeric_text(text: str) -> float:
+    """Parse a numeric field's text in the C locale.
+
+    Fields carry :func:`_numeric_validator`, which is pinned to C and rejects
+    the group separator, so text arriving here uses a dot decimal.
+
+    A comma is deliberately *not* translated to a dot. On a comma-grouping
+    system ``1,234`` means one thousand two hundred and thirty-four; reading it
+    as 1.234 would be a silent 1000x error, where :func:`float` raises a
+    ValueError the caller already reports to the user.
+    """
+    return float(text.strip())
+
+
+# Capacitance suffixes accepted by the Capacitors tab's value editor, in
+# farads. The empty key is the bare number, which means the unit the column
+# is labelled with — µF.
+_CAPACITANCE_UNIT_F: dict[str, float] = {
+    "": 1e-6,
+    "f": 1.0,
+    "mf": 1e-3, "m": 1e-3,
+    "uf": 1e-6, "u": 1e-6, "µf": 1e-6, "µ": 1e-6,
+    "nf": 1e-9, "n": 1e-9,
+    "pf": 1e-12, "p": 1e-12,
+}
+
+_CAPACITANCE_INPUT_RE = re.compile(
+    r"([0-9][0-9.]*(?:[eE][+\-]?[0-9]+)?)\s*([a-zA-Zµ]*)")
+
+
+def _parse_capacitance_f(text: str) -> float:
+    """Farads from a Capacitors-tab capacitance entry.
+
+    A bare number is µF, the unit the column is labelled with. A unit
+    suffix overrides that, because "100n" typed into a µF field means
+    100 nF and never 100 µF — and silently reading it as µF would be
+    exactly the 1000x error this editor exists to correct.
+
+    Raises ``ValueError`` on anything else, including a comma decimal: on a
+    comma-grouping locale ``1,234`` is one thousand two hundred and thirty
+    four, so translating it would be another silent 1000x error (see
+    :func:`_parse_numeric_text`).
+    """
+    stripped = text.strip().replace("μ", "µ")
+    m = _CAPACITANCE_INPUT_RE.fullmatch(stripped)
+    if m is None:
+        raise ValueError(f"not a capacitance: {text!r}")
+    scale = _CAPACITANCE_UNIT_F.get(m.group(2).lower())
+    if scale is None:
+        raise ValueError(f"unknown capacitance unit: {m.group(2)!r}")
+    return float(m.group(1)) * scale
+
+
 class _SettingsTabMixin:
     """Shared construction of the Settings tab.
 
@@ -6150,6 +6702,15 @@ class _SettingsTabMixin:
          "1/°C",
          "Linear temperature coefficient of resistivity. Default 0.00393 "
          "/°C is the standard value for annealed copper."),
+        ("heat_transfer_w_per_m2k",
+         "Board heat transfer coefficient",
+         "W/(m²·K)",
+         "Only used when 'Coupled electro-thermal solve' is ticked. How "
+         "readily the board sheds heat to ambient, counting both faces. "
+         "~20 is a bare board in still air; 50–100 with forced air or a "
+         "chassis heatsink; lower for a conformally coated board in a "
+         "sealed box. Lower values mean hotter copper and a larger IR "
+         "drop."),
         ("plating_thickness_mm",
          "Via plating thickness",
          "mm",
@@ -6364,9 +6925,48 @@ class _SettingsTabMixin:
         )
         self._settings_adaptive_check.toggled.connect(
             self._on_settings_field_changed)
+        self._settings_area_weighted_check = QCheckBox(
+            "Weight multi-pin coupling by pad area")
+        self._settings_area_weighted_check.setChecked(
+            bool(getattr(
+                self._solve_settings, "area_weighted_pin_coupling", False)))
+        self._settings_area_weighted_check.setToolTip(
+            "Scale each multi-pin star coupling resistor inversely with that "
+            "pin's pad area (R ∝ 1/A), so larger pads — including QFN thermal "
+            "pads on GND — take a larger share of supply and return current "
+            "when copper access is similar. Off = equal R per pin (default)."
+        )
+        self._settings_area_weighted_check.toggled.connect(
+            self._on_settings_field_changed)
+        # Coupled electro-thermal solve. Off by default: with it off the
+        # solve is bit-identical to an isothermal run, so every existing
+        # result is reproduced exactly.
+        self._settings_electrothermal_check = QCheckBox(
+            "Coupled electro-thermal solve (self-heating)")
+        self._settings_electrothermal_check.setChecked(
+            bool(getattr(self._solve_settings, "electrothermal", False)))
+        self._settings_electrothermal_check.setToolTip(
+            "Iterate self-heating: copper that dissipates power gets hotter, "
+            "so more resistive, so it drops more and heats further. Copper "
+            "rises ~0.39 %/K, so a heavily loaded rail can read 10–20 % "
+            "optimistic without this.\n\n"
+            "Heat is shed locally to ambient using the 'Board heat transfer "
+            "coefficient' above — there is no lateral heat spreading, so a "
+            "small hot feature reads as an upper bound while a broad one is "
+            "about right. Costs one extra factorisation per iteration "
+            "(typically 3–8).\n\n"
+            "Off = isothermal at the board temperature (the default)."
+        )
+        self._settings_electrothermal_check.toggled.connect(
+            self._on_settings_field_changed)
+        self._settings_electrothermal_check.toggled.connect(
+            self._on_electrothermal_toggled)
         _solve_layout = solve_box.layout()
         if _solve_layout is not None:
             _solve_layout.addRow(self._settings_adaptive_check)
+            _solve_layout.addRow(self._settings_area_weighted_check)
+            _solve_layout.addRow(self._settings_electrothermal_check)
+        self._apply_electrothermal_enabled()
         # Adaptive SMPS regulator-gain iteration — moved here from the editor
         # canvas overlay. Same attribute name + handler as before, so the
         # solve-time reads and resolve-enable logic are unchanged. Enabled only
@@ -6762,10 +7362,7 @@ class _SettingsTabMixin:
             )
 
             edit = QLineEdit(self._fmt_settings_value(current))
-            validator = QDoubleValidator(self)
-            validator.setNotation(QDoubleValidator.StandardNotation)
-            validator.setBottom(0.0)
-            edit.setValidator(validator)
+            edit.setValidator(_numeric_validator(self))
             edit.setMinimumWidth(110)
             edit.setMaximumWidth(160)
             edit.setToolTip(tooltip)
@@ -6964,7 +7561,7 @@ class _SettingsTabMixin:
         if combo is None or edit is None:
             return
         try:
-            val = float(edit.text().strip())
+            val = self._parse_settings_value(edit.text())
         except ValueError:
             return
         target = len(self._FILL_MATERIAL_PRESETS) - 1   # Custom by default
@@ -7110,6 +7707,8 @@ class _SettingsTabMixin:
         # %g picks fixed or scientific automatically; clamp to 6 sig figs.
         return f"{f:.6g}"
 
+    _parse_settings_value = staticmethod(_parse_numeric_text)
+
     def _on_settings_reset(self) -> None:
         """Restore every Settings-tab field to its built-in default. The
         user still has to press Re-run Solver to commit."""
@@ -7122,6 +7721,13 @@ class _SettingsTabMixin:
         chk = getattr(self, "_settings_adaptive_check", None)
         if chk is not None:
             chk.setChecked(bool(defaults.adaptive_mesh))
+        et = getattr(self, "_settings_electrothermal_check", None)
+        if et is not None:
+            et.setChecked(bool(defaults.electrothermal))
+            self._apply_electrothermal_enabled()
+        aw = getattr(self, "_settings_area_weighted_check", None)
+        if aw is not None:
+            aw.setChecked(bool(defaults.area_weighted_pin_coupling))
         mode_combo = getattr(self, "_fill_mode_combo", None)
         if mode_combo is not None:
             idx = mode_combo.findData(defaults.conductive_fill_mode)
@@ -7175,7 +7781,7 @@ class _SettingsTabMixin:
                 mark(edit, False)
                 continue
             try:
-                val = float(edit.text().strip())
+                val = self._parse_settings_value(edit.text())
                 dirty = abs(val - float(baseline)) > 1e-12
             except ValueError:
                 dirty = True
@@ -7187,6 +7793,21 @@ class _SettingsTabMixin:
             dirty = bool(chk.isChecked()) != bool(
                 getattr(self._solve_settings, "adaptive_mesh", False))
             mark(chk, dirty)
+            any_dirty = any_dirty or dirty
+
+        aw = getattr(self, "_settings_area_weighted_check", None)
+        if aw is not None:
+            dirty = bool(aw.isChecked()) != bool(
+                getattr(
+                    self._solve_settings, "area_weighted_pin_coupling", False))
+            mark(aw, dirty)
+            any_dirty = any_dirty or dirty
+
+        et = getattr(self, "_settings_electrothermal_check", None)
+        if et is not None:
+            dirty = bool(et.isChecked()) != bool(
+                getattr(self._solve_settings, "electrothermal", False))
+            mark(et, dirty)
             any_dirty = any_dirty or dirty
 
         mode_combo = getattr(self, "_fill_mode_combo", None)
@@ -7204,7 +7825,7 @@ class _SettingsTabMixin:
             if edit is None:
                 continue
             try:
-                val = float(edit.text().strip())
+                val = self._parse_settings_value(edit.text())
                 dirty = abs(val - float(baseline)) > 1e-12
             except ValueError:
                 dirty = True
@@ -7218,7 +7839,7 @@ class _SettingsTabMixin:
                 mark(edit, False)
                 continue
             try:
-                new_um = float(text)
+                new_um = self._parse_settings_value(text)
                 dirty = abs(new_um / 1000.0 - original_mm) > 1.0e-6
             except ValueError:
                 dirty = True
@@ -7226,6 +7847,26 @@ class _SettingsTabMixin:
             any_dirty = any_dirty or dirty
 
         return any_dirty
+
+    def _on_electrothermal_toggled(self, _checked: bool) -> None:
+        """Grey the heat-transfer field when the coupled solve is off — it
+        has no effect there, and a live-looking field that does nothing is
+        worse than a disabled one."""
+        self._apply_electrothermal_enabled()
+
+    def _apply_electrothermal_enabled(self) -> None:
+        chk = getattr(self, "_settings_electrothermal_check", None)
+        edit = getattr(self, "settings_edit_heat_transfer_w_per_m2k", None)
+        if edit is None:
+            return
+        on = bool(chk.isChecked()) if chk is not None else False
+        edit.setEnabled(on)
+        edit.setToolTip(
+            "How readily the board sheds heat to ambient, both faces "
+            "combined. Lower = hotter copper = larger IR drop."
+            if on else
+            "Enabled by 'Coupled electro-thermal solve (self-heating)'."
+        )
 
     def _on_settings_field_changed(self, *_args) -> None:
         """Slot wired to every Settings-tab editor's change signal:
@@ -7624,6 +8265,15 @@ class LauncherWindow(_SettingsTabMixin, QMainWindow):
     def _on_solve_failed(self, message: str) -> None:
         logging.getLogger(__name__).error("Solve failed: %s", message)
         _drop_pending_altium_recent(self)
+        if getattr(self, "_cli_import_pending", False):
+            # Drives main()'s exit code — see the tail of main().
+            self._cli_import_failed = True
+            if _headless_platform():
+                # A modal here has no one to dismiss it: a CI job running
+                # `FYPA gui` under the offscreen platform would block forever.
+                # The message is already on stderr via the log above.
+                self.close()
+                return
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Critical)
         box.setWindowTitle("Solve failed")
@@ -7655,6 +8305,8 @@ class LauncherWindow(_SettingsTabMixin, QMainWindow):
         _maybe_warn_open_loop_rails(new_win or self, metadata)
         # Nets whose source & sink landed on disconnected copper — tell the user.
         _maybe_warn_connectivity_breaks(new_win or self, metadata)
+        # Parts joining a solved rail to copper outside the FEM — advisory.
+        _maybe_warn_unannotated_bridges(new_win or self, metadata)
 
     def _on_menu_open_solution(self) -> None:
         path_str, _ = QFileDialog.getOpenFileName(
@@ -7822,6 +8474,10 @@ _NET_TABLE_ROW_ROLE = int(Qt.UserRole) + 1
 # the numeric sort key — the Go / Use cells need both a sort key and a row
 # identity that survives the user re-sorting the table.
 _CAPS_TABLE_ROW_ROLE = int(Qt.UserRole) + 2
+
+# Canonical imperial package key on the Impedance-tab package table's name
+# cell — the visible text may be a metric label when that convention is on.
+_PKG_CANONICAL_ROLE = int(Qt.UserRole) + 3
 
 # Columns of the Capacitors-tab table: (display label, numeric?). Defined at
 # module scope so the label→index map below can be built from it (a class-body
@@ -8616,6 +9272,10 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         self._rail_names, self._rail_to_members = self._compute_rail_groups(
             metadata,
         )
+        from fypa.rail_groups import build_rail_trees
+        self._rail_to_trees = build_rail_trees(
+            metadata, self._rail_to_members,
+        )
 
         _stackup_pos = {
             row["name"]: i
@@ -8739,6 +9399,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         saved_rails: dict[str, bool] = {}
         saved_subnets: dict[tuple[str, str], bool] = {}
         saved_expanded: dict[str, bool] = {}
+        saved_subnet_expanded: dict[tuple[str, str], bool] = {}
         if preserve_visibility:
             saved_layers = {
                 p: e.isVisibleState() for p, e in self._layer_eye_buttons
@@ -8753,6 +9414,9 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                 for net, eye in nets.items():
                     saved_subnets[(rail, net)] = eye.isVisibleState()
             saved_expanded = dict(getattr(self, "_rail_expanded", {}))
+            saved_subnet_expanded = dict(
+                getattr(self, "_subnet_node_expanded", {}),
+            )
 
         while self.layer_list.count() > 1:
             self.layer_list.takeItem(self.layer_list.count() - 1)
@@ -8764,47 +9428,13 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         self._selected_layer = None
 
         for phys in self._physicals:
-            eye = EyeButton(
-                visible=True,
-                tip_show="Show this layer's analysed rails (rail copper only)",
-                tip_hide="Hide this layer's analysed rails (rail copper only)",
-            )
-            eye.toggled_visible.connect(self._on_layer_eye_toggled)
-            eye2 = EyeButton(
-                visible=False,
-                tip_show="Show all copper on this layer",
-                tip_hide="Hide all copper on this layer",
-            )
-            eye2.toggled_visible.connect(self._on_layer_eye2_toggled)
-            fill = FillToggleButton(solid=True)
-            fill.toggled_fill.connect(self._on_layer_fill_toggled)
-            transp = TransparencyButton(step=0)
-            transp.toggled_transparency.connect(
-                self._on_layer_transparency_toggled,
-            )
-            row = self._build_layer_row_widget(
-                eye, swatch_color=self._layer_color_for(phys),
-                label_text=phys, bold=False,
-                second_eye=eye2, fill_btn=fill, transparency_btn=transp,
-            )
-            item = QListWidgetItem()
-            item.setFlags(Qt.ItemIsEnabled)
-            self.layer_list.addItem(item)
-            item.setSizeHint(row.sizeHint())
-            self.layer_list.setItemWidget(item, row)
-            self._layer_eye_buttons.append((phys, eye))
-            self._layer_eye2_buttons.append((phys, eye2))
-            self._layer_fill_buttons.append((phys, fill))
-            self._layer_transparency_buttons.append((phys, transp))
-            self._layer_list_items[phys] = item
+            eye, eye2 = self._add_layer_row(phys)
             if preserve_visibility and phys in saved_layers:
                 eye.setVisibleState(saved_layers[phys], emit=False)
             if preserve_visibility and phys in saved_layers2:
                 eye2.setVisibleState(saved_layers2[phys], emit=False)
 
-        if (self._no_pdn_visibility() and self._layer_eye2_buttons
-                and not any(e.isVisibleState() for _, e in self._layer_eye2_buttons)):
-            self._layer_eye2_buttons[0][1].setVisibleState(True, emit=False)
+        self._ensure_default_copper_visibility()
         self._sync_all_layers_eye()
         self._sync_all_layers_eye2()
         approx_row_h = self.layer_list.sizeHintForRow(0) or 22
@@ -8817,6 +9447,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             saved_rails=saved_rails,
             saved_subnets=saved_subnets,
             saved_expanded=saved_expanded,
+            saved_subnet_expanded=saved_subnet_expanded,
         )
 
         has_rails = bool(self._rails)
@@ -8907,6 +9538,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                     self._solved_since_save = False
                     self._display_dirty = False
                     self._init_overlay_state()
+                    self._load_sidebar_width_from_project()
                     title = (
                         Path(project_path).stem if project_path is not None
                         else getattr(new_solution.problem, "project_name", None)
@@ -8966,6 +9598,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             self._invalidate_caps_cache(repopulate=False, heavy=True)
             self._caps_shapes_cache = None
             self._impedance_populated = False
+            self._sync_footprint_convention_ui()
             if self._project is not None:
                 self._update_pending_rails()
 
@@ -9060,6 +9693,37 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         from fypa.rail_groups import compute_rail_groups
         return compute_rail_groups(metadata)
 
+    def _rail_tree_metadata(self) -> dict:
+        """Metadata for :func:`build_rail_trees` on pending / editor rails."""
+        from fypa.rail_groups import merge_rail_tree_metadata
+        meta = self.metadata if isinstance(self.metadata, dict) else {}
+        editor_series: list[tuple[str, str]] = []
+        project = getattr(self, "_project", None)
+        if project is not None:
+            for ed in getattr(project, "editor_directives", []) or []:
+                if (
+                    getattr(ed, "role", None) == "SERIES"
+                    and getattr(ed, "p_net", None)
+                    and getattr(ed, "n_net", None)
+                ):
+                    editor_series.append((ed.p_net, ed.n_net))
+        return merge_rail_tree_metadata(meta, editor_series)
+
+    def _subnet_rows_for_rail(
+        self,
+        rail: str,
+        members: list[str],
+        trees: dict | None,
+        *,
+        node_expanded: dict | None = None,
+    ) -> list[tuple[str, int, bool]]:
+        """Visible subnet rows as ``(net, depth, has_children)``."""
+        from fypa.rail_groups import visible_rail_tree_rows
+        tree = (trees or {}).get(rail)
+        return visible_rail_tree_rows(
+            rail, members, tree, node_expanded=node_expanded,
+        )
+
     def showEvent(self, event) -> None:
         """Apply the deferred ``showMaximized`` once Qt has actually shown the
         window. Doing this in ``__init__`` is unreliable on Windows — the
@@ -9146,6 +9810,12 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         # handler and the row-background highlight.
         self._layer_list_items: dict[str, QListWidgetItem] = {}
         self._selected_layer: str | None = None
+        # What the last Shift+click isolated, so a second Shift+click on the
+        # same item inverts. "Is it the only thing visible?" cannot stand in
+        # for this: the default rail visibility already leaves exactly one rail
+        # showing, and narrowing to one layer by ordinary clicks is routine —
+        # in both cases the FIRST Shift+click would invert instead of isolate.
+        self._isolated_key: object | None = None
 
         self._all_layers_eye = EyeButton(
             visible=True,
@@ -9193,38 +9863,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         self._outlines_btn.toggled_outline.connect(self._render)
 
         for phys in self._physicals:
-            eye = EyeButton(
-                visible=True,
-                tip_show="Show this layer's analysed rails (rail copper only)",
-                tip_hide="Hide this layer's analysed rails (rail copper only)",
-            )
-            eye.toggled_visible.connect(self._on_layer_eye_toggled)
-            eye2 = EyeButton(
-                visible=False,
-                tip_show="Show all copper on this layer",
-                tip_hide="Hide all copper on this layer",
-            )
-            eye2.toggled_visible.connect(self._on_layer_eye2_toggled)
-            fill = FillToggleButton(solid=True)
-            fill.toggled_fill.connect(self._on_layer_fill_toggled)
-            transp = TransparencyButton(step=0)
-            transp.toggled_transparency.connect(
-                self._on_layer_transparency_toggled)
-            row = self._build_layer_row_widget(
-                eye, swatch_color=self._layer_color_for(phys),
-                label_text=phys, bold=False,
-                second_eye=eye2, fill_btn=fill, transparency_btn=transp,
-            )
-            item = QListWidgetItem()
-            item.setFlags(Qt.ItemIsEnabled)
-            self.layer_list.addItem(item)
-            item.setSizeHint(row.sizeHint())
-            self.layer_list.setItemWidget(item, row)
-            self._layer_eye_buttons.append((phys, eye))
-            self._layer_eye2_buttons.append((phys, eye2))
-            self._layer_fill_buttons.append((phys, fill))
-            self._layer_transparency_buttons.append((phys, transp))
-            self._layer_list_items[phys] = item
+            self._add_layer_row(phys)
 
         # Clicking a layer row (anywhere outside its eye/fill/transparency
         # buttons — those consume the click before itemClicked fires)
@@ -9233,14 +9872,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         self.layer_list.itemClicked.connect(self._on_layer_item_clicked)
 
         self._sync_all_layers_eye()
-        # If the design has no PDN rails (Gerber import before the user has
-        # placed any directives, or any other "blank board" load) — or an
-        # unsolved stub is loaded (Import without auto-solve) — turn on the
-        # top physical layer's all-copper eye by default so the user actually
-        # sees their board on open. Without this every eye starts closed and
-        # the viewport is empty.
-        if self._no_pdn_visibility() and self._layer_eye2_buttons:
-            self._layer_eye2_buttons[0][1].setVisibleState(True, emit=False)
+        self._ensure_default_copper_visibility()
         self._sync_all_layers_eye2()
 
         # Size the list to show every physical layer (plus the "All Layers"
@@ -9483,19 +10115,31 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
 
         side.addStretch(1)
 
-        # Wrap side layout in a fixed-width container, then put that inside a
-        # QScrollArea so the panel scrolls vertically when its contents exceed
-        # the window height (e.g. on boards with many copper layers).
+        # Wrap side layout in a width-adjustable container, then put that
+        # inside a QScrollArea so the panel scrolls vertically when its
+        # contents exceed the window height (e.g. many copper layers).
+        # Width is user-draggable via the SidebarToggleButton splitter.
+        self._SIDEBAR_DEFAULT_W = 260
+        self._SIDEBAR_MIN_W = 180
+        self._SIDEBAR_MAX_W = 520
+        self._SIDEBAR_SCROLLBAR_W = 18
+        self._sidebar_content_w = self._SIDEBAR_DEFAULT_W
+        # What the user asked for, before clamping to the current window —
+        # see _apply_sidebar_content_width.
+        self._sidebar_requested_w = self._SIDEBAR_DEFAULT_W
+        self._sidebar_drag_start_w = self._sidebar_content_w
+
         side_widget = QWidget()
         side_widget.setLayout(side)
-        side_widget.setFixedWidth(260)
+        side_widget.setFixedWidth(self._sidebar_content_w)
+        self._sidebar_widget = side_widget
 
         side_scroll = QScrollArea()
         side_scroll.setWidget(side_widget)
         # Resizable=True is essential: with =False, the inner widget uses its
         # width-agnostic sizeHint() for height, which under-estimates the
         # height of word-wrapped labels (e.g. summary_label) at the actual
-        # 260px width, and the controls below it overlap. =True makes the
+        # panel width, and the controls below it overlap. =True makes the
         # layout reflow at the real width.
         side_scroll.setWidgetResizable(True)
         side_scroll.setFrameShape(QFrame.NoFrame)
@@ -9504,26 +10148,26 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         # constant regardless of whether scrolling is needed; without this,
         # adding/removing the scrollbar would shift content widths around.
         side_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-        # Reserve room for the vertical scrollbar so its appearance doesn't
-        # crop the 260px-wide content. 18px covers the default Fusion/Win
-        # scrollbar extent with a hair of margin.
-        side_scroll.setFixedWidth(260 + 18)
+        side_scroll.setFixedWidth(
+            self._sidebar_content_w + self._SIDEBAR_SCROLLBAR_W,
+        )
         side_scroll.setStyleSheet(
             f"QScrollArea {{ background-color: {_T()['bg']}; }}"
         )
         outer.addWidget(side_scroll)
         self._sidebar_scroll = side_scroll
 
-        # Slim vertical splitter handle that toggles the sidebar's visibility
-        # so the user can give the viewport extra real estate. Custom-painted
-        # triangle stays crisp at 14px; Unicode arrow glyphs were fuzzy.
+        # Slim vertical splitter: click toggles collapse; drag resizes width.
         # Hotkey "B" mirrors the click.
         self._sidebar_toggle_btn = SidebarToggleButton()
         self._sidebar_toggle_btn.setToolTip(
-            "Collapse / expand the side panel (B)"
+            "Drag to resize the side panel · Click to collapse / expand (B)"
         )
         self._sidebar_toggle_btn.clicked.connect(self._toggle_sidebar)
+        self._sidebar_toggle_btn.resizedBy.connect(self._on_sidebar_resized_by)
+        self._sidebar_toggle_btn.pressed.connect(self._on_sidebar_resize_press)
         outer.addWidget(self._sidebar_toggle_btn)
+        self._load_sidebar_width_from_project()
 
         # Plot area — custom QOpenGLWidget rendering the FEM mesh directly
         # via shaders (per-vertex colour interpolation, MVP transform on
@@ -9657,6 +10301,17 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         self._vias_table_populated = False
         self._vias_tab_index = self.tabs.addTab(self._build_vias_tab(), "Vias")
         self._init_log.info("PdnViewer init: Vias tab (%.2fs)", time.monotonic() - _t)
+
+        # Bridges — every part that joins two nets, and what FYPA did with
+        # it. Cheap to build (the candidate scan already ran during the
+        # solve), but populated lazily like its neighbours for consistency.
+        _t = time.monotonic()
+        self._bridges_table_populated = False
+        self._bridges_tab_index = self.tabs.addTab(
+            self._build_bridges_tab(), "Bridges")
+        self._update_bridges_tab_title()
+        self._init_log.info("PdnViewer init: Bridges tab (%.2fs)",
+                            time.monotonic() - _t)
 
         # Capacitors tab — decoupling-cap loop-inductance analysis. Same
         # lazy-populate treatment; unlike Nodes/Vias there's no deferred
@@ -9870,6 +10525,10 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
 
     # --- Rails list (expandable subnet rows) ---------------------------------
 
+    # Indent per tree depth (px). Kept modest so deep SERIES chains stay
+    # readable in the default sidebar width.
+    _RAIL_SUBNET_INDENT_PX = 10
+
     def _init_rail_list_state(self) -> None:
         """Allocate per-rail / per-subnet visibility state containers."""
         self._rail_eye_buttons: list[tuple[str, EyeButton]] = []
@@ -9881,14 +10540,25 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         self._subnet_eye_holder.setFixedSize(0, 0)
         self._subnet_eye_holder.hide()
         self._rail_expand_buttons: dict[str, QToolButton] = {}
+        self._subnet_expand_buttons: dict[tuple[str, str], QToolButton] = {}
         self._rail_subnet_items: dict[str, list[QListWidgetItem]] = {}
         self._rail_expanded: dict[str, bool] = {}
+        # (rail, net) → whether that tree node's children are shown.
+        self._subnet_node_expanded: dict[tuple[str, str], bool] = getattr(
+            self, "_subnet_node_expanded", {},
+        )
         self._rail_list_items: dict[str, QListWidgetItem] = {}
+        self._rail_to_trees: dict = getattr(self, "_rail_to_trees", {})
         self._pending_rail_items: list = []
         self._pending_rail_list_items: dict[str, QListWidgetItem] = {}
         self._pending_rail_expand_buttons: dict[str, QToolButton] = {}
+        self._pending_subnet_expand_buttons: dict[tuple[str, str], QToolButton] = {}
         self._pending_rail_subnet_items: dict[str, list[QListWidgetItem]] = {}
         self._pending_rail_expanded: dict[str, bool] = {}
+        self._pending_subnet_node_expanded: dict[tuple[str, str], bool] = getattr(
+            self, "_pending_subnet_node_expanded", {},
+        )
+        self._pending_rail_trees: dict = {}
 
     def _ground_rail_names(self) -> set[str]:
         return {"0v", "gnd", "ground", "vss"}
@@ -9897,6 +10567,25 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         if self._no_pdn_visibility():
             return False
         return rail.lower() not in self._ground_rail_names()
+
+    def _make_expand_tool_button(
+        self,
+        *,
+        expanded: bool,
+        tip: str,
+        on_toggled,
+    ) -> QToolButton:
+        btn = QToolButton()
+        btn.setCheckable(True)
+        btn.setChecked(expanded)
+        btn.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        btn.setFixedSize(14, 14)
+        btn.setAutoRaise(True)
+        btn.setFocusPolicy(Qt.NoFocus)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setToolTip(tip)
+        btn.toggled.connect(on_toggled)
+        return btn
 
     def _build_rail_row_widget(
         self,
@@ -9947,6 +10636,9 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         for btn in getattr(self, "_rail_expand_buttons", {}).values():
             if _qt_widget_alive(btn):
                 btn.blockSignals(True)
+        for btn in getattr(self, "_subnet_expand_buttons", {}).values():
+            if _qt_widget_alive(btn):
+                btn.blockSignals(True)
         for nets in getattr(self, "_subnet_eye_buttons", {}).values():
             for eye in nets.values():
                 if _qt_widget_alive(eye):
@@ -9959,6 +10651,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         saved_rails: dict[str, bool] | None = None,
         saved_subnets: dict[tuple[str, str], bool] | None = None,
         saved_expanded: dict[str, bool] | None = None,
+        saved_subnet_expanded: dict[tuple[str, str], bool] | None = None,
     ) -> None:
         """Rebuild solved-rail rows (not including the 'All Rails' header)."""
         self._silence_rail_list_widgets()
@@ -9969,6 +10662,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         self._rail_eye_buttons.clear()
         self._subnet_eye_buttons.clear()
         self._rail_expand_buttons.clear()
+        self._subnet_expand_buttons.clear()
         self._rail_subnet_items.clear()
         self._rail_list_items.clear()
 
@@ -9982,32 +10676,33 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             }
         else:
             self._rail_expanded = {}
+        if saved_subnet_expanded is not None:
+            self._subnet_node_expanded = {
+                k: bool(v) for k, v in saved_subnet_expanded.items()
+                if k[0] in self._rails
+            }
 
         for rail in self._rails:
             members = self._rail_to_members.get(rail, [rail])
             has_subnets = len(members) > 1
 
-            eye = EyeButton(visible=False)
+            eye = EyeButton(visible=False, shift_isolatable=True)
             eye.toggled_visible.connect(
                 lambda on, r=rail: self._on_rail_eye_toggled(r, on),
+            )
+            eye.shift_clicked.connect(
+                lambda r=rail: self._on_rail_eye_shift_clicked(r),
             )
 
             expand_btn = None
             expanded = bool(self._rail_expanded.get(rail, False))
             if has_subnets:
-                expand_btn = QToolButton()
-                expand_btn.setCheckable(True)
-                expand_btn.setChecked(expanded)
-                expand_btn.setArrowType(
-                    Qt.DownArrow if expanded else Qt.RightArrow,
-                )
-                expand_btn.setFixedSize(14, 14)
-                expand_btn.setAutoRaise(True)
-                expand_btn.setFocusPolicy(Qt.NoFocus)
-                expand_btn.setCursor(Qt.PointingHandCursor)
-                expand_btn.setToolTip("Show/hide subnet nets")
-                expand_btn.toggled.connect(
-                    lambda exp, r=rail: self._on_rail_expand_toggled(r, exp),
+                expand_btn = self._make_expand_tool_button(
+                    expanded=expanded,
+                    tip="Show/hide subnet nets",
+                    on_toggled=lambda exp, r=rail: self._on_rail_expand_toggled(
+                        r, exp,
+                    ),
                 )
                 self._rail_expand_buttons[rail] = expand_btn
                 self._rail_expanded[rail] = expanded
@@ -10032,12 +10727,30 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                     subnet_eye = EyeButton(
                         parent=self._subnet_eye_holder,
                         visible=False,
-                        tip_show=f"Show {net} copper",
-                        tip_hide=f"Hide {net} copper",
+                        tip_show=(
+                            f"Show {net} copper\n"
+                            f"Ctrl+Click: include SERIES subtree"
+                        ),
+                        tip_hide=(
+                            f"Hide {net} copper\n"
+                            f"Ctrl+Click: include SERIES subtree"
+                        ),
+                        shift_isolatable=True,
+                        partial_is_badge=True,
                     )
                     subnet_eye.toggled_visible.connect(
                         lambda on, r=rail, n=net: self._on_subnet_eye_toggled(
                             r, n, on,
+                        ),
+                    )
+                    subnet_eye.shift_clicked.connect(
+                        lambda r=rail, n=net: self._on_subnet_eye_shift_clicked(
+                            r, n,
+                        ),
+                    )
+                    subnet_eye.ctrl_clicked.connect(
+                        lambda r=rail, n=net: self._on_subnet_eye_ctrl_clicked(
+                            r, n,
                         ),
                     )
                     self._subnet_eye_buttons[rail][net] = subnet_eye
@@ -10050,6 +10763,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                         vis = self._default_rail_visible(rail)
                     subnet_eye.setVisibleState(vis, emit=False)
                 self._sync_rail_eye_from_subnets(rail)
+                self._sync_rail_tree_node_partials(rail)
             else:
                 if preserve_visibility and rail in saved_rails:
                     vis = saved_rails[rail]
@@ -10064,32 +10778,87 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         self._update_rail_list_height()
 
     def _insert_subnet_rows(
-        self, rail: str, *, after_item: QListWidgetItem,
+        self, rail: str, *, after_item: QListWidgetItem, pending: bool = False,
     ) -> None:
-        """Insert indented subnet rows directly below a parent rail row."""
-        if self._rail_subnet_items.get(rail):
+        """Insert indented subnet rows for the currently expanded tree nodes.
+
+        Serves both rail panes. The solved pane shows the rail's live per-net
+        eyes; the pending pane shows a throwaway disabled eye on a muted
+        italic row. Everything else — the tree walk, the indent, the per-node
+        expand buttons, the item bookkeeping — is identical, and the two
+        copies this replaces had already drifted apart.
+        """
+        items_by_rail = (
+            self._pending_rail_subnet_items if pending
+            else self._rail_subnet_items
+        )
+        if items_by_rail.get(rail):
             return
-        members = self._rail_to_members.get(rail, [rail])
-        subnets = self._subnet_eye_buttons.get(rail, {})
+        node_expanded = (
+            self._pending_subnet_node_expanded if pending
+            else self._subnet_node_expanded
+        )
+        expand_buttons = (
+            self._pending_subnet_expand_buttons if pending
+            else self._subnet_expand_buttons
+        )
+        members = (
+            self._pending_rails.get(rail, [rail]) if pending
+            else self._rail_to_members.get(rail, [rail])
+        )
+        trees = getattr(
+            self, "_pending_rail_trees" if pending else "_rail_to_trees", {},
+        )
+        subnets = {} if pending else self._subnet_eye_buttons.get(rail, {})
+        muted_qss = (
+            f"color: {_T()['fg_muted']}; font-style: italic;" if pending
+            else ""
+        )
         items: list[QListWidgetItem] = []
         row_idx = self.rail_list.row(after_item) + 1
-        for net in members:
-            eye = subnets.get(net)
-            if eye is None or not _qt_widget_alive(eye):
-                continue
+        indent_px = self._RAIL_SUBNET_INDENT_PX
+        for net, depth, has_children in self._subnet_rows_for_rail(
+            rail, members, trees, node_expanded=node_expanded,
+        ):
+            if pending:
+                eye = EyeButton(visible=False)
+                eye.setEnabled(False)
+            else:
+                eye = subnets.get(net)
+                if eye is None or not _qt_widget_alive(eye):
+                    continue
             is_primary = net == rail
+            expand_btn = None
+            if has_children:
+                key = (rail, net)
+                node_exp = node_expanded.get(key, is_primary)
+                node_expanded[key] = node_exp
+                expand_btn = self._make_expand_tool_button(
+                    expanded=node_exp,
+                    tip=f"Show/hide children of {net}",
+                    on_toggled=lambda exp, r=rail, n=net, p=pending: (
+                        self._on_subnet_node_expand_toggled(r, n, exp, pending=p)
+                    ),
+                )
+                expand_buttons[key] = expand_btn
             subnet_row = self._build_rail_row_widget(
                 eye,
+                expand_btn=expand_btn,
                 label_text=net,
                 bold=is_primary,
-                indent=18,
+                indent=indent_px * depth,
             )
-            if is_primary:
+            if muted_qss:
+                subnet_row.setStyleSheet(muted_qss)
+            if pending:
+                tip = (
+                    f"Unsolved subnet of rail {rail} — press Resolve to "
+                    f"compute it."
+                )
+            elif is_primary:
                 tip = f"Primary net of rail {rail}"
             else:
-                tip = (
-                    f"Subnet of rail {rail} — joined via a SERIES bridge"
-                )
+                tip = f"Subnet of rail {rail} — joined via a SERIES bridge"
             subnet_row.setToolTip(tip)
             item = QListWidgetItem()
             item.setFlags(Qt.ItemIsEnabled)
@@ -10098,11 +10867,27 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             self.rail_list.setItemWidget(item, subnet_row)
             items.append(item)
             row_idx += 1
-        self._rail_subnet_items[rail] = items
+        items_by_rail[rail] = items
 
-    def _remove_subnet_rows(self, rail: str) -> None:
-        self._detach_subnet_eyes(rail)
-        for item in self._rail_subnet_items.pop(rail, []):
+    def _remove_subnet_rows(self, rail: str, *, pending: bool = False) -> None:
+        if not pending:
+            # Solved rows borrow the rail's persistent per-net eyes and must
+            # hand them back before the row widgets go; pending rows own
+            # throwaway ones that die with the row.
+            self._detach_subnet_eyes(rail)
+        expand_buttons = (
+            self._pending_subnet_expand_buttons if pending
+            else self._subnet_expand_buttons
+        )
+        items_by_rail = (
+            self._pending_rail_subnet_items if pending
+            else self._rail_subnet_items
+        )
+        for key in [k for k in list(expand_buttons) if k[0] == rail]:
+            btn = expand_buttons.pop(key)
+            if _qt_widget_alive(btn):
+                btn.blockSignals(True)
+        for item in items_by_rail.pop(rail, []):
             row = self.rail_list.row(item)
             if row >= 0:
                 self.rail_list.takeItem(row)
@@ -10116,7 +10901,59 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
     def _fan_out_rail_eye_to_subnets(self, rail: str, on: bool) -> None:
         for eye in self._subnet_eye_buttons.get(rail, {}).values():
             if _qt_widget_alive(eye):
-                eye.setVisibleState(on, emit=False)
+                eye.setVisibleState(on, partial=False, emit=False)
+
+    def _subnet_tree_for_rail(self, rail: str):
+        trees = getattr(self, "_rail_to_trees", {}) or {}
+        return trees.get(rail)
+
+    def _fan_out_subnet_subtree(
+        self, rail: str, net: str, on: bool,
+    ) -> None:
+        """Set visibility for ``net`` and all SERIES descendants."""
+        from fypa.rail_groups import subtree_net_names
+
+        tree = self._subnet_tree_for_rail(rail)
+        names = subtree_net_names(tree, net)
+        if not names:
+            names = [net]
+        subnets = self._subnet_eye_buttons.get(rail, {})
+        for name in names:
+            eye = subnets.get(name)
+            if eye is not None and _qt_widget_alive(eye):
+                eye.setVisibleState(on, partial=False, emit=False)
+
+    def _sync_rail_tree_node_partials(self, rail: str) -> None:
+        """Update node partial badges from subtree visibility.
+
+        Does **not** change each node's own on/off (that is copper for that
+        net). The badge means "my state does not describe this whole branch"
+        — some descendant differs from this node — and is information only:
+        a plain click still toggles this net, Ctrl+Click still owns the
+        branch. See :func:`rail_tree_node_partial_flags`.
+        """
+        from fypa.rail_groups import rail_tree_node_partial_flags
+
+        tree = self._subnet_tree_for_rail(rail)
+        if tree is None:
+            return
+        subnets = self._subnet_eye_buttons.get(rail, {})
+        if not subnets:
+            return
+        visible = {
+            name: eye.isVisibleState()
+            for name, eye in subnets.items()
+            if _qt_widget_alive(eye)
+        }
+        for name, partial in rail_tree_node_partial_flags(tree, visible).items():
+            eye = subnets.get(name)
+            if eye is None or not _qt_widget_alive(eye):
+                continue
+            eye.setVisibleState(
+                eye.isVisibleState(),
+                partial=partial,
+                emit=False,
+            )
 
     def _sync_rail_eye_from_subnets(self, rail: str) -> None:
         subnets = self._subnet_eye_buttons.get(rail, {})
@@ -10139,6 +10976,13 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                 )
                 break
 
+    def _refresh_rail_visibility_after_subnet_change(self, rail: str) -> None:
+        self._sync_rail_tree_node_partials(rail)
+        self._sync_rail_eye_from_subnets(rail)
+        self._sync_all_rails_eye()
+        self._sync_rail_only_visibility()
+        self._render_with_busy_popup()
+
     def _on_rail_expand_toggled(self, rail: str, expanded: bool) -> None:
         self._rail_expanded[rail] = expanded
         btn = self._rail_expand_buttons.get(rail)
@@ -10153,14 +10997,270 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             self._remove_subnet_rows(rail)
         self._update_rail_list_height()
 
+    def _on_subnet_node_expand_toggled(
+        self, rail: str, net: str, expanded: bool, *, pending: bool = False,
+    ) -> None:
+        node_expanded = (
+            self._pending_subnet_node_expanded if pending
+            else self._subnet_node_expanded
+        )
+        expand_buttons = (
+            self._pending_subnet_expand_buttons if pending
+            else self._subnet_expand_buttons
+        )
+        node_expanded[(rail, net)] = expanded
+        btn = expand_buttons.get((rail, net))
+        if btn is not None and _qt_widget_alive(btn):
+            btn.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        # Defer the rebuild: this slot runs on the expand button's toggled
+        # signal, and rebuilding destroys that button.
+        QTimer.singleShot(
+            0, lambda r=rail, p=pending: self._rebuild_subnet_rows(
+                r, pending=p,
+            ),
+        )
+
+    def _rebuild_subnet_rows(self, rail: str, *, pending: bool = False) -> None:
+        # Deferred by one event-loop turn (see the caller), so the list may
+        # already have been torn down by a viewer retire in between — the
+        # Python-side item dicts outlive the C++ widget.
+        if not _qt_widget_alive(getattr(self, "rail_list", None)):
+            return
+        list_items = (
+            self._pending_rail_list_items if pending else self._rail_list_items
+        )
+        expanded = (
+            self._pending_rail_expanded if pending else self._rail_expanded
+        )
+        parent_item = list_items.get(rail)
+        if parent_item is None or not expanded.get(rail):
+            return
+        self._remove_subnet_rows(rail, pending=pending)
+        self._insert_subnet_rows(rail, after_item=parent_item, pending=pending)
+        self._update_rail_list_height()
+
     def _on_subnet_eye_toggled(self, rail: str, net: str, _on: bool) -> None:
         eye = self._subnet_eye_buttons.get(rail, {}).get(net)
         if eye is None or not _qt_widget_alive(eye):
             return
-        self._sync_rail_eye_from_subnets(rail)
+        self._refresh_rail_visibility_after_subnet_change(rail)
+
+    def _on_subnet_eye_ctrl_clicked(self, rail: str, net: str) -> None:
+        """Ctrl+Click: apply this net's own toggle to its SERIES subtree.
+
+        The target mirrors what a plain click on this node would do — visible
+        → hide the branch, hidden → show it — so the gesture round-trips. The
+        alternative ("anything mixed → show all") cannot hide a partly-hidden
+        branch at all without first rendering every net in it.
+        """
+        from fypa.rail_groups import subtree_toggle_target
+
+        eye = self._subnet_eye_buttons.get(rail, {}).get(net)
+        if eye is None or not _qt_widget_alive(eye):
+            return
+        self._fan_out_subnet_subtree(
+            rail, net, subtree_toggle_target(eye.isVisibleState()),
+        )
+        self._refresh_rail_visibility_after_subnet_change(rail)
+
+    def _add_layer_row(self, phys: str) -> tuple[EyeButton, EyeButton]:
+        """Build, wire and append one physical-layer row. Returns (eye, eye2).
+
+        Shared by ``_build_ui`` and ``_rebuild_layer_rail_lists`` — the two
+        used to carry byte-identical copies 400 lines apart, and had already
+        drifted over the default-copper-visibility fallback.
+        """
+        eye = EyeButton(
+            visible=True,
+            tip_show="Show this layer's analysed rails (rail copper only)",
+            tip_hide="Hide this layer's analysed rails (rail copper only)",
+            shift_isolatable=True,
+        )
+        eye.toggled_visible.connect(self._on_layer_eye_toggled)
+        eye.shift_clicked.connect(
+            lambda p=phys: self._on_layer_eye_shift_clicked(p),
+        )
+        eye2 = EyeButton(
+            visible=False,
+            tip_show="Show all copper on this layer",
+            tip_hide="Hide all copper on this layer",
+            shift_isolatable=True,
+        )
+        eye2.toggled_visible.connect(self._on_layer_eye2_toggled)
+        eye2.shift_clicked.connect(
+            lambda p=phys: self._on_layer_eye2_shift_clicked(p),
+        )
+        fill = FillToggleButton(solid=True)
+        fill.toggled_fill.connect(self._on_layer_fill_toggled)
+        transp = TransparencyButton(step=0)
+        transp.toggled_transparency.connect(
+            self._on_layer_transparency_toggled,
+        )
+        row = self._build_layer_row_widget(
+            eye, swatch_color=self._layer_color_for(phys),
+            label_text=phys, bold=False,
+            second_eye=eye2, fill_btn=fill, transparency_btn=transp,
+        )
+        item = QListWidgetItem()
+        item.setFlags(Qt.ItemIsEnabled)
+        self.layer_list.addItem(item)
+        item.setSizeHint(row.sizeHint())
+        self.layer_list.setItemWidget(item, row)
+        self._layer_eye_buttons.append((phys, eye))
+        self._layer_eye2_buttons.append((phys, eye2))
+        self._layer_fill_buttons.append((phys, fill))
+        self._layer_transparency_buttons.append((phys, transp))
+        self._layer_list_items[phys] = item
+        return eye, eye2
+
+    def _ensure_default_copper_visibility(self) -> None:
+        """Keep the viewport non-empty on a board with no analysed rails.
+
+        A Gerber import before any directives are placed — or an unsolved stub
+        loaded without auto-solve — starts with every eye closed, so turn on
+        the top physical layer's all-copper eye. Only when nothing else is
+        already showing, so a restored session keeps its own choice.
+        """
+        if not (self._no_pdn_visibility() and self._layer_eye2_buttons):
+            return
+        if any(eye.isVisibleState() for _, eye in self._layer_eye2_buttons):
+            return
+        self._layer_eye2_buttons[0][1].setVisibleState(True, emit=False)
+
+    def _apply_isolate_or_invert(
+        self,
+        entries: list[tuple[object, EyeButton]],
+        targets: set,
+        isolate_key: object,
+    ) -> bool:
+        """Show only *targets*, or invert when this same click already did.
+
+        ``entries`` pairs an arbitrary hashable key with its eye; ``targets``
+        is the subset of keys the clicked item covers (one entry for a layer or
+        subnet, the whole group for a bridged rail). ``isolate_key`` identifies
+        the click for the invert-on-repeat check.
+
+        Returns True when the visibility state was changed.
+        """
+        alive = [(key, eye) for key, eye in entries if _qt_widget_alive(eye)]
+        if not alive:
+            return False
+        target_keys = {key for key, _eye in alive if key in targets}
+        if not target_keys:
+            # The clicked item has no live eye. Isolating on it would switch
+            # every other eye off and leave the viewport blank.
+            return False
+        visible = {key for key, eye in alive if eye.isVisibleState()}
+        # Invert only on a repeat of the click that isolated, and only while
+        # that isolation still holds — a manual toggle in between means the
+        # user is narrowing down again, not asking for the complement.
+        invert = visible == target_keys and self._isolated_key == isolate_key
+        if invert and len(target_keys) == len(alive):
+            # Nothing to swap to; inverting would hide everything.
+            return False
+        for key, eye in alive:
+            eye.setVisibleState(
+                (key in targets) != invert, partial=False, emit=False,
+            )
+        self._isolated_key = None if invert else isolate_key
+        return True
+
+    def _iter_rail_visibility_entries(
+        self,
+    ) -> list[tuple[str, str | None, EyeButton]]:
+        """Return (rail, net_or_none, eye) for every isolatable rail/subnet eye."""
+        entries: list[tuple[str, str | None, EyeButton]] = []
+        for rail, eye in self._rail_eye_buttons:
+            subnets = [
+                (net, seye)
+                for net, seye in self._subnet_eye_buttons.get(rail, {}).items()
+                if _qt_widget_alive(seye)
+            ]
+            if subnets:
+                entries.extend((rail, net, seye) for net, seye in subnets)
+            elif _qt_widget_alive(eye):
+                # Aliveness is checked per eye, not per rail: a rail whose
+                # subnet eyes were destroyed with their row still has a live
+                # parent eye, and dropping it from the list would let everyone
+                # else's isolate switch it off with no way back.
+                entries.append((rail, None, eye))
+        return entries
+
+    def _after_rail_visibility_change(self) -> None:
+        """Re-sync the rail eye hierarchy after a bulk visibility change."""
+        for rail in self._subnet_eye_buttons:
+            self._sync_rail_eye_from_subnets(rail)
         self._sync_all_rails_eye()
         self._sync_rail_only_visibility()
-        self._render_with_busy_popup()
+
+    def _apply_rail_group_isolate_or_invert(self, rail: str) -> bool:
+        """Isolate a rail (all its subnets) or invert when already sole group."""
+        entries = self._iter_rail_visibility_entries()
+        targets = {(r, n) for r, n, _eye in entries if r == rail}
+        return self._apply_isolate_or_invert(
+            [((r, n), eye) for r, n, eye in entries],
+            targets,
+            ("rail", rail),
+        )
+
+    def _apply_rail_entry_isolate_or_invert(
+        self, rail: str, net: str | None,
+    ) -> bool:
+        """Isolate one rail or subnet entry, or invert when already sole visible."""
+        entries = self._iter_rail_visibility_entries()
+        return self._apply_isolate_or_invert(
+            [((r, n), eye) for r, n, eye in entries],
+            {(rail, net)},
+            ("entry", rail, net),
+        )
+
+    def _apply_eye_isolate_or_invert(
+        self,
+        items: list[tuple[str, EyeButton]],
+        target: str,
+        *,
+        kind: str = "layer",
+    ) -> bool:
+        """Show only *target*, or invert on a repeat click."""
+        return self._apply_isolate_or_invert(
+            list(items), {target}, (kind, target),
+        )
+
+    def _on_layer_eye_shift_clicked(self, phys: str) -> None:
+        if not self._apply_eye_isolate_or_invert(
+            self._layer_eye_buttons, phys, kind="layer",
+        ):
+            return
+        self._sync_all_layers_eye()
+        self._on_layer_visibility_changed()
+
+    def _on_layer_eye2_shift_clicked(self, phys: str) -> None:
+        if not self._apply_eye_isolate_or_invert(
+            self._layer_eye2_buttons, phys, kind="layer2",
+        ):
+            return
+        self._sync_all_layers_eye2()
+        rails = self._visible_rails()
+        self._run_with_busy_popup(
+            lambda: self._refresh_after_copper_eye(rails))
+
+    def _on_rail_eye_shift_clicked(self, rail: str) -> None:
+        # Branch on the same map _iter_rail_visibility_entries builds from.
+        # _rail_to_members is maintained separately (_init_solution_indices),
+        # and if the two disagree the isolate matches no entry at all and
+        # switches every eye off.
+        if self._subnet_eye_buttons.get(rail):
+            changed = self._apply_rail_group_isolate_or_invert(rail)
+        else:
+            changed = self._apply_rail_entry_isolate_or_invert(rail, None)
+        if changed:
+            self._after_rail_visibility_change()
+            self._render_with_busy_popup()
+
+    def _on_subnet_eye_shift_clicked(self, rail: str, net: str) -> None:
+        if self._apply_rail_entry_isolate_or_invert(rail, net):
+            self._after_rail_visibility_change()
+            self._render_with_busy_popup()
 
     def _on_layer_eye_toggled(self, _on: bool) -> None:
         """An individual layer's eye was clicked."""
@@ -10329,10 +11429,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         ):
             return
         self._fan_out_rail_eye_to_subnets(rail, on)
-        self._sync_rail_eye_from_subnets(rail)
-        self._sync_all_rails_eye()
-        self._sync_rail_only_visibility()
-        self._render_with_busy_popup()
+        self._refresh_rail_visibility_after_subnet_change(rail)
 
     def _on_all_rails_toggled(self, on: bool) -> None:
         """The "All Rails" eye was clicked — show or hide every rail."""
@@ -10340,6 +11437,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             if _qt_widget_alive(eye):
                 eye.setVisibleState(on, partial=False, emit=False)
             self._fan_out_rail_eye_to_subnets(name, on)
+            self._sync_rail_tree_node_partials(name)
         self._sync_all_rails_eye()
         self._sync_rail_only_visibility()
         self._render_with_busy_popup()
@@ -12748,7 +13846,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                                 continue
                             out.append(
                                 (v_at, f"{d.get('label') or d.get('designator', '?')}"
-                                       f".{pin.get('pad', '?')}")
+                                       f".{self._pin_display_pad(pin) or '?'}")
                             )
                 return out
 
@@ -13149,6 +14247,12 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         "RESISTOR":  {"symbol": "s",        "color": "#3aff8a", "size": 12, "label": "SERIES"},
         "SERIES":    {"symbol": "s",        "color": "#3aff8a", "size": 12, "label": "SERIES"},
         "REGULATOR": {"symbol": "d",        "color": "#ff66ff", "size": 14, "label": "REGULATOR"},
+        # A link FYPA shorted on its own (Net Tie, 0 Ω resistor, jumper).
+        # Same square as SERIES because that is what it is electrically, but
+        # a dimmer green and its own legend row so it reads as inferred
+        # rather than annotated, and can be toggled independently.
+        "AUTO_BRIDGE": {"symbol": "s",      "color": "#1f9c5a", "size": 12,
+                        "label": "SERIES (auto)"},
     }
 
     # --- Directive-pin marker + legend overlay -----------------------------
@@ -15296,23 +16400,48 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                 for term_name, term in (d.get("terminals") or {}).items():
                     term_pins = term.get("pins") or []
                     is_n_side = term_name in _N_SIDE_TERMINALS
-                    # Per-pin current = directive total / pins in THIS
-                    # terminal. The lumped element couples to each pin in
-                    # a terminal through equal-valued star resistors, so
-                    # with similar copper potentials at the pins the
-                    # current splits evenly. A terminal with no pins
-                    # (multi-channel directives can have empty terminals)
-                    # contributes no markers, so the divisor is never 0.
+                    # Per-pin current estimate for hover. Equal split when
+                    # area weighting is off; I * A_i / ΣA when the solve used
+                    # area-weighted star coupling (physics_constants flag).
+                    # Same equal-potential approximation as the star model —
+                    # FEM pin currents can still differ when copper access
+                    # to the pads is unequal.
                     n_pins = len(term_pins)
+                    area_weighted = bool(
+                        ((self.metadata or {}).get("physics_constants") or {})
+                        .get("area_weighted_pin_coupling")
+                    )
+                    per_pin_currents: list[float | None]
                     if (directive_current is not None
                             and np.isfinite(directive_current)
                             and n_pins > 0):
-                        per_pin_current: float | None = (
-                            directive_current / n_pins
-                        )
+                        if area_weighted:
+                            areas = [
+                                float(p.get("area_mm2") or 0.0)
+                                for p in term_pins
+                            ]
+                            positive = [a for a in areas if a > 0.0]
+                            if positive:
+                                a_mean = sum(positive) / len(positive)
+                                weights = [
+                                    a if a > 0.0 else a_mean for a in areas
+                                ]
+                                wsum = sum(weights) or 1.0
+                                per_pin_currents = [
+                                    directive_current * w / wsum
+                                    for w in weights
+                                ]
+                            else:
+                                per_pin_currents = [
+                                    directive_current / n_pins
+                                ] * n_pins
+                        else:
+                            per_pin_currents = [
+                                directive_current / n_pins
+                            ] * n_pins
                     else:
-                        per_pin_current = None
-                    for pin in term_pins:
+                        per_pin_currents = [None] * n_pins
+                    for pin_i, pin in enumerate(term_pins):
                         lid = pin.get("layer_id")
                         if lid not in target_layer_ids:
                             continue
@@ -15324,7 +16453,14 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                         # every rail's directives in at once. No visible rail
                         # ⇒ no rail markers (don't fall through to "show
                         # everything").
-                        if pin.get("net") not in rail_members:
+                        # An auto-bridge is not gated on rail visibility:
+                        # after the merge both its pads report the surviving
+                        # net, which is usually a return net the user is not
+                        # currently viewing — so the rail test would hide
+                        # exactly the inferred shorts they most need to see.
+                        # Its own legend row provides the off switch instead.
+                        if (role != "AUTO_BRIDGE"
+                                and pin.get("net") not in rail_members):
                             continue
                         xs, ys, zs, rcs = per_role.setdefault(
                             (role, is_n_side), ([], [], [], []))
@@ -15346,7 +16482,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                                 "terminal": term_name,
                                 "net": pin.get("net", ""),
                                 "physical": phys_for_pin or "",
-                                "current_a": per_pin_current,
+                                "current_a": per_pin_currents[pin_i],
                                 "directive_current_a": directive_current,
                                 "terminal_pin_count": n_pins,
                                 "size_px": int(
@@ -16086,12 +17222,83 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
 
     def _toggle_sidebar(self) -> None:
         """Show / hide the heatmap-tab side panel so the user can give the
-        viewport the panel's 260px of horizontal real estate. The slim
-        toggle button between the panel and the plot stays visible either
+        viewport the panel's horizontal real estate. The slim toggle /
+        resize handle between the panel and the plot stays visible either
         way, and its triangle flips ▶ / ◀ to mirror the new state."""
         was_visible = self._sidebar_scroll.isVisible()
         self._sidebar_scroll.setVisible(not was_visible)
         self._sidebar_toggle_btn.setCollapsed(was_visible)
+
+    def _on_sidebar_resize_press(self) -> None:
+        """Remember content width at the start of a splitter drag."""
+        self._sidebar_drag_start_w = getattr(
+            self, "_sidebar_requested_w", self._SIDEBAR_DEFAULT_W,
+        )
+
+    def _on_sidebar_resized_by(self, delta_px: int) -> None:
+        """Apply a drag delta from :class:`SidebarToggleButton`."""
+        start = getattr(
+            self, "_sidebar_drag_start_w", self._SIDEBAR_DEFAULT_W,
+        )
+        self._apply_sidebar_content_width(start + int(delta_px))
+        # Cosmetic and solve-independent, so _display_dirty rather than
+        # _mark_project_dirty: a panel drag must not light up Resolve, but it
+        # does need to count as an unsaved change or the width the user just
+        # set is silently lost on close.
+        self._display_dirty = True
+
+    def _apply_sidebar_content_width(
+        self, content_w: int, *, remember: bool = True,
+    ) -> None:
+        """Apply the left side-panel content width (px), clamped to the window.
+
+        ``_sidebar_requested_w`` is what the user asked for and is what gets
+        persisted; ``_sidebar_content_w`` is that same width clamped to what
+        currently fits beside the plot. Persisting the clamp instead would
+        shrink a 400 px preference to the 180 px minimum the first time the
+        project is opened on a narrow window — permanently, since the next
+        save writes the shrunken value back.
+        """
+        scroll = getattr(self, "_sidebar_scroll", None)
+        widget = getattr(self, "_sidebar_widget", None)
+        if scroll is None or widget is None:
+            return
+        content_w = int(content_w)
+        if remember:
+            self._sidebar_requested_w = max(
+                self._SIDEBAR_MIN_W, min(content_w, self._SIDEBAR_MAX_W),
+            )
+        max_w = getattr(self, "_SIDEBAR_MAX_W", 520)
+        gl = getattr(self, "_gl_viewer", None)
+        if gl is not None and gl.width() > 0:
+            # Leave room for the plot + toggle handle.
+            max_w = min(max_w, max(self._SIDEBAR_MIN_W, gl.width() - 80))
+        w = max(self._SIDEBAR_MIN_W, min(content_w, max_w))
+        if w == getattr(self, "_sidebar_content_w", None) and widget.width() == w:
+            return
+        self._sidebar_content_w = w
+        widget.setFixedWidth(w)
+        scroll.setFixedWidth(w + self._SIDEBAR_SCROLLBAR_W)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        # Re-assert the requested width against the new window size, so a
+        # panel that had to be clamped narrow grows back when the window is
+        # widened. ``remember=False``: the window changed, not the request.
+        super().resizeEvent(event)
+        requested = getattr(self, "_sidebar_requested_w", None)
+        if requested is not None:
+            self._apply_sidebar_content_width(requested, remember=False)
+
+    def _load_sidebar_width_from_project(self) -> None:
+        """Restore left side-panel width from ``viewer_settings``."""
+        proj = getattr(self, "_project", None)
+        if proj is None:
+            return
+        saved = (getattr(proj, "viewer_settings", None) or {}).get(
+            "sidebar_content_w",
+        )
+        if isinstance(saved, (int, float)) and saved > 0:
+            self._apply_sidebar_content_width(int(saved))
 
     def _hotkey_2d_mode(self) -> None:
         self.view_3d_box.setChecked(False)
@@ -16325,9 +17532,59 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         adaptive_on = (
             chk is not None and chk.isEnabled() and chk.isChecked()
         )
-        return bool(
+        wanted = bool(
             self._awaiting_first_solve or self._solve_stale or adaptive_on
         )
+        # A pending / stale solve is only actionable if the solver would
+        # accept it — otherwise the click just lands on the "Project is not
+        # solveable" dialog, so keep the button greyed out with a tooltip
+        # that says what's missing instead.
+        return wanted and self._has_solveable_directives()
+
+    _NOTHING_TO_SOLVE_TIP = (
+        "Nothing to solve yet — the design needs a SOURCE and a SINK on the "
+        "same rail. Switch on Edit to place them, then Solve."
+    )
+
+    def _has_solveable_directives(self) -> bool:
+        """True when the schematic + editor directives form at least one
+        closed rail (a source and a sink that share connected nets) — the
+        same test :attr:`LoadedProject.is_solveable` applies once the editor
+        directives are merged in. Answers ``True`` when there is no in-memory
+        design to inspect (a viewer opened from a bare pickle) or the check
+        itself fails, so the button never gets stuck disabled for a solve
+        the worker could actually run."""
+        loaded = getattr(self, "_loaded_project", None)
+        if loaded is None:
+            return True
+        project = getattr(self, "_project", None)
+        editor_directives = (
+            list(project.editor_directives) if project is not None else []
+        )
+
+        def _named_copper_at(ed):
+            # Free marker on copper the user has since named via a
+            # CopperName rename — mirror _unnamed_copper_directives()'s
+            # promotion, read-only.
+            if (ed.kind != "free" or ed.anchor_xy is None
+                    or ed.layer_id is None):
+                return None
+            c = self._copper_name_at(
+                float(ed.anchor_xy[0]), float(ed.anchor_xy[1]),
+                int(ed.layer_id),
+            )
+            return c.name if c is not None else None
+
+        try:
+            from fypa.editor_directives import has_closed_pdn_loop
+            return has_closed_pdn_loop(
+                loaded, editor_directives, p_net_resolver=_named_copper_at,
+            )
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "closed-loop check failed; enabling Solve", exc_info=True,
+            )
+            return True
 
     def _on_adaptive_gain_toggled(self, checked: bool) -> None:
         save_adaptive_regulator_gain(checked)
@@ -16808,9 +18065,13 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             if visible:
                 enabled = self._resolve_button_enabled()
                 rbtn.setEnabled(enabled)
+                solveable = enabled or self._has_solveable_directives()
                 if self._awaiting_first_solve:
                     rbtn.setText("↻  Solve")
-                    rbtn.setToolTip("Run the FEM solver on the loaded design")
+                    rbtn.setToolTip(
+                        "Run the FEM solver on the loaded design"
+                        if solveable else self._NOTHING_TO_SOLVE_TIP
+                    )
                 else:
                     rbtn.setText("↻  Resolve")
                     if enabled:
@@ -16818,6 +18079,8 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                             "Re-run the solver with the current editor "
                             "changes and settings applied"
                         )
+                    elif not solveable:
+                        rbtn.setToolTip(self._NOTHING_TO_SOLVE_TIP)
                     else:
                         rbtn.setToolTip(
                             "Check Adaptive SMPS gain to re-solve, or edit "
@@ -18951,11 +20214,74 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
     def _terminal_pin_pads(term: dict | None) -> list[str]:
         """Pad designators of a metadata directive terminal's pins — the
         PDN_PINS set the schematic resolved to. ``[]`` for an ideal return or
-        a terminal with no pins."""
+        a terminal with no pins.
+
+        Uses the raw ``pad`` field (not a compound ``J2-1`` label). Dedupes
+        case-insensitively so multi-DES terminals with the same pad number on
+        several connectors seed a single PDN_PINS entry.
+        """
         if not term or term.get("ideal_return"):
             return []
-        return [str(p.get("pad")) for p in term.get("pins", []) or []
-                if p.get("pad") not in (None, "")]
+        seen: set[str] = set()
+        out: list[str] = []
+        for p in term.get("pins", []) or []:
+            pad = p.get("pad")
+            if pad in (None, ""):
+                continue
+            pad_s = str(pad)
+            # Legacy metadata prefixed pad as ``COMP-PAD``; strip when the
+            # component field matches the prefix so Unlock stays resolvable.
+            comp = p.get("component")
+            if (comp and pad_s.upper().startswith(str(comp).upper() + "-")):
+                pad_s = pad_s[len(str(comp)) + 1:]
+            key = pad_s.upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(pad_s)
+        return out
+
+    @staticmethod
+    def _terminal_des_list(term: dict | None,
+                           host: str | None) -> list[str]:
+        """Unique component designators that contributed pins to ``term``.
+
+        Used to seed P DES / N DES on Unlock. Host-only terminals return
+        ``[]`` (blank DES ⇒ host component). Multi-connector terminals return
+        every unique ``component`` that contributed a pin (order preserved).
+        """
+        if not term or term.get("ideal_return"):
+            return []
+        seen: set[str] = set()
+        out: list[str] = []
+        for p in term.get("pins", []) or []:
+            c = p.get("component")
+            if not c:
+                continue
+            key = str(c).upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(str(c))
+        if not out:
+            return []
+        if host and len(out) == 1 and out[0].upper() == str(host).upper():
+            return []
+        return out
+
+    @staticmethod
+    def _pin_display_pad(pin: dict | None) -> str:
+        """Display label for a metadata pin — prefer compound ``pad_label``."""
+        if not pin:
+            return ""
+        label = pin.get("pad_label")
+        if label:
+            return str(label)
+        pad = pin.get("pad", "")
+        comp = pin.get("component")
+        if comp and pad:
+            return f"{comp}-{pad}"
+        return "" if pad is None else str(pad)
 
     @staticmethod
     def _parse_pin_field(text: str | None) -> list[str] | None:
@@ -19023,13 +20349,15 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             form.addRow("Layer", layer_lbl)
 
         self._ef_loc_x = QLineEdit(f"{float(ax):.4f}")
-        self._ef_loc_x.setValidator(QDoubleValidator(-1e9, 1e9, 4))
+        self._ef_loc_x.setValidator(
+            _numeric_validator(self, bottom=-1e9, top=1e9))
         self._ef_loc_x.setToolTip("X position (mm) — must stay on copper")
         self._ef_loc_x.editingFinished.connect(
             self._on_free_marker_coord_edited)
         form.addRow("X (mm)", self._ef_loc_x)
         self._ef_loc_y = QLineEdit(f"{float(ay):.4f}")
-        self._ef_loc_y.setValidator(QDoubleValidator(-1e9, 1e9, 4))
+        self._ef_loc_y.setValidator(
+            _numeric_validator(self, bottom=-1e9, top=1e9))
         self._ef_loc_y.setToolTip("Y position (mm) — must stay on copper")
         self._ef_loc_y.editingFinished.connect(
             self._on_free_marker_coord_edited)
@@ -19291,14 +20619,14 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         self._ef_role.currentTextChanged.connect(self._on_editor_role_changed)
         form.addRow("PDN role", self._ef_role)
         self._ef_value = QLineEdit()
-        self._ef_value.setValidator(QDoubleValidator(0.0, 1e12, 6))
+        self._ef_value.setValidator(_numeric_validator(self, top=1e12))
         self._ef_value_label = QLabel("Voltage (V)")
         form.addRow(self._ef_value_label, self._ef_value)
         # SINK-only optional minimum acceptable rail voltage (PDN_MIN_V
         # equivalent). Blank disables the per-pin pass/fail check. Visibility
         # is toggled by _on_editor_role_changed below.
         self._ef_min_v = QLineEdit()
-        self._ef_min_v.setValidator(QDoubleValidator(0.0, 1e12, 6))
+        self._ef_min_v.setValidator(_numeric_validator(self, top=1e12))
         self._ef_min_v.setToolTip(
             "Optional: minimum acceptable rail voltage at this sink's pins. "
             "Leave blank to skip the check. Sinks below this voltage are "
@@ -19351,10 +20679,33 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         )
         self._ef_npins_label = QLabel("N pins")
         form2.addRow(self._ef_npins_label, self._ef_npins)
-        # Pins apply to a real component's pads only.
+        # Multi-connector designator lists (PDN_P_DES / PDN_N_DES) — CSV of
+        # other component designators whose pads feed this terminal. Two-net
+        # SOURCE/SINK only; host is not auto-included when set.
+        self._ef_pdes = QLineEdit()
+        self._ef_pdes.setPlaceholderText("host only")
+        self._ef_pdes.setToolTip(
+            "Optional: comma-separated designators for the P terminal "
+            "(PDN_P_DES). Pads come only from those parts — the host is "
+            "not auto-included. Leave blank to use the host component."
+        )
+        self._ef_pdes_label = QLabel("P DES")
+        form2.addRow(self._ef_pdes_label, self._ef_pdes)
+        self._ef_ndes = QLineEdit()
+        self._ef_ndes.setPlaceholderText("host only")
+        self._ef_ndes.setToolTip(
+            "Optional: comma-separated designators for the N terminal "
+            "(PDN_N_DES). Pads come only from those parts — the host is "
+            "not auto-included. Leave blank to use the host component."
+        )
+        self._ef_ndes_label = QLabel("N DES")
+        form2.addRow(self._ef_ndes_label, self._ef_ndes)
+        # Pins / DES apply to a real component's pads only.
         self._ef_pins_apply = sel["kind"] == "component"
         for _w in (self._ef_pins, self._ef_pins_label,
-                   self._ef_npins, self._ef_npins_label):
+                   self._ef_npins, self._ef_npins_label,
+                   self._ef_pdes, self._ef_pdes_label,
+                   self._ef_ndes, self._ef_ndes_label):
             _w.setVisible(self._ef_pins_apply)
         lay.addLayout(form2)
 
@@ -19391,6 +20742,10 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                 self._set_combo(self._ef_nnet, existing.n_net)
             self._ef_pins.setText(", ".join(existing.p_pins or []))
             self._ef_npins.setText(", ".join(existing.n_pins or []))
+            self._ef_pdes.setText(", ".join(
+                getattr(existing, "p_des", None) or []))
+            self._ef_ndes.setText(", ".join(
+                getattr(existing, "n_des", None) or []))
             self._ef_remove.setEnabled(True)
             if existing.overrides_designator:
                 self._ef_status.setText(
@@ -19429,6 +20784,13 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                 ", ".join(self._terminal_pin_pads(terms.get("P"))))
             self._ef_npins.setText(
                 ", ".join(self._terminal_pin_pads(n_term)))
+            # Seed P/N DES from the components that actually contributed pins
+            # (multi-connector PDN_*_DES). Host-only → leave blank.
+            host_des = sel.get("designator")
+            self._ef_pdes.setText(
+                ", ".join(self._terminal_des_list(terms.get("P"), host_des)))
+            self._ef_ndes.setText(
+                ", ".join(self._terminal_des_list(n_term, host_des)))
             self._ef_remove.setEnabled(False)
             self._ef_status.setText(
                 f"<span style='color:{t['warn']};'>Unlocked — Apply "
@@ -19477,12 +20839,22 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         self._ef_pnet_label.setText("P net" if two else "Net")
         # The N-pin restriction only exists in two-net mode (single-net's N
         # terminal is an ideal return with no pads). Keep it in step with the
-        # N-net picker, and only for a component selection.
+        # N-net picker, and only for a component selection. P/N DES likewise
+        # apply only to two-net SOURCE/SINK (SERIES ignores them).
         if hasattr(self, "_ef_npins"):
             show_npins = two and getattr(self, "_ef_pins_apply", False)
             self._ef_npins.setVisible(show_npins)
             self._ef_npins_label.setVisible(show_npins)
             self._ef_pins_label.setText("P pins" if two else "Pins")
+        if hasattr(self, "_ef_pdes"):
+            role = (self._ef_role.currentText()
+                    if hasattr(self, "_ef_role") else "")
+            show_des = (two and getattr(self, "_ef_pins_apply", False)
+                        and role in ("SOURCE", "SINK"))
+            self._ef_pdes.setVisible(show_des)
+            self._ef_pdes_label.setVisible(show_des)
+            self._ef_ndes.setVisible(show_des)
+            self._ef_ndes_label.setVisible(show_des)
 
     def _on_editor_apply(self) -> None:
         """Commit the form into an :class:`EditorDirective` on the project,
@@ -19560,6 +20932,13 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             d.p_pins = self._parse_pin_field(self._ef_pins.text())
             d.n_pins = (None if single
                         else self._parse_pin_field(self._ef_npins.text()))
+            # Multi-connector DES lists (PDN_*_DES). Two-net SOURCE/SINK only.
+            if single or role not in ("SOURCE", "SINK"):
+                d.p_des = None
+                d.n_des = None
+            else:
+                d.p_des = self._parse_pin_field(self._ef_pdes.text())
+                d.n_des = self._parse_pin_field(self._ef_ndes.text())
             # If this component has a schematic directive, mark the editor
             # directive as its override so the re-solve drops the schematic
             # one instead of stamping both.
@@ -19571,6 +20950,8 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             d.kind = "free"
             d.p_pins = None
             d.n_pins = None
+            d.p_des = None
+            d.n_des = None
             self._editor_selection = {"kind": "free", "id": d.id}
 
         self._ensure_project().upsert_directive(d)
@@ -20043,8 +21424,8 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             return
         old_xy = (float(d.anchor_xy[0]), float(d.anchor_xy[1]))
         try:
-            nx = float(self._ef_loc_x.text())
-            ny = float(self._ef_loc_y.text())
+            nx = _parse_numeric_text(self._ef_loc_x.text())
+            ny = _parse_numeric_text(self._ef_loc_y.text())
         except (ValueError, RuntimeError):
             self._sync_free_marker_coord_fields(*old_xy)
             return
@@ -20373,8 +21754,27 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         self._pending_rail_items = []
         self._pending_rail_list_items = {}
         self._pending_rail_expand_buttons = {}
+        self._pending_subnet_expand_buttons = {}
         self._pending_rail_subnet_items = {}
         self._pending_rails = self._editor_pending_rails()
+        # Drop expansion state for rails that are no longer pending. Without
+        # this the dicts grow for the process lifetime and a node collapsed
+        # in one project reopens collapsed in the next project that happens
+        # to reuse the rail and subnet names — the solved list prunes the
+        # same way in _populate_rail_list.
+        self._pending_rail_expanded = {
+            r: v for r, v in self._pending_rail_expanded.items()
+            if r in self._pending_rails
+        }
+        self._pending_subnet_node_expanded = {
+            k: v for k, v in self._pending_subnet_node_expanded.items()
+            if k[0] in self._pending_rails
+        }
+        from fypa.rail_groups import build_rail_trees
+        self._pending_rail_trees = build_rail_trees(
+            self._rail_tree_metadata(),
+            self._pending_rails,
+        )
         t = _T()
         for name in sorted(self._pending_rails):
             members = self._pending_rails[name]
@@ -20385,20 +21785,11 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             expand_btn = None
             expanded = bool(self._pending_rail_expanded.get(name, False))
             if has_subnets:
-                expand_btn = QToolButton()
-                expand_btn.setCheckable(True)
-                expand_btn.setChecked(expanded)
-                expand_btn.setArrowType(
-                    Qt.DownArrow if expanded else Qt.RightArrow,
-                )
-                expand_btn.setFixedSize(14, 14)
-                expand_btn.setAutoRaise(True)
-                expand_btn.setFocusPolicy(Qt.NoFocus)
-                expand_btn.setCursor(Qt.PointingHandCursor)
-                expand_btn.setToolTip("Show/hide subnet nets (unsolved)")
-                expand_btn.toggled.connect(
-                    lambda exp, n=name: self._on_pending_rail_expand_toggled(
-                        n, exp,
+                expand_btn = self._make_expand_tool_button(
+                    expanded=expanded,
+                    tip="Show/hide subnet nets (unsolved)",
+                    on_toggled=lambda exp, n=name: (
+                        self._on_pending_rail_expand_toggled(n, exp)
                     ),
                 )
                 self._pending_rail_expand_buttons[name] = expand_btn
@@ -20420,58 +21811,25 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             self._pending_rail_items.append(item)
             self._pending_rail_list_items[name] = item
             if has_subnets and expanded:
-                self._insert_pending_subnet_rows(name, after_item=item)
+                self._insert_subnet_rows(
+                    name, after_item=item, pending=True,
+                )
         self._update_rail_list_height()
-
-    def _insert_pending_subnet_rows(
-        self, rail: str, *, after_item: QListWidgetItem,
-    ) -> None:
-        if self._pending_rail_subnet_items.get(rail):
-            return
-        members = self._pending_rails.get(rail, [rail])
-        items: list[QListWidgetItem] = []
-        row_idx = self.rail_list.row(after_item) + 1
-        t = _T()
-        for net in members:
-            eye = EyeButton(visible=False)
-            eye.setEnabled(False)
-            is_primary = net == rail
-            subnet_row = self._build_rail_row_widget(
-                eye,
-                label_text=net,
-                bold=is_primary,
-                indent=18,
-            )
-            subnet_row.setStyleSheet(
-                f"color: {t['fg_muted']}; font-style: italic;"
-            )
-            subnet_row.setToolTip(
-                f"Unsolved subnet of rail {rail} — press Resolve to compute it."
-            )
-            item = QListWidgetItem()
-            item.setFlags(Qt.ItemIsEnabled)
-            self.rail_list.insertItem(row_idx, item)
-            item.setSizeHint(subnet_row.sizeHint())
-            self.rail_list.setItemWidget(item, subnet_row)
-            items.append(item)
-            row_idx += 1
-        self._pending_rail_subnet_items[rail] = items
 
     def _on_pending_rail_expand_toggled(self, rail: str, expanded: bool) -> None:
         self._pending_rail_expanded[rail] = expanded
         btn = self._pending_rail_expand_buttons.get(rail)
-        if btn is not None:
+        if btn is not None and _qt_widget_alive(btn):
             btn.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
         parent_item = self._pending_rail_list_items.get(rail)
         if parent_item is None:
             return
         if expanded:
-            self._insert_pending_subnet_rows(rail, after_item=parent_item)
+            self._insert_subnet_rows(
+                rail, after_item=parent_item, pending=True,
+            )
         else:
-            for item in self._pending_rail_subnet_items.pop(rail, []):
-                row = self.rail_list.row(item)
-                if row >= 0:
-                    self.rail_list.takeItem(row)
+            self._remove_subnet_rows(rail, pending=True)
         self._update_rail_list_height()
 
     def _unnamed_copper_directives(self) -> list:
@@ -20525,6 +21883,15 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         editor directives) — in that case the editor-directive list is
         simply empty and the solve runs with the new parameters."""
         if not self._resolve_button_enabled():
+            if not self._has_solveable_directives():
+                QMessageBox.information(
+                    self, "Nothing to solve",
+                    "The design has no closed PDN rail to solve: it needs a "
+                    "<b>SOURCE</b> and a <b>SINK</b> on the same rail.\n\n"
+                    "Switch on Edit to place them, then press "
+                    f"{self._stub_action_word()}.",
+                )
+                return
             QMessageBox.information(
                 self, "Nothing to resolve",
                 "The current solve is up to date. Check "
@@ -21085,34 +22452,16 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
     def _ensure_cursor_tooltip_label(self) -> QLabel:
         """Lazily build the floating QLabel used as the cursor tooltip."""
         label = getattr(self, "_cursor_tooltip_label", None)
-        if label is not None:
+        if label is not None and _qt_widget_alive(label):
             return label
-        # Qt.ToolTip = frameless, no focus, stays above its parent window.
-        # WA_TransparentForMouseEvents so we never steal hover events
-        # from the GL viewer when the label happens to slide under the
-        # cursor at the screen edge.
-        label = QLabel(self._gl_viewer, Qt.ToolTip | Qt.FramelessWindowHint)
-        label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        label.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        label.setFocusPolicy(Qt.NoFocus)
-        _t = _T()
-        label.setStyleSheet(
-            "QLabel {"
-            f" background-color: {_t['bg']};"
-            f" color: {_t['fg']};"
-            f" border: 1px solid {_t['border']};"
-            " padding: 4px 8px;"
-            " font-family: Consolas, monospace;"
-            " font-size: 9pt;"
-            "}"
-        )
-        label.hide()
+        label = _make_floating_tooltip(
+            self._gl_viewer, font_family="Consolas, monospace")
         self._cursor_tooltip_label = label
         return label
 
     def _hide_cursor_tooltip(self) -> None:
         label = getattr(self, "_cursor_tooltip_label", None)
-        if label is not None and label.isVisible():
+        if label is not None and _qt_widget_alive(label):
             label.hide()
 
     def _update_cursor_tooltip(
@@ -21172,19 +22521,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         label = self._ensure_cursor_tooltip_label()
         label.setText("\n".join(lines))
         label.adjustSize()
-        # Anchor below-right of the cursor (Windows-cursor convention).
-        # Clamp to the current screen so the label stays fully visible
-        # when the cursor is near the right / bottom edge.
-        gx = QCursor.pos().x() + 16
-        gy = QCursor.pos().y() + 20
-        screen = label.screen() or QApplication.primaryScreen()
-        if screen is not None:
-            geo = screen.availableGeometry()
-            gx = min(gx, geo.right() - label.width() - 2)
-            gy = min(gy, geo.bottom() - label.height() - 2)
-            gx = max(gx, geo.left() + 2)
-            gy = max(gy, geo.top() + 2)
-        label.move(gx, gy)
+        _move_tooltip_to_cursor(label)
         if not label.isVisible():
             label.show()
 
@@ -21583,8 +22920,9 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
     def _rail_sink_load(self, rail_members: set[str]) -> tuple[float, bool]:
         """Sum of every SINK load coupling into ``rail_members`` — solved
         schematic directives plus pending editor directives. A schematic
-        SINK is dropped when an editor directive overrides its designator
-        so an unlocked-and-edited sink isn't counted twice. Returns
+        SINK is dropped when an editor directive overrides its designator,
+        and an editor-originated one is dropped from the solved side
+        outright, so neither is counted twice. Returns
         ``(total_amps, any_found)``."""
         total = 0.0
         any_found = False
@@ -21595,6 +22933,16 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             if other.get("role") != "SINK":
                 continue
             if other.get("designator") in overridden:
+                continue
+            # An editor directive that has survived a re-solve sits in BOTH
+            # lists: apply_editor_directives appended it to the solved
+            # directives, and the project still holds it as a live editor
+            # directive. The editor loop below owns it, so counting it here
+            # too doubles the reported rail load. Only skip when that loop
+            # will actually run — a solve bundle opened without a project
+            # would otherwise lose its editor-placed sinks entirely.
+            if (self._project is not None
+                    and other.get("schdoc") == _EDITOR_SCHDOC):
                 continue
             for term in (other.get("terminals") or {}).values():
                 if any(p.get("net") in rail_members
@@ -22056,15 +23404,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             )
         if getattr(self, "_cursor_tooltip_label", None) is not None:
             self._cursor_tooltip_label.setStyleSheet(
-                "QLabel {"
-                f" background-color: {t['bg']};"
-                f" color: {t['fg']};"
-                f" border: 1px solid {t['border']};"
-                " padding: 4px 8px;"
-                " font-family: Consolas, monospace;"
-                " font-size: 9pt;"
-                "}"
-            )
+                _floating_tooltip_qss("Consolas, monospace"))
         if getattr(self, "scale_controller", None) is not None:
             self.scale_controller.apply_theme()
         if getattr(self, "_sidebar_toggle_btn", None) is not None:
@@ -22111,6 +23451,11 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             self._build_vias_tab(), "Vias",
         )
         self._update_vias_tab_title(getattr(self, "_vias_warn_count", 0))
+        self._bridges_table_populated = False
+        self._bridges_tab_index = self.tabs.addTab(
+            self._build_bridges_tab(), "Bridges",
+        )
+        self._update_bridges_tab_title()
         self._caps_tab_index = self.tabs.addTab(
             self._build_capacitors_tab(), "Capacitors",
         )
@@ -22234,10 +23579,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             is_plane = bool(row.get("is_plane"))
 
             edit = QLineEdit(self._fmt_settings_value(thk_um))
-            validator = QDoubleValidator(self)
-            validator.setNotation(QDoubleValidator.StandardNotation)
-            validator.setBottom(0.0)
-            edit.setValidator(validator)
+            edit.setValidator(_numeric_validator(self))
             edit.setMinimumWidth(110)
             edit.setMaximumWidth(160)
             tooltip = (
@@ -22336,7 +23678,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         if btn is None or edit is None:
             return
         try:
-            val = float(edit.text().strip())
+            val = self._parse_settings_value(edit.text())
         except ValueError:
             btn.setVisible(False)
             return
@@ -22407,7 +23749,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             if not text:
                 continue
             try:
-                new_um = float(text)
+                new_um = self._parse_settings_value(text)
             except ValueError:
                 raise ValueError(
                     f"layer {lid} thickness: not a number ({text!r})"
@@ -22435,12 +23777,18 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                 continue
             text = edit.text().strip()
             try:
-                kwargs[key] = float(text)
+                kwargs[key] = self._parse_settings_value(text)
             except ValueError:
                 raise ValueError(f"{label!r}: not a number ({text!r})")
         chk = getattr(self, "_settings_adaptive_check", None)
         if chk is not None:
             kwargs["adaptive_mesh"] = chk.isChecked()
+        aw = getattr(self, "_settings_area_weighted_check", None)
+        if aw is not None:
+            kwargs["area_weighted_pin_coupling"] = aw.isChecked()
+        et = getattr(self, "_settings_electrothermal_check", None)
+        if et is not None:
+            kwargs["electrothermal"] = et.isChecked()
         mode_combo = getattr(self, "_fill_mode_combo", None)
         if mode_combo is not None:
             data = mode_combo.currentData()
@@ -22455,7 +23803,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                 return getattr(self, f"_{key}")
             text = edit.text().strip()
             try:
-                return float(text)
+                return self._parse_settings_value(text)
             except ValueError:
                 raise ValueError(f"{label!r}: not a number ({text!r})")
 
@@ -23008,6 +24356,17 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         if caploop is not None:
             proj.viewer_settings["caploop"] = caploop.to_dict()
 
+        # No footprint_convention here: _set_footprint_convention already
+        # writes it into the project's viewer_settings the moment the user
+        # picks one, and this method does not clear the dict. Repeating it
+        # read from self._project while writing into the PASSED proj (the
+        # wrong project for any future Save-As), and stamped "auto" into
+        # every saved .fypa for users who never touched the setting.
+
+        sidebar_w = getattr(self, "_sidebar_requested_w", None)
+        if isinstance(sidebar_w, int) and sidebar_w > 0:
+            proj.viewer_settings["sidebar_content_w"] = int(sidebar_w)
+
         overlay_state = getattr(self, "_overlay_state", None)
         if overlay_state:
             proj.viewer_settings["overlay_state"] = {
@@ -23416,6 +24775,14 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             loaded_project=loaded_project,
             load_only=load_only,
             adaptive_regulator_gain=adaptive_regulator_gain,
+            # Bridges-tab opt-outs. Read from the live project rather than
+            # passed in: every solve path (Resolve, Re-run, import) must
+            # honour them, and they live with the editor directives.
+            no_auto_bridge={
+                d.strip().upper()
+                for d in (getattr(getattr(self, "_project", None),
+                                  "no_auto_bridge", []) or [])
+            },
             parent=self,
         )
         if is_import:
@@ -23978,6 +25345,23 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         # is deferred to first tab activation (see __init__ + _on_tabs_current_changed).
         return widget
 
+    def _update_bridges_tab_title(self) -> None:
+        """Badge the tab with the number of parts that affect a solved rail.
+
+        Those are the rows that change an answer — a part joining a solved
+        rail to copper no directive touches means that copper is missing
+        from the FEM. Putting the count on the tab is what stops the whole
+        feature being something the user has to think to go and look at.
+        """
+        idx = getattr(self, "_bridges_tab_index", -1)
+        if idx < 0:
+            return
+        try:
+            n = sum(1 for r in self._bridge_rows() if r.get("impact"))
+        except Exception:
+            n = 0
+        self.tabs.setTabText(idx, f"Bridges \u26a0 {n}" if n else "Bridges")
+
     def _on_tabs_current_changed(self, index: int) -> None:
         """Lazy-populate the Nodes / Vias tables the first time the user
         opens them. On a 7 000-via board the Vias populate alone takes
@@ -24000,6 +25384,10 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                 self._populate_vias_table()
             finally:
                 QApplication.restoreOverrideCursor()
+        elif (index == getattr(self, "_bridges_tab_index", -1)
+                and not getattr(self, "_bridges_table_populated", True)):
+            self._bridges_table_populated = True
+            self._populate_bridges_table()
         elif (index == getattr(self, "_caps_tab_index", -1)
                 and not getattr(self, "_caps_table_populated", True)):
             # The row build is seconds of geometry work — run it behind a busy
@@ -24336,7 +25724,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                         "designator": display_desig,
                         "schdoc": schdoc,
                         "terminal": term_name,
-                        "pad": pin.get("pad", ""),
+                        "pad": self._pin_display_pad(pin),
                         "net": net,
                         "layer_id": layer_id,
                         "x_mm": x,
@@ -24461,6 +25849,516 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         ("|I| max (A)",      True),
         ("Power (mW)",       True),
     )
+
+
+    # --- Bridges tab -------------------------------------------------------
+    #
+    # Every part that joins two nets, and what FYPA did with it. Bridging was
+    # previously spread across four mechanisms with no single view of the
+    # result — Altium PDN_ROLE=SERIES, the Net Tie / 0 Ω auto-bridge, the
+    # low-Ω net merge that absorbs those, and editor-mode SERIES — which is
+    # why a board could be silently shorted in five places with nothing on
+    # screen to say so. This tab is that single view, and the only place an
+    # auto-bridge can be turned off.
+
+    _BRIDGES_TABLE_COLUMNS: tuple[tuple[str, str], ...] = (
+        ("Part", "Designator. Click a row to locate it on the board."),
+        ("Kind", "Inferred from the designator prefix."),
+        ("Value", "The part's Altium value / comment."),
+        ("Pins", "Pad count. The filter below keys on distinct NETS, not "
+                 "pins — a 4-pad Kelvin shunt bridges two nets and matters, "
+                 "a 2-pin part with both pads on one net does not."),
+        ("Nets", "The two nets this part joins."),
+        ("State", "series = you annotated it · auto = FYPA shorted it on "
+                  "its own · off = auto-bridge disabled · not modelled = "
+                  "open at DC, its far-side copper is absent from the FEM."),
+        ("R", "DC resistance in ohms. Editable. Blank = not modelled."),
+        ("Why / impact", "Why FYPA treated it this way, and what it costs "
+                         "the result if it is wrong."),
+    )
+
+    # Below this, FYPA merges the two nets into one rail instead of keeping a
+    # lumped resistor — mirrors loader.NET_MERGE_RESISTANCE_THRESHOLD_OHM.
+    # Surfaced in the UI because the merge renames nets, which is startling
+    # if you typed a small number and watched a rail disappear.
+    _BRIDGE_MERGE_THRESHOLD_OHM: float = 0.9e-3
+
+    def _build_bridges_tab(self) -> QWidget:
+        widget = QWidget(self.tabs)
+        outer = QVBoxLayout(widget)
+        outer.setContentsMargins(8, 8, 8, 8)
+
+        blurb = QLabel(
+            "Parts that electrically join two nets. Set a resistance to model "
+            "one as a SERIES element, or switch off an automatic short. "
+            "Changes are saved to the project file and applied on the next "
+            "Resolve."
+        )
+        blurb.setWordWrap(True)
+        blurb.setStyleSheet(f"QLabel {{ color: {_T()['fg_muted']}; }}")
+        outer.addWidget(blurb)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Show:"))
+        self.bridges_state_combo = QComboBox()
+        self.bridges_state_combo.addItems([
+            "All parts", "Modelled as SERIES", "Auto-bridged",
+            "Not modelled", "Affects a solved rail",
+        ])
+        self.bridges_state_combo.setToolTip(
+            "'Affects a solved rail' is the one to watch: those parts join a "
+            "rail being solved to copper no directive touches, so that copper "
+            "is missing from the FEM and the rail's return resistance reads "
+            "high."
+        )
+        self.bridges_state_combo.currentTextChanged.connect(
+            self._apply_bridges_filter)
+        filter_row.addWidget(self.bridges_state_combo)
+
+        filter_row.addSpacing(12)
+        self.bridges_two_net_box = QCheckBox("Two-net parts only")
+        self.bridges_two_net_box.setChecked(True)
+        self.bridges_two_net_box.setToolTip(
+            "Only parts whose pads touch exactly two distinct nets — the "
+            "ones that can actually bridge. Off shows every candidate part."
+        )
+        self.bridges_two_net_box.toggled.connect(self._apply_bridges_filter)
+        filter_row.addWidget(self.bridges_two_net_box)
+
+        filter_row.addStretch(1)
+        self.bridges_summary_label = QLabel("")
+        self.bridges_summary_label.setStyleSheet(
+            f"QLabel {{ color: {_T()['fg_muted']}; }}")
+        filter_row.addWidget(self.bridges_summary_label)
+        outer.addLayout(filter_row)
+
+        self.bridges_table = QTableWidget()
+        cols = self._BRIDGES_TABLE_COLUMNS
+        self.bridges_table.setColumnCount(len(cols))
+        self.bridges_table.setHorizontalHeaderLabels([c[0] for c in cols])
+        for i, (_name, tip) in enumerate(cols):
+            item = self.bridges_table.horizontalHeaderItem(i)
+            if item is not None:
+                item.setToolTip(tip)
+        self.bridges_table.setSortingEnabled(True)
+        self.bridges_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.bridges_table.setAlternatingRowColors(True)
+        self.bridges_table.verticalHeader().setVisible(False)
+        self.bridges_table.horizontalHeader().setStretchLastSection(True)
+        self.bridges_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.Interactive)
+        _t = _T()
+        self.bridges_table.setStyleSheet(
+            f"QTableWidget {{ background-color: {_t['bg']}; color: {_t['fg']};"
+            f"               gridline-color: {_t['gridline']};"
+            f"               alternate-background-color: {_t['bg_alt']}; }}"
+            f"QHeaderView::section {{ background-color: {_t['bg_header']};"
+            f"                       color: {_t['fg_strong']}; padding: 4px;"
+            f"                       border: 1px solid {_t['border']}; }}"
+            f"QTableWidget::item:selected {{"
+            f"    background-color: {_t['bg_selection']}; }}"
+        )
+        self.bridges_table.cellClicked.connect(self._on_bridges_cell_clicked)
+        self.bridges_table.itemChanged.connect(self._on_bridges_item_changed)
+        outer.addWidget(self.bridges_table, 1)
+
+        edit_row = QHBoxLayout()
+        edit_row.addWidget(QLabel("Selected part:"))
+        self.bridges_r_edit = QLineEdit()
+        self.bridges_r_edit.setPlaceholderText("resistance in ohms, e.g. 0.05")
+        self.bridges_r_edit.setValidator(_numeric_validator(self, top=1e12))
+        self.bridges_r_edit.setFixedWidth(180)
+        self.bridges_r_edit.setToolTip(
+            "Use the part's real DC resistance, not its nominal value — a "
+            "ferrite's datasheet '0 Ω' is 20–200 mΩ of DCR, a fuse 10–100 mΩ."
+        )
+        self.bridges_r_edit.textChanged.connect(self._on_bridge_r_text_changed)
+        edit_row.addWidget(self.bridges_r_edit)
+
+        self.bridges_apply_btn = QPushButton("Model as SERIES")
+        self.bridges_apply_btn.setToolTip(
+            "Add an editor SERIES directive for the selected part with this "
+            "resistance. Saved to the .fypa; press Resolve to apply it.")
+        self.bridges_apply_btn.clicked.connect(self._on_bridge_apply)
+        edit_row.addWidget(self.bridges_apply_btn)
+
+        self.bridges_clear_btn = QPushButton("Remove")
+        self.bridges_clear_btn.setToolTip(
+            "Drop the editor SERIES directive for this part, or re-enable an "
+            "auto-bridge that was switched off.")
+        self.bridges_clear_btn.clicked.connect(self._on_bridge_clear)
+        edit_row.addWidget(self.bridges_clear_btn)
+
+        self.bridges_disable_btn = QPushButton("Disable auto-bridge")
+        self.bridges_disable_btn.setToolTip(
+            "Stop FYPA shorting this part automatically — it is left open at "
+            "DC. The only way to veto an auto-bridge: the short (and the net "
+            "merge that absorbs it) happens while annotations are parsed, "
+            "long before editor directives are applied.")
+        self.bridges_disable_btn.clicked.connect(self._on_bridge_disable)
+        edit_row.addWidget(self.bridges_disable_btn)
+
+        edit_row.addStretch(1)
+        self.bridges_hint_label = QLabel("")
+        self.bridges_hint_label.setWordWrap(True)
+        edit_row.addWidget(self.bridges_hint_label, 1)
+        outer.addLayout(edit_row)
+        self._refresh_bridge_buttons()
+        return widget
+
+    # --- Bridges tab: data -------------------------------------------------
+
+    def _bridge_rows(self) -> list[dict]:
+        """Candidate records from solve metadata, with the user's own edits
+        folded in so the table shows the *pending* state rather than the last
+        solve's."""
+        meta = self.metadata if isinstance(self.metadata, dict) else {}
+        rows = [dict(r) for r in (meta.get("bridge_candidates") or [])]
+        project = getattr(self, "_project", None)
+        if project is None:
+            return rows
+
+        opted_out = {d.strip().upper()
+                     for d in getattr(project, "no_auto_bridge", []) or []}
+        editor_series = {
+            (ed.designator or "").strip().upper(): ed
+            for ed in getattr(project, "editor_directives", []) or []
+            if ed.role == "SERIES" and ed.designator
+        }
+        for r in rows:
+            key = r["designator"].strip().upper()
+            ed = editor_series.get(key)
+            if ed is not None and ed.resistance is not None:
+                r["state"] = "series"
+                r["resistance_ohm"] = float(ed.resistance)
+                r["why"] = "set here (editor SERIES)"
+                r["impact"] = ""
+            elif key in opted_out:
+                r["state"] = "off"
+                r["resistance_ohm"] = None
+                r["why"] = "auto-bridge disabled here"
+        return rows
+
+    def _selected_bridge_row(self) -> dict | None:
+        table = getattr(self, "bridges_table", None)
+        if table is None:
+            return None
+        items = table.selectedItems()
+        if not items:
+            return None
+        rec = table.item(items[0].row(), 0)
+        return rec.data(Qt.UserRole) if rec is not None else None
+
+
+    _BRIDGE_STATE_LABEL = {
+        "series": "series",
+        "auto": "auto",
+        "off": "off",
+        "unmodelled": "not modelled",
+    }
+
+    def _populate_bridges_table(self) -> None:
+        table = getattr(self, "bridges_table", None)
+        if table is None:
+            return
+        rows = self._bridge_rows()
+        self._bridges_rows_cache = rows
+        # Sorting and itemChanged both fire during a populate; suppress them
+        # or every setItem re-sorts the model out from under the loop and the
+        # R column's edit handler fires on rows the user never touched.
+        table.setSortingEnabled(False)
+        self._bridges_populating = True
+        try:
+            table.setRowCount(len(rows))
+            for i, r in enumerate(rows):
+                state = r.get("state", "unmodelled")
+                r_ohm = r.get("resistance_ohm")
+                nets = f"{r.get('net_a', '?')} \u2194 {r.get('net_b', '?')}"
+                why = r.get("impact") or r.get("why") or ""
+                cells = [
+                    r.get("designator", "?"),
+                    r.get("kind", ""),
+                    r.get("value", ""),
+                    str(r.get("pin_count", "")),
+                    nets,
+                    self._BRIDGE_STATE_LABEL.get(state, state),
+                    "" if r_ohm is None else f"{r_ohm:g}",
+                    why,
+                ]
+                for c, text in enumerate(cells):
+                    item = QTableWidgetItem(text)
+                    # Only the R column is editable — everything else is
+                    # extracted fact, not a user choice.
+                    if c == 6:
+                        item.setFlags(item.flags() | Qt.ItemIsEditable)
+                    else:
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                    if c == 0:
+                        item.setData(Qt.UserRole, r)
+                    if r.get("impact"):
+                        item.setForeground(QColor("#ffb300"))
+                    elif state == "auto":
+                        item.setForeground(QColor("#1f9c5a"))
+                    table.setItem(i, c, item)
+        finally:
+            self._bridges_populating = False
+            table.setSortingEnabled(True)
+        table.resizeColumnsToContents()
+        self._apply_bridges_filter()
+
+    def _apply_bridges_filter(self) -> None:
+        table = getattr(self, "bridges_table", None)
+        if table is None:
+            return
+        mode = self.bridges_state_combo.currentText()
+        two_net_only = self.bridges_two_net_box.isChecked()
+        shown = 0
+        impacted = 0
+        for i in range(table.rowCount()):
+            cell = table.item(i, 0)
+            r = cell.data(Qt.UserRole) if cell is not None else None
+            if r is None:
+                continue
+            state = r.get("state", "unmodelled")
+            if r.get("impact"):
+                impacted += 1
+            keep = True
+            if mode == "Modelled as SERIES":
+                keep = state == "series"
+            elif mode == "Auto-bridged":
+                keep = state == "auto"
+            elif mode == "Not modelled":
+                keep = state in ("unmodelled", "off")
+            elif mode == "Affects a solved rail":
+                keep = bool(r.get("impact"))
+            if keep and two_net_only and r.get("net_a") == r.get("net_b"):
+                keep = False
+            table.setRowHidden(i, not keep)
+            shown += int(keep)
+        total = table.rowCount()
+        msg = f"{shown} of {total} part(s)"
+        if impacted:
+            msg += f"  \u2022  {impacted} affecting a solved rail"
+        self.bridges_summary_label.setText(msg)
+
+    def _on_bridges_cell_clicked(self, row: int, _col: int) -> None:
+        """Locate the part on the board and load its resistance into the
+        editor field."""
+        cell = self.bridges_table.item(row, 0)
+        r = cell.data(Qt.UserRole) if cell is not None else None
+        if not r:
+            return
+        r_ohm = r.get("resistance_ohm")
+        self.bridges_r_edit.setText("" if r_ohm is None else f"{r_ohm:g}")
+        self._refresh_bridge_buttons()
+        # Reuse the Vias tab's highlight so a row click centres the part.
+        try:
+            self._highlight_via_xy = (float(r["x_mm"]), float(r["y_mm"]))
+            self._render()
+        except Exception:
+            logging.getLogger(__name__).debug("bridge row highlight failed", exc_info=True)
+
+    def _on_bridges_item_changed(self, item) -> None:
+        """In-place edit of the R column commits the same way the button
+        does, so typing a value and pressing Enter just works."""
+        if getattr(self, "_bridges_populating", False) or item.column() != 6:
+            return
+        cell = self.bridges_table.item(item.row(), 0)
+        r = cell.data(Qt.UserRole) if cell is not None else None
+        if not r:
+            return
+        text = item.text().strip()
+        if not text:
+            self._apply_bridge_series(r, None)
+            return
+        try:
+            value = _parse_numeric_text(text)
+        except ValueError:
+            QMessageBox.warning(
+                self, "Not a number",
+                f"{text!r} is not a resistance. Enter ohms, e.g. 0.05.")
+            self._populate_bridges_table()
+            return
+        self._apply_bridge_series(r, value)
+
+    def _on_bridge_r_text_changed(self, text: str) -> None:
+        """Live warning about the merge cliff — below the threshold the two
+        nets stop existing separately, which renames rails."""
+        label = getattr(self, "bridges_hint_label", None)
+        if label is None:
+            return
+        text = (text or "").strip()
+        if not text:
+            label.setText("")
+            return
+        try:
+            value = _parse_numeric_text(text)
+        except ValueError:
+            label.setText("")
+            return
+        r = self._selected_bridge_row()
+        if value < self._BRIDGE_MERGE_THRESHOLD_OHM:
+            a = (r or {}).get("net_a", "the two nets")
+            b = (r or {}).get("net_b", "")
+            label.setText(
+                f"<span style='color:#ffb300;'>Below "
+                f"{self._BRIDGE_MERGE_THRESHOLD_OHM * 1e3:g} m\u03a9 this is "
+                f"treated as a wire: {_esc(a)} and {_esc(b)} merge into one "
+                f"rail and one of the names disappears from the rail "
+                f"picker.</span>")
+        else:
+            label.setText(
+                f"<span style='color:{_T()['fg_muted']};'>Modelled as a "
+                f"{value * 1e3:g} m\u03a9 series element; both nets stay "
+                f"separate.</span>")
+
+    def _refresh_bridge_buttons(self) -> None:
+        r = self._selected_bridge_row()
+        for name in ("bridges_apply_btn", "bridges_clear_btn",
+                     "bridges_disable_btn"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.setEnabled(bool(r))
+        btn = getattr(self, "bridges_disable_btn", None)
+        if btn is not None:
+            # Only meaningful for a part FYPA shorted on its own.
+            btn.setEnabled(bool(r) and r.get("state") == "auto")
+
+    # --- Bridges tab: actions ----------------------------------------------
+
+    def _warn_if_shorting_power_rails(self, rec: dict) -> bool:
+        """Confirm before joining two nets that both look like supplies.
+
+        Tying AGND to GND is routine; tying +5V to +3V3 is almost always a
+        mistake, and it is one the solver will happily accept and quietly
+        give a wrong answer for.
+        """
+        a = str(rec.get("net_a", ""))
+        b = str(rec.get("net_b", ""))
+        if not (_looks_like_supply_net(a) and _looks_like_supply_net(b)):
+            return True
+        if _supply_net_key(a) == _supply_net_key(b):
+            return True   # +3V3 and +3V3_SW are the same supply
+        return QMessageBox.warning(
+            self, "Shorting two supplies?",
+            f"{rec.get('designator', '?')} joins {a} and {b}, which "
+            f"both look like supply rails rather than a ground pair."
+            f"\n\nTying two grounds together is routine; tying two "
+            f"different supplies is almost always a mistake, and the "
+            f"solver will accept it and quietly return a wrong answer."
+            f"\n\nBridge them anyway?",
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
+        ) == QMessageBox.Yes
+
+    def _on_bridge_apply(self) -> None:
+        rec = self._selected_bridge_row()
+        if not rec:
+            return
+        text = self.bridges_r_edit.text().strip()
+        if not text:
+            QMessageBox.information(
+                self, "No resistance",
+                "Enter the part's DC resistance in ohms first.")
+            return
+        try:
+            value = _parse_numeric_text(text)
+        except ValueError:
+            QMessageBox.warning(self, "Not a number",
+                                f"{text!r} is not a resistance.")
+            return
+        self._apply_bridge_series(rec, value)
+
+    def _on_bridge_clear(self) -> None:
+        rec = self._selected_bridge_row()
+        if rec:
+            self._apply_bridge_series(rec, None)
+
+    def _on_bridge_disable(self) -> None:
+        rec = self._selected_bridge_row()
+        if not rec:
+            return
+        project = self._ensure_project()
+        des = rec["designator"]
+        existing = {d.strip().upper()
+                    for d in getattr(project, "no_auto_bridge", []) or []}
+        if des.strip().upper() in existing:
+            return
+        project.no_auto_bridge = list(
+            getattr(project, "no_auto_bridge", []) or []) + [des]
+        self._after_bridge_edit(
+            f"{des}: auto-bridge disabled. It will be left open at DC on the "
+            f"next Resolve.")
+
+    def _apply_bridge_series(self, rec: dict, resistance: float | None) -> None:
+        """Write (or drop) an editor SERIES directive for this part.
+
+        Edits go into the ``.fypa`` as ordinary editor directives — the same
+        store and the same undo path as Edit mode — so there is one source of
+        truth rather than a parallel one owned by this tab.
+        """
+        from fypa.project_file import EditorDirective
+
+        project = self._ensure_project()
+        des = rec["designator"]
+        key = des.strip().upper()
+
+        # Drop any existing editor SERIES for this part first, so repeated
+        # edits replace rather than accumulate.
+        for ed in list(getattr(project, "editor_directives", []) or []):
+            if (ed.role == "SERIES"
+                    and (ed.designator or "").strip().upper() == key):
+                project.remove_directive(ed.id)
+
+        if resistance is None:
+            # "Remove" also lifts an opt-out, so one button undoes either.
+            opted = list(getattr(project, "no_auto_bridge", []) or [])
+            project.no_auto_bridge = [
+                d for d in opted if d.strip().upper() != key]
+            self._after_bridge_edit(f"{des}: reverted to FYPA's default.")
+            return
+
+        if not self._warn_if_shorting_power_rails(rec):
+            return
+        if resistance <= 0.0:
+            QMessageBox.warning(
+                self, "Resistance must be positive",
+                "A zero or negative resistance would short the pads through "
+                "an ideal wire. For a true wire link, leave it to the "
+                "automatic bridge.")
+            return
+
+        project.upsert_directive(EditorDirective(
+            kind="component", role="SERIES", designator=des,
+            single_net=False,
+            p_net=rec.get("net_a"), n_net=rec.get("net_b"),
+            resistance=float(resistance),
+            overrides_designator=des,
+        ))
+        # An explicit directive supersedes the automatic short, so clear any
+        # opt-out too — otherwise the part would be both disabled and modelled.
+        opted = list(getattr(project, "no_auto_bridge", []) or [])
+        project.no_auto_bridge = [
+            d for d in opted if d.strip().upper() != key]
+        note = (f"{des}: modelled as a {resistance * 1e3:g} m\u03a9 SERIES "
+                f"element.")
+        if resistance < self._BRIDGE_MERGE_THRESHOLD_OHM:
+            note += (f" Below {self._BRIDGE_MERGE_THRESHOLD_OHM * 1e3:g} "
+                     f"m\u03a9, so {rec.get('net_a')} and {rec.get('net_b')} "
+                     f"will be merged into one rail.")
+        self._after_bridge_edit(note)
+
+    def _after_bridge_edit(self, message: str) -> None:
+        """Persist, refresh the table, and mark the solve stale."""
+        # Editor mode marks dirty and lets the user save explicitly; do the
+        # same rather than writing the .fypa behind their back. The edit is
+        # already in the in-memory project either way.
+        self._mark_project_dirty()
+        self._update_pending_rails()
+        self._populate_bridges_table()
+        self.bridges_hint_label.setText(
+            f"<span style='color:{_T()['fg_muted']};'>{_esc(message)} "
+            f"Press Resolve to apply.</span>")
+
 
     def _build_vias_tab(self) -> QWidget:
         """Build the Vias tab — a sortable table of every via's worst-segment
@@ -25085,6 +26983,8 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
     _CAPS_ACTION_COL = _CAPS_COL[""]
     _CAPS_USE_COL = _CAPS_COL["Use"]
     _CAPS_RAIL_COL = _CAPS_COL["Rail"]
+    _CAPS_C_COL = _CAPS_COL["C (µF)"]
+    _CAPS_PKG_COL = _CAPS_COL["Pkg"]
     _CAPS_ESL_COL = _CAPS_COL["ESL (nH)"]
     _CAPS_ESR_COL = _CAPS_COL["ESR (mΩ)"]
     _CAPS_TARGET_COL = _CAPS_COL["Target"]
@@ -25103,6 +27003,58 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             obj = CapLoopSettings.from_dict(stored)
             self._caploop_settings_obj = obj
         return obj
+
+    def _footprint_convention(self) -> str:
+        """Case-size naming convention for footprint parsing and display."""
+        from fypa.caploop.packages import normalize_footprint_convention
+
+        if getattr(self, "_project", None) is not None:
+            stored = self._project.viewer_settings.get("footprint_convention")
+            if stored is not None:
+                return normalize_footprint_convention(str(stored))
+        return "auto"
+
+    def _set_footprint_convention(self, convention: str) -> None:
+        from fypa.caploop.packages import normalize_footprint_convention
+
+        conv = normalize_footprint_convention(convention)
+        proj = self._ensure_project()
+        proj.viewer_settings["footprint_convention"] = conv
+        self._display_dirty = True
+
+    def _build_footprint_convention_combo(self) -> QComboBox:
+        """Case-size naming convention — shared by Capacitors and Impedance tabs."""
+        combo = QComboBox()
+        for value, label in (
+            ("auto", "Auto"),
+            ("metric", "Metric"),
+            ("imperial", "Imperial"),
+        ):
+            combo.addItem(label, value)
+        current = self._footprint_convention()
+        idx = combo.findData(current)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        combo.setToolTip(
+            "How bare case-size codes in footprint names are read and "
+            "shown. Auto recognises unambiguous metric codes (1005, 1608) "
+            "and treats bare 0402 / 0603 as imperial.")
+        combo.currentIndexChanged.connect(self._on_footprint_convention_changed)
+        return combo
+
+    def _sync_footprint_convention_ui(self) -> None:
+        """Refresh convention combos and package labels from the active project."""
+        current = self._footprint_convention()
+        for attr in ("caps_footprint_conv_combo", "imp_footprint_conv_combo"):
+            combo = getattr(self, attr, None)
+            if combo is not None:
+                combo.blockSignals(True)
+                idx = combo.findData(current)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                combo.blockSignals(False)
+        if getattr(self, "imp_pkg_table", None) is not None:
+            self._populate_package_table()
 
     def _build_capacitors_tab(self) -> QWidget:
         """Build the Capacitors tab — a sortable table of every decoupling
@@ -25152,6 +27104,11 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         )
         self.caps_overlay_box.toggled.connect(self._on_caps_overlay_toggled)
         filter_row.addWidget(self.caps_overlay_box)
+
+        filter_row.addSpacing(12)
+        filter_row.addWidget(QLabel("Case size convention:"))
+        self.caps_footprint_conv_combo = self._build_footprint_convention_combo()
+        filter_row.addWidget(self.caps_footprint_conv_combo)
 
         filter_row.addSpacing(12)
         self.caps_tier23_btn = QPushButton("Compute Tier 2/3")
@@ -25309,9 +27266,11 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         settings = self._caploop_settings()
         includes, targets = ({}, {})
         esl_over, esr_over = ({}, {})
+        cap_over, pkg_over = ({}, {})
         if getattr(self, "_project", None) is not None:
             includes, targets = self._project.cap_override_maps()
             esl_over, esr_over = self._project.cap_parasitic_overrides()
+            cap_over, pkg_over = self._project.cap_value_overrides()
         library = self._caploop_package_library()
         directives = (self.metadata or {}).get("directives") or []
 
@@ -25323,19 +27282,23 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         # so toggling a checkbox is a millisecond, not a five-second freeze.
         _t1 = time.monotonic()
         forced = frozenset(d for d, v in includes.items() if v)
+        convention = self._footprint_convention()
         cached = getattr(self, "_caps_identity_cache", None)
         if (cached is not None and cached[0] is extracted
-                and cached[1] == settings and cached[2] == forced):
-            base = cached[3]
+                and cached[1] == settings and cached[2] == forced
+                and cached[3] == convention):
+            base = cached[4]
         else:
             base = identify_capacitors(
                 extracted, self._rail_to_members,
                 metadata_directives=directives,
                 settings=settings,
                 net_layer_shapes=shapes,
-                include_overrides={d: True for d in forced},
+                include_overrides=dict.fromkeys(forced, True),
+                footprint_convention=convention,
             )
-            self._caps_identity_cache = (extracted, settings, forced, base)
+            self._caps_identity_cache = (
+                extracted, settings, forced, convention, base)
             log.info("Caps report: identify %.2fs (%d caps)",
                      time.monotonic() - _t1, len(base))
         caps = apply_cap_overrides(
@@ -25343,10 +27306,16 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         rows: list[dict] = []
         for cap in caps:
             t1 = mounted_inductance(cap, settings)
+            # Case size: detected from the footprint name unless the user has
+            # pinned one. The override is applied *here* rather than inside
+            # identification because it only selects a library entry and a
+            # label — it changes no geometry, so the identity cache (which a
+            # package override does not key) stays valid.
+            package = pkg_over.get(cap.designator, cap.package)
             # Part parasitics: the package library supplies the default, an
             # explicit per-part override wins. A part the library can't
             # classify has neither until the user supplies one.
-            model = library.get(cap.package)
+            model = library.get(package)
             esl_h = esl_over.get(cap.designator,
                                  model.esl_h if model else None)
             esr_ohm = esr_over.get(cap.designator,
@@ -25357,8 +27326,17 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                 "rail": cap.rail_group,
                 "rail_net": cap.rail_net,
                 "return_net": cap.return_net,
-                "capacitance_f": cap.capacitance_f,
-                "package": cap.package,
+                "capacitance_f": cap_over.get(cap.designator,
+                                              cap.capacitance_f),
+                "package": package,
+                # What extraction found, kept beside the effective value so a
+                # tooltip can say what the override is overriding — and so
+                # picking the detected case size can be stored as "no
+                # override" rather than as a redundant one.
+                "capacitance_parsed_f": cap.capacitance_f,
+                "package_detected": cap.package,
+                "capacitance_is_override": cap.designator in cap_over,
+                "package_is_override": cap.designator in pkg_over,
                 "esl_h": esl_h,
                 "esr_ohm": esr_ohm,
                 "esl_is_override": cap.designator in esl_over,
@@ -25520,7 +27498,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             if edit is None:
                 continue
             try:
-                values[f.name] = float(edit.text().strip())
+                values[f.name] = self._parse_settings_value(edit.text())
             except ValueError:
                 self._settings_status_label.setText(
                     f"<span style='color:{_T()['warn_fg']};'>"
@@ -25609,6 +27587,8 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
     def _populate_caps_table(self) -> None:
         """Fill the Capacitors table from the cached cap report. Same
         plain-cell + single click-dispatcher pattern as the Vias table."""
+        from fypa.caploop.packages import format_package_label
+
         log = logging.getLogger(__name__)
         _t0 = time.monotonic()
         rows = self._get_or_compute_cap_rows()
@@ -25619,6 +27599,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         warn_fg = QBrush(QColor(_t["warn_fg"]))
         action_fg = QBrush(QColor(_t["accent"]))
         muted_fg = QBrush(QColor(_t["fg_muted"]))
+        footprint_convention = self._footprint_convention()
 
         # itemChanged fires for every setItem during populate — guard the
         # include-toggle handler with a populating flag.
@@ -25672,6 +27653,9 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             if row.get("target_is_override"):
                 target_text += " ✎"
 
+            package_label = format_package_label(
+                row.get("package"), footprint_convention)
+
             cells = (
                 None,  # action
                 None,  # use checkbox — set above
@@ -25679,7 +27663,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                 row["rail"],
                 None if row.get("capacitance_f") is None
                 else row["capacitance_f"] * 1e6,
-                row.get("package") or "—",
+                package_label,   # already "—" when the package is unknown
                 None if row.get("esl_h") is None else row["esl_h"] * 1e9,
                 None if row.get("esr_ohm") is None else row["esr_ohm"] * 1e3,
                 row.get("voltage_rating_v"),
@@ -25749,15 +27733,19 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                             "press Compute Tier 2/3.")
                 if col_label == "Flags":
                     item.setToolTip(self._cap_flags_tooltip(row))
+                if col_label == "C (µF)":
+                    item.setToolTip(self._cap_value_tooltip(row))
+                    if row.get("capacitance_is_override"):
+                        item.setText(f"{item.text()} ✎")
+                        item.setForeground(action_fg)
+                    elif row.get("capacitance_f") is None:
+                        item.setForeground(action_fg)
                 if col_label == "Pkg":
-                    item.setToolTip(
-                        f"SMD case size parsed from the footprint "
-                        f"{row['cap'].footprint!r}. It selects the default "
-                        f"ESL / ESR from the package library."
-                        if row.get("package") else
-                        f"{row['cap'].footprint!r} is not a recognised SMD "
-                        "chip package. Set ESL and ESR on this part to "
-                        "include it in the impedance model.")
+                    item.setToolTip(self._cap_package_tooltip(
+                        row, package_label, footprint_convention))
+                    if row.get("package_is_override"):
+                        item.setText(f"{package_label} ✎")
+                        item.setForeground(action_fg)
                 if col_label in ("ESL (nH)", "ESR (mΩ)"):
                     is_esl = col_label.startswith("ESL")
                     overridden = row.get(
@@ -25766,17 +27754,26 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                     if row.get("esl_h" if is_esl else "esr_ohm") is None:
                         item.setToolTip(
                             f"No equivalent series {what} — the package is "
-                            "unrecognised. Double-click to set it.")
-                    elif overridden:
+                            "unrecognised. Double-click to set it, or "
+                            "double-click the Pkg cell to name the case "
+                            "size and take the library default.")
+                    elif overridden and row.get("package"):
                         item.setToolTip(
                             f"Per-part override. Double-click to change, or "
                             f"clear the field to fall back to the "
-                            f"{row['package']} package default.")
+                            f"{package_label} package default.")
+                    elif overridden:
+                        # No package, so there is nothing to fall back TO --
+                        # clearing the field drops the part from the model.
+                        item.setToolTip(
+                            "Per-part override. Double-click to change. The "
+                            "package is unrecognised, so clearing this field "
+                            "removes the part from the impedance model.")
                         item.setForeground(action_fg)
                     else:
                         item.setToolTip(
                             f"Typical equivalent series {what} for a "
-                            f"{row['package']} package. Double-click to "
+                            f"{package_label} package. Double-click to "
                             "override this part.")
                         item.setForeground(muted_fg)
                 if col_label == "Target":
@@ -25812,6 +27809,54 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         self._apply_caps_filter()
         log.info("Caps populate: TOTAL %.2fs (%d rows)",
                  time.monotonic() - _t0, len(rows))
+
+    def _cap_value_tooltip(self, row: dict) -> str:
+        """Tooltip for the Capacitors-tab C column.
+
+        The value is not decoration: :func:`fypa.caploop.impedance.cap_branch`
+        feeds it straight into the branch impedance, and a capacitor without
+        one is dropped from the model — so the cell has to say where the
+        number came from and how to correct it.
+        """
+        parsed = row.get("capacitance_parsed_f")
+        parsed_txt = ("—" if parsed is None
+                      else f"{parsed * 1e6:.4g} µF")
+        if row.get("capacitance_is_override"):
+            return (
+                "Per-part override. Double-click to change, or clear the "
+                "field to fall back to the value read from the part "
+                f"({parsed_txt}).")
+        if parsed is None:
+            return (
+                "No capacitance could be read from this part's Altium "
+                "parameters (Capacitance / Value / Comment), so it is "
+                "excluded from the impedance model. Double-click to set it.")
+        return (
+            "Read from the part's Altium parameters. Double-click to "
+            "override — for a value no heuristic can parse, or for the "
+            "effective capacitance after DC-bias and temperature derating.")
+
+    def _cap_package_tooltip(self, row: dict, package_label: str,
+                             convention: str) -> str:
+        """Tooltip for the Capacitors-tab Pkg column."""
+        from fypa.caploop.packages import (
+            format_package_label,
+            package_detection_tooltip,
+        )
+
+        footprint = row["cap"].footprint
+        if row.get("package_is_override"):
+            detected = row.get("package_detected")
+            was = (f"The footprint {footprint!r} reads as "
+                   f"{format_package_label(detected, convention)}."
+                   if detected else
+                   f"The footprint {footprint!r} names no case size.")
+            return (
+                f"Per-part override: {package_label}. {was} It selects the "
+                "default ESL / ESR from the package library. Double-click "
+                "to change it, or choose (automatic) to clear it.")
+        return (package_detection_tooltip(footprint, row.get("package"))
+                + "\n\nDouble-click to pin a different case size.")
 
     def _on_caps_item_changed(self, item) -> None:
         """Include-checkbox edits → persist as a CapOverride and recompute.
@@ -25870,16 +27915,24 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         return None
 
     def _on_caps_cell_double_clicked(self, row: int, col: int) -> None:
-        """Edit a capacitor's own ESL / ESR — the parasitics the impedance
-        model needs and the board geometry can't supply.
+        """Edit the four per-part values the board geometry can't supply:
+        the capacitance, the case size, and the part's own ESL / ESR.
 
-        An empty input clears the override and falls back to the package
-        library, which is the only way back for a part the user has pinned.
+        An empty input clears the override, falling back to the parsed part
+        value or the package library — the only way back for a part the user
+        has pinned.
         """
-        if col not in (self._CAPS_ESL_COL, self._CAPS_ESR_COL):
+        if col not in (self._CAPS_C_COL, self._CAPS_PKG_COL,
+                       self._CAPS_ESL_COL, self._CAPS_ESR_COL):
             return
         data = self._caps_row_at(row)
         if data is None:
+            return
+        if col == self._CAPS_C_COL:
+            self._edit_cap_capacitance(data)
+            return
+        if col == self._CAPS_PKG_COL:
+            self._show_cap_package_menu(data)
             return
 
         is_esl = col == self._CAPS_ESL_COL
@@ -25890,9 +27943,15 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             title, unit, scale = "Equivalent series resistance", "mΩ", 1e-3
             current, key = data.get("esr_ohm"), "esr_ohm"
 
+        from fypa.caploop.packages import format_package_label
         package = data.get("package")
+        # Same label the Pkg cell shows: naming the canonical "0402" while the
+        # cell the user just double-clicked reads "1005" looks like two
+        # different parts.
+        package_label = format_package_label(
+            package, self._footprint_convention())
         default_note = (
-            f"Leave empty to use the {package} package default."
+            f"Leave empty to use the {package_label} package default."
             if package else
             "This part's package is unrecognised, so there is no default to "
             "fall back on.")
@@ -25918,6 +27977,82 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                                 f"{title} must be zero or positive.")
             return
         self._set_cap_override(data["designator"], **{key: value * scale})
+
+    def _edit_cap_capacitance(self, data: dict) -> None:
+        """Override one capacitor's value. Empty input restores the value
+        parsed from the part's Altium parameters."""
+        parsed = data.get("capacitance_parsed_f")
+        current = data.get("capacitance_f")
+        note = (
+            f"Leave empty to use the value read from the part "
+            f"({parsed * 1e6:.4g} µF)." if parsed is not None else
+            "Nothing could be read from this part's parameters, so leaving "
+            "it empty keeps the capacitor out of the impedance model.")
+        text, ok = QInputDialog.getText(
+            self, f"Capacitance — {data['designator']}",
+            f"Capacitance (µF, or a unit suffix such as 100n):\n{note}",
+            text="" if current is None else f"{current * 1e6:.4g}")
+        if not ok:
+            return
+
+        text = text.strip()
+        if not text:
+            self._set_cap_override(data["designator"], capacitance_f=None)
+            return
+        try:
+            value = _parse_capacitance_f(text)
+        except ValueError:
+            QMessageBox.warning(
+                self, "Not a capacitance",
+                f"{text!r} is not a capacitance. Enter a number in µF "
+                f"(0.1), or a number with a unit (100n, 4.7uF, 220pF). "
+                f"Use a dot decimal separator.")
+            return
+        if value <= 0.0:
+            QMessageBox.warning(self, "Out of range",
+                                "The capacitance must be greater than zero.")
+            return
+        self._set_cap_override(data["designator"], capacitance_f=value)
+
+    def _show_cap_package_menu(self, row: dict) -> None:
+        """Popup listing every case size in the SMD package library plus an
+        "(automatic)" reset. The chosen value persists as a CapOverride.
+
+        Only library case sizes are offered: the package exists to select an
+        ESL / ESR pair, so a name the library doesn't hold would select
+        nothing. A part with no case size at all (a tantalum brick) still
+        needs the ESL / ESR editors.
+        """
+        from fypa.caploop.packages import format_package_label
+
+        convention = self._footprint_convention()
+        detected = row.get("package_detected")
+        menu = QMenu(self)
+        auto = menu.addAction(
+            "(automatic — from the footprint: "
+            f"{format_package_label(detected, convention)})" if detected else
+            "(automatic — the footprint names no case size)")
+        auto.setCheckable(True)
+        auto.setChecked(not row.get("package_is_override"))
+        menu.addSeparator()
+        by_action = {}
+        for model in self._caploop_package_library():
+            act = menu.addAction(format_package_label(model.name, convention))
+            act.setCheckable(True)
+            act.setChecked(bool(row.get("package_is_override"))
+                           and row.get("package") == model.name)
+            by_action[act] = model.name
+        chosen = menu.exec(QCursor.pos())
+        if chosen is None:
+            return
+        package = None if chosen is auto else by_action[chosen]
+        # Persist only a deviation from detection, exactly as the include
+        # checkbox does: pinning the case size the footprint already names
+        # would leave a no-op record in the .fypa that survives a footprint
+        # rename and then silently contradicts it.
+        self._set_cap_override(
+            row["designator"],
+            package=None if package == detected else package)
 
     def _show_cap_target_menu(self, row: dict) -> None:
         """Popup listing every eligible target directive for the cap's rail
@@ -25946,18 +28081,27 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                                    target_label=chosen.text())
 
     def _set_cap_override(self, designator: str, *, include=...,
-                          target_label=..., esl_h=..., esr_ohm=...) -> None:
+                          target_label=..., esl_h=..., esr_ohm=...,
+                          capacitance_f=..., package=...) -> None:
         """Write one override into the project file (created on first edit),
         mark the display dirty (no re-solve — analysis state only), and
         rebuild the cap rows so every derived value reflects the change."""
         proj = self._ensure_project()
         proj.upsert_cap_override(designator, include=include,
                                  target_label=target_label,
-                                 esl_h=esl_h, esr_ohm=esr_ohm)
+                                 esl_h=esl_h, esr_ohm=esr_ohm,
+                                 capacitance_f=capacitance_f,
+                                 package=package)
         # Display-dirty, not project-dirty: an include/target choice never
         # stales the FEM solve, it only changes this tab's analysis.
         self._display_dirty = True
         self._invalidate_caps_cache()
+        # Every one of these overrides is an input to the impedance model --
+        # C and the parasitics directly, include/target through which branches
+        # exist and how long their mounting loop is — so a plot already on
+        # screen is now stale. Same guard the package-library editor uses.
+        if getattr(self, "_impedance_populated", False):
+            self._replot_impedance()
 
     def _update_caps_tab_title(self, warn_count: int) -> None:
         idx = getattr(self, "_caps_tab_index", -1)
@@ -26289,7 +28433,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             "capacitors no longer helps.")
         for e in (self.imp_ripple_edit, self.imp_itran_edit,
                   self.imp_fmax_edit):
-            e.setValidator(QDoubleValidator(0.0, 1e12, 6, self))
+            e.setValidator(_numeric_validator(self, top=1e12))
             e.setMaximumWidth(120)
         mask_form.addRow("Ripple (%)", self.imp_ripple_edit)
         mask_form.addRow("Transient current (A)", self.imp_itran_edit)
@@ -26312,7 +28456,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             "Output inductance of the regulator including its path to the "
             "plane. It makes the VRM branch give up above its bandwidth.")
         for e in (self.imp_vrm_r_edit, self.imp_vrm_l_edit):
-            e.setValidator(QDoubleValidator(0.0, 1e12, 6, self))
+            e.setValidator(_numeric_validator(self, top=1e12))
             e.setMaximumWidth(120)
         vrm_form.addRow("R (mΩ)", self.imp_vrm_r_edit)
         vrm_form.addRow("L (nH)", self.imp_vrm_l_edit)
@@ -26338,8 +28482,9 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
 
         self.imp_show_branches = QCheckBox("Show individual capacitors")
         self.imp_show_branches.setToolTip(
-            "Draw each capacitor's own |Z| faintly, so you can see which one "
-            "is responsible for each dip and which pair forms each peak.")
+            "Draw each capacitor's own |Z| faintly. Hover a trace to "
+            "highlight it and show its designator; the legend lists all "
+            "included parts.")
         self.imp_show_branches.toggled.connect(self._replot_impedance)
         side.addWidget(self.imp_show_branches)
 
@@ -26368,6 +28513,19 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         self._imp_figure = Figure(figsize=(7, 5), layout="constrained")
         self._imp_canvas = FigureCanvasQTAgg(self._imp_figure)
         self._imp_axes = self._imp_figure.add_subplot(111)
+        self._imp_branch_artists: list[_ImpBranch] = []
+        self._imp_branch_highlighted = None
+        # This tab is destroyed and rebuilt on every theme change, taking the
+        # canvas and the tooltip parented to it. Drop the stale reference here
+        # or the next hover resolves a deleted C++ object.
+        self._imp_branch_tooltip = None
+        self._imp_canvas.mpl_connect(
+            "motion_notify_event", self._on_imp_branch_hover)
+        # Leaving delivers a leave event, not a final motion event.
+        self._imp_canvas.mpl_connect(
+            "figure_leave_event", self._on_imp_branch_leave)
+        self._imp_canvas.mpl_connect(
+            "axes_leave_event", self._on_imp_branch_leave)
         right.addWidget(NavigationToolbar2QT(self._imp_canvas, widget))
         right.addWidget(self._imp_canvas, 1)
 
@@ -26397,6 +28555,12 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         note.setStyleSheet(f"QLabel {{ color: {_T()['fg_muted']}; }}")
         layout.addWidget(note)
 
+        conv_row = QHBoxLayout()
+        conv_row.addWidget(QLabel("Case size convention:"))
+        self.imp_footprint_conv_combo = self._build_footprint_convention_combo()
+        conv_row.addWidget(self.imp_footprint_conv_combo, 1)
+        layout.addLayout(conv_row)
+
         self.imp_pkg_table = QTableWidget()
         self.imp_pkg_table.setColumnCount(3)
         self.imp_pkg_table.setHorizontalHeaderLabels(
@@ -26408,6 +28572,7 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
         self.imp_pkg_table.setMinimumHeight(220)
         self._populate_package_table()
+        self.imp_pkg_table.setItemDelegate(_NumericCellDelegate(self.imp_pkg_table))
         self.imp_pkg_table.itemChanged.connect(self._on_package_item_changed)
         layout.addWidget(self.imp_pkg_table)
 
@@ -26419,18 +28584,62 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
     def _populate_package_table(self) -> None:
         lib = self._caploop_package_library()
         table = self.imp_pkg_table
+        convention = self._footprint_convention()
         self._imp_pkg_populating = True
+        try:
+            self._fill_package_rows(table, lib, convention)
+        finally:
+            # Without this, an exception mid-fill leaves the flag set and
+            # _on_package_item_changed silently discards EVERY later ESL/ESR
+            # edit for the rest of the session.
+            self._imp_pkg_populating = False
+        table.resizeColumnsToContents()
+
+    def _fill_package_rows(self, table, lib, convention: str) -> None:
+        from fypa.caploop.packages import format_package_label
+
         table.setRowCount(len(lib))
         for r, model in enumerate(lib):
-            name = QTableWidgetItem(model.name)
+            name = QTableWidgetItem(
+                format_package_label(model.name, convention))
+            name.setData(_PKG_CANONICAL_ROLE, model.name)
             name.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             table.setItem(r, 0, name)
             for c, value in ((1, model.esl_nh), (2, model.esr_mohm)):
                 item = QTableWidgetItem(f"{value:.4g}")
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 table.setItem(r, c, item)
-        table.resizeColumnsToContents()
-        self._imp_pkg_populating = False
+
+    def _on_footprint_convention_changed(self, _index: int = 0) -> None:
+        sender = self.sender()
+        if isinstance(sender, QComboBox):
+            value = sender.currentData()
+        else:
+            combo = getattr(self, "imp_footprint_conv_combo", None)
+            value = combo.currentData() if combo else None
+        if not value:
+            return
+        self._set_footprint_convention(str(value))
+        for attr in ("caps_footprint_conv_combo", "imp_footprint_conv_combo"):
+            combo = getattr(self, attr, None)
+            if combo is not None and combo is not sender:
+                combo.blockSignals(True)
+                idx = combo.findData(value)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                combo.blockSignals(False)
+        if getattr(self, "imp_pkg_table", None) is not None:
+            self._populate_package_table()
+        # heavy=False: the convention only remaps a footprint STRING to a
+        # package key. Copper geometry, escape-via clustering and the
+        # plane-pair cavity are untouched, so discarding those caches cost a
+        # multi-second re-identification per toggle for no change in result.
+        self._invalidate_caps_cache(heavy=False)
+        # Every cap's package -- and so its library ESL/ESR and the
+        # anti-resonance -- just changed, leaving the plotted curve, the
+        # summary and the skipped list stale. Both sibling handlers do this.
+        if getattr(self, "_impedance_populated", False):
+            self._replot_impedance()
 
     def _on_package_item_changed(self, item) -> None:
         """Commit an edited ESL / ESR back to the library, persist it, and
@@ -26438,17 +28647,37 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         if getattr(self, "_imp_pkg_populating", False) or item.column() == 0:
             return
         table = self.imp_pkg_table
-        package = table.item(item.row(), 0).text()
+        name_item = table.item(item.row(), 0)
+        package = name_item.data(_PKG_CANONICAL_ROLE) if name_item else None
+        if not package:
+            # Falling back to the cell TEXT is precisely wrong here: under the
+            # metric convention that text is a display label ("1005"), never a
+            # library key, so lib.get() returns None and every branch below
+            # raises AttributeError or KeyError. A row without the canonical
+            # role is not editable.
+            return
         lib = self._caploop_package_library()
         model = lib.get(package)
+        if model is None:
+            return
         try:
-            value = float(item.text())
+            value = _parse_numeric_text(item.text())
             if value < 0.0:
                 raise ValueError
         except ValueError:
+            bad = item.text().strip()
             self._imp_pkg_populating = True
             item.setText(f"{(model.esl_nh if item.column() == 1 else model.esr_mohm):.4g}")
             self._imp_pkg_populating = False
+            # Reverting in silence looks like the edit simply vanished. Say
+            # what was rejected — a comma decimal is the likely cause on a
+            # locale that formats numbers that way.
+            QMessageBox.warning(
+                self, "Invalid value",
+                f"{'ESL' if item.column() == 1 else 'ESR'} for {package}: "
+                f"{bad!r} is not a non-negative number. Use a dot decimal "
+                f"separator (0.5, not 0,5)."
+            )
             return
         esl_h = value * 1e-9 if item.column() == 1 else model.esl_h
         esr_ohm = value * 1e-3 if item.column() == 2 else model.esr_ohm
@@ -26612,17 +28841,23 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             combo.blockSignals(False)
             if rails:
                 self._load_impedance_rail_config(rails[0])
+            self._sync_footprint_convention_ui()
             self._replot_impedance()
 
         self._ensure_cap_rows_async(_ready)
 
     def _load_impedance_rail_config(self, rail: str) -> None:
         cfg = self._caploop_rail_config(rail)
-        self.imp_ripple_edit.setText(f"{cfg['ripple_pct']:g}")
-        self.imp_itran_edit.setText(f"{cfg['transient_current_a']:g}")
-        self.imp_fmax_edit.setText(f"{cfg['f_max_hz'] / 1e6:g}")
-        self.imp_vrm_r_edit.setText(f"{cfg['vrm_r_ohm'] * 1e3:g}")
-        self.imp_vrm_l_edit.setText(f"{cfg['vrm_l_h'] * 1e9:g}")
+        self.imp_ripple_edit.setText(
+            self._fmt_settings_value(cfg["ripple_pct"]))
+        self.imp_itran_edit.setText(
+            self._fmt_settings_value(cfg["transient_current_a"]))
+        self.imp_fmax_edit.setText(
+            self._fmt_settings_value(cfg["f_max_hz"] / 1e6))
+        self.imp_vrm_r_edit.setText(
+            self._fmt_settings_value(cfg["vrm_r_ohm"] * 1e3))
+        self.imp_vrm_l_edit.setText(
+            self._fmt_settings_value(cfg["vrm_l_h"] * 1e9))
 
     def _on_impedance_rail_changed(self, rail: str) -> None:
         if not rail:
@@ -26637,11 +28872,13 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
             return
 
         def _f(edit, name, scale=1.0):
-            text = edit.text().strip()
+            # Normalisation belongs to _parse_settings_value; keep the raw
+            # text only to quote back what the user actually typed.
+            text = edit.text()
             try:
-                value = float(text)
+                value = self._parse_settings_value(text)
             except ValueError:
-                raise ValueError(f"{name}: {text!r} is not a number")
+                raise ValueError(f"{name}: {text.strip()!r} is not a number")
             if value < 0.0:
                 raise ValueError(f"{name} must be zero or positive")
             return value * scale
@@ -26683,6 +28920,127 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         return (f"All {len(rows)} detected capacitor(s) are excluded from the "
                 f"analysis.\nTick Use on the Capacitors tab to include one.")
 
+    def _ensure_imp_branch_tooltip(self) -> QLabel:
+        """Floating label for the capacitor trace under the cursor."""
+        label = getattr(self, "_imp_branch_tooltip", None)
+        # Aliveness, not just presence: _refresh_inline_theme destroys and
+        # rebuilds the Impedance tab, taking the canvas and this child label
+        # with it, and a cached dead wrapper raises RuntimeError out of a slot.
+        if label is not None and _qt_widget_alive(label):
+            return label
+        label = _make_floating_tooltip(
+            self._imp_canvas, font_size="8pt", padding="3px 6px")
+        self._imp_branch_tooltip = label
+        return label
+
+    def _hide_imp_branch_tooltip(self) -> None:
+        label = getattr(self, "_imp_branch_tooltip", None)
+        # Unconditional hide: isVisible() is False whenever the Impedance page
+        # is not the current tab, so guarding on it left a stale tooltip to
+        # reappear with the tab after a background replot.
+        if label is not None and _qt_widget_alive(label):
+            label.hide()
+
+    def _reset_imp_branch_highlight(self) -> None:
+        for entry in self._imp_branch_artists:
+            entry.line.set_linewidth(0.9)
+            entry.line.set_alpha(0.55)
+            entry.line.set_color(entry.color)
+            entry.line.set_zorder(2)
+        self._imp_branch_highlighted = None
+        self._hide_imp_branch_tooltip()
+
+    def _pick_impedance_branch(self, event):
+        """Return the branch trace nearest the cursor, in log-log space."""
+        if (event.inaxes is not self._imp_axes
+                or event.xdata is None or event.ydata is None
+                or not self._imp_branch_artists):
+            return None
+        try:
+            ex = math.log10(event.xdata)
+            ey = math.log10(event.ydata)
+        except ValueError:
+            return None
+        best = None
+        best_d2 = float("inf")
+        for entry in self._imp_branch_artists:
+            hit, info = entry.line.contains(event)
+            if not hit:
+                continue
+            # The nearest index within the pick radius, not the first one.
+            # Near a capacitor's SRF the trace is close to vertical, so
+            # contains() returns a long run of indices and ind[0] can be a
+            # decade of |Z| away — far enough for a genuinely more distant but
+            # flatter neighbour to win and the tooltip to name the wrong part.
+            for i in info.get("ind", ()):
+                if not 0 <= i < len(entry.log_f):
+                    continue
+                d2 = ((entry.log_f[i] - ex) ** 2
+                      + (entry.log_z[i] - ey) ** 2)
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best = entry
+        return best
+
+    def _highlight_impedance_branch(self, entry, event) -> None:
+        # Keyed on the artist, not the designator: a duplicate refdes would
+        # otherwise short-circuit the restyle and leave the highlight on the
+        # first trace while the tooltip reported the second's values.
+        restyle = self._imp_branch_highlighted is not entry.line
+        if restyle:
+            self._reset_imp_branch_highlight()
+            # Keep the branch's own colour. Recolouring to the accent made the
+            # highlight indistinguishable from the |Z| total trace (also
+            # accent) exactly where the two run together, and left the legend
+            # swatch — a copy taken at ax.legend() time — disagreeing with the
+            # line. Weight, opacity and z-order carry the highlight instead.
+            entry.line.set_linewidth(2.4)
+            entry.line.set_alpha(1.0)
+            entry.line.set_zorder(6)
+            self._imp_branch_highlighted = entry.line
+
+        idx = int(np.argmin(np.abs(entry.log_f - math.log10(event.xdata))))
+        label = self._ensure_imp_branch_tooltip()
+        label.setText(
+            f"{entry.designator}  |Z|={entry.z[idx] * 1e3:.3g} mΩ @ "
+            f"{entry.freqs[idx] / 1e6:.3g} MHz")
+        label.adjustSize()
+        _move_tooltip_to_cursor(label)
+        label.show()
+        label.raise_()
+        if restyle:
+            self._imp_canvas.draw_idle()
+
+    def _on_imp_branch_leave(self, _event=None) -> None:
+        """Reset when the cursor leaves the axes or the canvas.
+
+        Leaving delivers a leave event, not another motion event, so without
+        this a cursor that exits over a trace — into the navigation toolbar, or
+        straight off the window — leaves the branch highlighted and the tooltip
+        floating indefinitely.
+        """
+        if self._imp_branch_highlighted is not None:
+            self._reset_imp_branch_highlight()
+            self._imp_canvas.draw_idle()
+        else:
+            self._hide_imp_branch_tooltip()
+
+    def _on_imp_branch_hover(self, event) -> None:
+        if not getattr(self, "imp_show_branches", None):
+            return
+        if not self.imp_show_branches.isChecked():
+            if self._imp_branch_highlighted is not None:
+                self._reset_imp_branch_highlight()
+                self._imp_canvas.draw_idle()
+            return
+        entry = self._pick_impedance_branch(event)
+        if entry is None:
+            if self._imp_branch_highlighted is not None:
+                self._reset_imp_branch_highlight()
+                self._imp_canvas.draw_idle()
+            return
+        self._highlight_impedance_branch(entry, event)
+
     def _replot_impedance(self, *_args) -> None:
         """Redraw |Z(f)| for the selected rail."""
         if getattr(self, "_imp_axes", None) is None:
@@ -26690,6 +29048,9 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         rail = self.imp_rail_combo.currentText()
         ax = self._imp_axes
         ax.clear()
+        self._imp_branch_artists = []
+        self._imp_branch_highlighted = None
+        self._hide_imp_branch_tooltip()
         t = _T()
 
         if not rail:
@@ -26713,12 +29074,25 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         self.imp_plane_label.setText(self._rail_plane_capacitance_f(rail)[1])
 
         freqs = result.freqs_hz
+        unlabelled_branches = 0
         if self.imp_show_branches.isChecked():
             from fypa.caploop.impedance import branch_impedance
             omega = 2.0 * math.pi * freqs
-            for branch in result.branches:
-                ax.loglog(freqs, np.abs(branch_impedance(branch, omega)),
-                          lw=0.6, alpha=0.35, color=t["fg_muted"])
+            log_f = np.log10(freqs)
+            colors = _branch_colors(len(result.branches))
+            for i, branch in enumerate(result.branches):
+                z_branch = np.abs(branch_impedance(branch, omega))
+                labelled = i < _IMP_MAX_LEGEND_BRANCHES
+                (line,) = ax.loglog(
+                    freqs, z_branch, lw=0.9, alpha=0.55, color=colors[i],
+                    label=branch.designator if labelled else "_nolegend_",
+                    zorder=2)
+                line.set_picker(8)
+                self._imp_branch_artists.append(_ImpBranch(
+                    line, branch.designator, freqs, z_branch,
+                    log_f, np.log10(z_branch), colors[i]))
+            unlabelled_branches = max(
+                0, len(result.branches) - _IMP_MAX_LEGEND_BRANCHES)
 
         ax.loglog(freqs, result.z_mag, lw=1.8, color=t["accent"],
                   label=f"|Z| — {rail}", zorder=3)
@@ -26752,10 +29126,21 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
         # to the swept band instead of leaving dead space beside the trace.
         ax.set_xlim(freqs[0], freqs[-1])
         ax.grid(True, which="both", alpha=0.25)
-        ax.legend(loc="upper left", fontsize=8)
+        legend_ncol = 1
+        if self.imp_show_branches.isChecked() and len(result.branches) > 5:
+            legend_ncol = 2
+        ax.legend(loc="upper left", fontsize=8, ncol=legend_ncol)
         self._style_impedance_axes(ax)
         self._imp_canvas.draw_idle()
-        self.imp_summary_label.setText(self._impedance_summary_html(result))
+        summary = self._impedance_summary_html(result)
+        if unlabelled_branches:
+            summary += (
+                f"<br><span style='color:{t['fg_muted']};'>Legend names the "
+                f"first {_IMP_MAX_LEGEND_BRANCHES} capacitors; "
+                f"{unlabelled_branches} more are drawn unlabelled — hover any "
+                f"trace to identify it.</span>"
+            )
+        self.imp_summary_label.setText(summary)
 
     def _style_impedance_axes(self, ax) -> None:
         """Match the plot to the app theme (matplotlib defaults are light)."""
@@ -26803,9 +29188,15 @@ class PdnViewer(_SettingsTabMixin, QMainWindow):
                      + (f", plane-pair {result.c_plane_f * 1e9:.3g} nF"
                         if result.c_plane_f > 0 else ""))
         if result.skipped:
-            shown = "; ".join(f"{d} ({r})" for d, r in result.skipped[:3])
-            more = (f" +{len(result.skipped) - 3} more"
-                    if len(result.skipped) > 3 else "")
+            # Collapse capacitors sharing a reason into one comma-delimited
+            # group so a whole footprint family reads as a single clause.
+            grouped: dict[str, list[str]] = {}
+            for des, reason in result.skipped:
+                grouped.setdefault(reason, []).append(des)
+            groups = list(grouped.items())
+            shown = "; ".join(f"{', '.join(d)} ({r})" for r, d in groups[:3])
+            hidden = sum(len(d) for _, d in groups[3:])
+            more = f" +{hidden} more" if hidden else ""
             parts.append(
                 f"<span style='color:{t['warn_fg']};'>Excluded: "
                 f"{_esc(shown)}{more}.</span>")
@@ -27671,7 +30062,7 @@ def _maybe_show_mesh_failures(parent_win, metadata) -> None:
     if not isinstance(metadata, dict):
         return
     failures = metadata.get("mesh_failures") or []
-    if not failures:
+    if not metadata.get("mesh_failed") and not failures:
         return
     summaries = []
     for rec in failures[:3]:
@@ -27686,13 +30077,25 @@ def _maybe_show_mesh_failures(parent_win, metadata) -> None:
     box = QMessageBox(parent_win)
     box.setIcon(QMessageBox.Icon.Critical)
     box.setWindowTitle("Meshing failed")
-    box.setText(
-        "Look for the yellow ring and red disc on the board — that marks "
-        "where the mesh failed. (The red Top-layer copper overlay is "
-        "normal; it is not the error marker.) Fix the geometry there in "
-        "Altium, then press ↻ Solve."
-    )
-    box.setDetailedText(body)
+    if failures:
+        box.setText(
+            "Look for the yellow ring and red disc on the board — that marks "
+            "where the mesh failed. (The red Top-layer copper overlay is "
+            "normal; it is not the error marker.) Fix the geometry there in "
+            "Altium, then press ↻ Solve."
+        )
+    else:
+        # Nothing survived _build_stub_record, so there is no marker to look
+        # for — say that rather than send the user hunting for one.
+        box.setText(
+            "FEM meshing failed, but the offending copper could not be "
+            "localised, so there is no marker on the board. This usually "
+            "means a zero-area sliver or a self-intersecting polygon. Check "
+            "the log for the failing layer, fix the geometry in Altium, then "
+            "press ↻ Solve."
+        )
+    if body:
+        box.setDetailedText(body)
     box.exec()
 
 
@@ -27858,64 +30261,123 @@ def _maybe_warn_connectivity_breaks(parent_win, metadata) -> None:
     )
 
 
-def _build_stub_lean_solution_from_loaded(loaded):
-    """Create a minimal :class:`LeanSolution` from a Gerber-derived
-    LoadedProject so the viewer can open BEFORE the user has added any
-    editor directives or pressed Resolve.
+def _maybe_warn_unannotated_bridges(parent_win, metadata) -> None:
+    """Pop a one-time, non-blocking notice listing parts that conduct between
+    a solved rail and copper the FEM leaves out.
 
-    The stub carries one :class:`LeanLayer` per copper layer with the
-    real geometry + conductance, and empty per-layer solution arrays.
-    Pre-solve there is no potentials field to interpolate, so we don't
-    pay for constrained-Delaunay triangulation here — the viewer
-    renders copper from ``metadata['all_copper']`` outline rings (the
-    same overlay the per-layer eye icon drives) until the user adds
-    directives and runs Resolve, at which point the FEM solver does
-    its own seeded triangulation.
+    The solve only meshes nets a PDN directive touches. A ferrite, fuse,
+    shunt or connector joining such a rail to an un-annotated net is a real
+    parallel current path the model cannot see, so the reported return-path
+    resistance is an over-estimate. Nothing is bridged automatically here —
+    only the user knows the part's DC resistance (a ferrite's "0 Ω" is
+    20-200 mΩ of DCR) — so this is advisory.
 
-    ``solver_info`` carries the ``"stub": True`` sentinel so the viewer
-    can pick the right pre-solve messaging and overlay defaults; legacy
-    "all zeroes" fields are preserved for any code that still checks
-    them.
+    Information, not a warning: the solve is still valid for the copper it
+    does model, and on many boards these parts genuinely are open at DC.
+    Reads ``metadata['unannotated_bridges']``, which round-trips through the
+    solve cache, so it also fires on a cache hit.
     """
-    from fypa.lean_solution import (
-        LeanLayer,
-        LeanLayerSolution,
-        LeanProblem,
-        LeanSolution,
+    if not isinstance(metadata, dict):
+        return
+    bridges = metadata.get("unannotated_bridges") or []
+    if not bridges:
+        return
+    shown = list(bridges[:8])
+    more = len(bridges) - len(shown)
+    bullets = "\n\n".join(f"  \u2022 {b}" for b in shown)
+    body = (
+        "These parts connect a solved rail to copper that no PDN directive "
+        "touches, so that copper is left out of the simulation and any "
+        "current it really carries is missing (the return-path resistance "
+        "reads high):\n\n"
+        + bullets
     )
+    if more > 0:
+        body += f"\n\n  \u2026 and {more} more (see the Messages tab)."
+    body += (
+        "\n\nThis is advisory \u2014 nothing was changed. If a part conducts "
+        "at DC, annotate it in Altium with PDN_ROLE=SERIES and PDN_R set to "
+        "its real DC resistance, then re-import. Genuine 0 \u03a9 links and "
+        "Net Ties are already bridged automatically."
+    )
+    QMessageBox.information(parent_win, "Unannotated net bridges", body)
+
+
+
+def _build_stub_lean_solution_from_loaded(loaded):
+    """Create a minimal :class:`LeanSolution` from a LoadedProject.
+
+    Thin wrapper around
+    :func:`fypa.altium.loader.build_stub_lean_solution_from_loaded` (shared
+    with the CLI ``gui`` path so mesh-failure recovery stays in sync).
+    """
+    from fypa.altium.loader import build_stub_lean_solution_from_loaded
     log = logging.getLogger(__name__)
-    lean_layers: list[LeanLayer] = []
     t_geom0 = time.monotonic()
-    geom = loaded.geometry
-    log.info("Gerber stub: loaded.geometry access took %.2fs (%d layer(s))",
-             time.monotonic() - t_geom0, len(geom))
-    for L in geom:
-        lean_layers.append(LeanLayer(
-            name=f"{L.name}|(none)",
-            conductance=L.conductance,
-            shape=L.shape,
-            layer_id=L.layer_id,
-            is_plane=L.is_plane,
-            plane_net_name=None,
-        ))
-    lean_solutions = [
-        LeanLayerSolution(
-            vertex_xys=[], triangles=[], potentials=[], power_densities=[],
-        )
-        for _ in geom
-    ]
-    return LeanSolution(
-        problem=LeanProblem(
-            layers=lean_layers,
-            project_name=loaded.project_name,
-        ),
-        layer_solutions=lean_solutions,
-        solver_info={
-            "stub": True,
-            "ground_node_current": 0.0,
-            "residual_norm": 0.0,
-        },
+    stub = build_stub_lean_solution_from_loaded(loaded)
+    log.info(
+        # Spans the lazy loaded.geometry access AND the per-layer LeanLayer
+        # construction — naming only the former made this read as a pure
+        # geometry-access cost when deciding whether that property is the
+        # bottleneck.
+        "Stub solution: geometry access + build took %.2fs (%d layer(s))",
+        time.monotonic() - t_geom0,
+        len(stub.problem.layers),
     )
+    return stub
+
+
+
+# Net names that read as a ground / return rather than a supply. Bridging two
+# of these is routine (AGND to GND through a ferrite is a standard layout);
+# bridging two different *supplies* almost never is, so the Bridges tab warns
+# only in the latter case.
+_GROUND_NET_TOKENS: frozenset[str] = frozenset({
+    "GND", "GROUND", "AGND", "DGND", "PGND", "SGND", "EGND", "CHASSIS",
+    "EARTH", "VSS", "VSSA", "COM", "RTN", "RETURN", "0V",
+})
+
+
+def _supply_net_key(name: str) -> str:
+    """Normalised identity of the supply a net name refers to.
+
+    ``+3V3``, ``3V3``, ``+3V3_SW`` and ``3v3-filt`` are all the same supply
+    seen at different points, so bridging them is not worth a warning. The
+    key strips polarity, separators and the common post-regulation suffixes.
+    """
+    key = re.sub(r"[^A-Z0-9]", "", str(name).upper())
+    for suffix in ("SW", "FILT", "FILTERED", "SENSE", "SNS", "IN", "OUT",
+                   "A", "D", "F"):
+        if len(key) > len(suffix) + 1 and key.endswith(suffix):
+            key = key[: -len(suffix)]
+            break
+    return key
+
+
+def _looks_like_supply_net(name: str) -> bool:
+    """True when a net name reads as a power rail rather than a return.
+
+    Deliberately conservative: it must NOT look like a ground, and must
+    carry a voltage-ish token (``3V3``, ``VCC``, ``VDD``, ``+5``). Anything
+    unrecognised returns False, so an unusual naming scheme produces no
+    warning rather than a false one.
+    """
+    raw = str(name).strip().upper()
+    if not raw:
+        return False
+    squashed = re.sub(r"[^A-Z0-9]", "", raw)
+    if not squashed:
+        return False
+    if squashed in _GROUND_NET_TOKENS:
+        return False
+    if any(squashed.startswith(g) or squashed.endswith(g)
+           for g in ("GND", "VSS", "AGND", "DGND", "PGND")):
+        return False
+    # 3V3 / 1V8 / 12V style, or an explicit supply prefix.
+    if re.search(r"\d+V\d*", squashed):
+        return True
+    return bool(re.match(r"^(VCC|VDD|VBAT|VBUS|VIN|VOUT|VREF|VVDD|PWR|\+)",
+                         raw.replace(" ", "")))
 
 
 class _GerberImportCancelled(Exception):
@@ -28284,7 +30746,7 @@ def _perform_gerber_import(parent_window) -> tuple | None:
 
 
 def main(solution, warnings_list=None, metadata=None,
-         gerber_import_target=None) -> int:
+         gerber_import_target=None, altium_import_target=None) -> int:
     """CLI entry — show the viewer for the given Solution and run the Qt
     event loop. Returns the QApplication exit code.
 
@@ -28295,6 +30757,12 @@ def main(solution, warnings_list=None, metadata=None,
     the launcher window opens, then immediately triggers the Gerber-import
     flow. Pass a folder Path or a saved ``.fypa`` Path; pass any non-None
     value to open the file picker without pre-selection.
+
+    ``altium_import_target`` (CLI ``FYPA gui <PrjPcb>``): dict with at least
+    ``prjpcb_path`` and a resolved ``pcbdoc_path`` (silent first-board /
+    ``--pcbdoc`` selection — no multi-board picker). Optional ``clean`` and
+    mesh overrides (only when the user passed ``--mesh-*``). Starts the same
+    File > Import Altium Design worker path after the launcher is shown.
     """
     # Route Python warnings.warn() (e.g. padne's SolverWarning) into the
     # logging system for the whole process. Set once here at startup rather
@@ -28328,6 +30796,12 @@ def main(solution, warnings_list=None, metadata=None,
             # pops over it.
             from PySide6.QtCore import QTimer
             QTimer.singleShot(0, win._on_menu_import_gerber)
+        elif altium_import_target is not None:
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(
+                0,
+                lambda: _schedule_cli_altium_import(win, altium_import_target),
+            )
     else:
         win = PdnViewer(solution, metadata=metadata)
     win.show()
@@ -28336,8 +30810,22 @@ def main(solution, warnings_list=None, metadata=None,
     # to the window so Windows uses our icon for the taskbar grouping.
     _force_native_window_icon(win)
     _set_window_aumid(win)
+    # ``show`` / a direct solution open: still pop the mesh-failure notice
+    # (launcher import uses ``_on_solve_finished`` instead).
+    if solution is not None and (metadata or {}).get("mesh_failed"):
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(
+            0, lambda: _maybe_show_mesh_failures(win, metadata),
+        )
     if owns_app:
-        return app.exec()
+        code = app.exec()
+        # `FYPA gui <PrjPcb>` used to raise SystemExit(1) from _solve_loaded on
+        # a failed load/solve. That now happens on a worker thread inside the
+        # event loop, so without this the command exits 0 and no scripted
+        # caller (Run_FYPA.pas, CI) can tell success from failure.
+        if code == 0 and getattr(win, "_cli_import_failed", False):
+            return 1
+        return code
     return 0
 
 
@@ -28503,6 +30991,12 @@ def _format_setup_html(solution, metadata: dict | None,
                      f"<tr><th>Multi-pin coupling resistance</th>"
                      f"<td class='num'>{phys.get('coupling_resistance_ohm', 0)*1000:.3f} mΩ</td>"
                      f"<td class='muted'>{_esc(phys.get('note_coupling_resistance', ''))}</td></tr>"
+                     f"<tr><th>Area-weighted pin coupling</th>"
+                     f"<td class='num'>"
+                     f"{'on' if phys.get('area_weighted_pin_coupling') else 'off'}"
+                     f"</td>"
+                     f"<td class='muted'>When on, each multi-pin star R scales "
+                     f"as R ∝ 1/pad area (supply and GND).</td></tr>"
                      "</table>")
 
     # Directives — each heading is a clickable toggle (collapsed by default).
@@ -28557,7 +31051,7 @@ def _format_setup_html(solution, metadata: dict | None,
                         net_cell = f"<code>{_esc(req_net or actual_net)}</code>"
                     parts.append("<tr>"
                                  f"<td>{_esc(term_name) if i == 0 else ''}</td>"
-                                 f"<td>{_esc(pin.get('pad',''))}</td>"
+                                 f"<td>{_esc(PdnViewer._pin_display_pad(pin))}</td>"
                                  f"<td>{net_cell}</td>"
                                  f"<td class='num'>{pin.get('layer_id','')}</td>"
                                  f"<td class='num'>{pin.get('x_mm', 0):.3f}</td>"
@@ -28595,6 +31089,40 @@ def _format_setup_html(solution, metadata: dict | None,
             parts.append(f"<tr><th>Solver residual ‖L·v − r‖</th><td{res_flag} class='num'>{res:.3e}</td></tr>"
                          f"<tr><th>Ground-node current</th><td{gnd_flag} class='num'>{gnd*1000:.4f} mA "
                          f"<span class='muted'>(should be ≈ 0 for a well-posed problem)</span></td></tr>")
+        parts.append("</table>")
+
+    # Bridged / shorted nets. These parts are electrically a piece of metal
+    # (a Net Tie, a 0 Ω resistor, a wire jumper, or a SERIES the user gave a
+    # sub-milliohm value), so the loader merges the two nets into one rail and
+    # re-inserts the physical link as a same-net bridge resistor. That merge
+    # is invisible everywhere else — after it, both pads report the surviving
+    # net name — so this is the one place the user can see which rails were
+    # tied together and by what.
+    bridges = metadata.get("merged_bridges") or []
+    if bridges:
+        parts.append("<h2>Bridged / shorted nets</h2>")
+        parts.append(
+            "<p class='muted'>These parts join two nets with (near-)zero "
+            "resistance, so FYPA solves them as a single rail and models the "
+            "link itself as a bridge resistor at the pads below. A part here "
+            "was <b>not</b> annotated by you \u2014 it was inferred from its "
+            "Altium ComponentKind, value or footprint. To model a real "
+            "resistance instead, annotate it with "
+            "<code>PDN_ROLE=SERIES</code> and <code>PDN_R</code>.</p>")
+        parts.append(
+            "<table><tr><th>Part</th><th>Shorted nets</th>"
+            "<th>Solved as</th><th>Bridge R</th><th>Location</th></tr>")
+        for b in bridges:
+            p_net, n_net = b.get("p_net", "?"), b.get("n_net", "?")
+            shorted = (f"{_esc(p_net)} \u2194 {_esc(n_net)}"
+                       if p_net != n_net else _esc(p_net))
+            parts.append(
+                f"<tr><th>{_esc(b.get('designator', '?'))}</th>"
+                f"<td>{shorted}</td>"
+                f"<td>{_esc(b.get('canonical_net', '?'))}</td>"
+                f"<td class='num'>{_esc(b.get('resistance_str', ''))}</td>"
+                f"<td class='num'>({b.get('p_x_mm', 0.0):.3f}, "
+                f"{b.get('p_y_mm', 0.0):.3f}) mm</td></tr>")
         parts.append("</table>")
 
     # Warnings + errors

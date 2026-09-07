@@ -55,8 +55,8 @@ the last self-resonance.
 ### Where each input comes from
 
 * **C** — parsed from the part's Altium parameters (the Capacitors tab's
-  `C (µF)` column). A capacitor whose value can't be read is excluded, and
-  said so.
+  `C (µF)` column), or the per-part override typed into that cell. A capacitor
+  with neither is excluded, and said so.
 * **L_mount** — the best tier FYPA has for that part: Tier 3 if the cavity
   solve has run, else Tier 2, else the Tier-1 closed form. Press **Compute
   Tier 2/3** on the Capacitors tab and the impedance plot redraws against the
@@ -101,11 +101,35 @@ vendor's model.
 
 ### Package detection, and what "SMD only" means
 
-The case size is parsed from the footprint name, handling the three conventions
-seen in the wild: a bare imperial code (`C_0402_SL`), an explicit metric one
-(`C_0402_1005Metric`), and IPC-7351 land names (`CAPC1608X90N`, whose digits
-are always metric). Note that `0603` is both an imperial code *and* the metric
-code for an 0201; the metric reading is taken only when the name says so.
+The case size is parsed from the footprint name. FYPA recognises:
+
+* a bare imperial code (`C_0402_SL`, `0603`);
+* a bare metric code with optional suffix letters (`1005B`, `1608C`, `1608C-HD`);
+* an explicit metric suffix (`C_0402_1005Metric`);
+* IPC-7351 land names (`CAPC1608X90N`, whose digits are always metric).
+
+Note that `0603` is both an imperial code *and* the metric code for an 0201.
+For that ambiguous pair (`0402` / `0603`), the **Case size convention**
+setting — on both the Capacitors and Impedance tabs, one project-wide value —
+decides how a bare code is read:
+
+| | bare `0402` / `0603` | metric-only codes (1005, 1608, 3216, …) |
+|---|---|---|
+| **Auto** (default) | imperial, unless the name marks it otherwise | read as metric |
+| **Metric** | metric — so `C0603` is an 0201 | read as metric |
+| **Imperial** | imperial | not case codes at all; the part is unsupported |
+
+Under Auto, a name that spells out an imperial land pattern (`C_0402_SL`,
+`C0402`) stays imperial. Choosing **Metric** or **Imperial** overrides that
+heuristic — it exists to guess which convention a library uses, and an
+explicit choice answers the question.
+
+Names that already state their units are never overridden: IPC-7351 land
+names (`CAPC1608X90N`) and explicit suffixes (`C_0402_1005Metric`) classify
+the same under all three settings.
+
+Pad geometry from the layout is always in millimetres — only the **name**
+convention affects classification and how the Pkg column is labelled.
 
 **Only SMD chip packages are supported.** A tantalum D-case brick, an
 electrolytic, anything through-hole — none has a case-size code, and none has an
@@ -115,11 +139,35 @@ silently defaulted.
 
 ### Per-part overrides
 
-Double-click a capacitor's `ESL (nH)` or `ESR (mΩ)` cell on the Capacitors tab
-to pin that part's value. Overridden cells are highlighted; clearing the field
-falls back to the package default. Supplying **both** is also the way to admit a
-non-SMD capacitor into the model — it is the only route in for a part the
-library cannot classify.
+Four cells on the Capacitors tab are editable per part, all by double-click.
+An overridden cell is marked `✎` and carries a tooltip naming the value it
+replaced; clearing an override restores that value.
+
+| Cell | Editor | Empty / `(automatic)` restores |
+|---|---|---|
+| `C (µF)` | value entry | the value parsed from the part's parameters |
+| `Pkg` | case-size picker | the case size detected from the footprint name |
+| `ESL (nH)` | value entry | the package library default |
+| `ESR (mΩ)` | value entry | the package library default |
+
+**`C (µF)`** takes a bare number in µF, or a number with its own unit —
+`100n`, `4.7uF`, `220pF`. A suffix always wins over the column's unit, so
+`100n` is 100 nF and never 100 µF. Use it for a part whose `Comment` no
+heuristic can read, and for the effective capacitance after DC-bias and
+temperature derating (see [What is not modelled](#what-is-not-modelled)).
+
+**`Pkg`** offers every case size in the library plus `(automatic)`. It is the
+one-click fix for a footprint whose name the parser reads wrongly or not at
+all: pinning the case size gives the part the library's ESL and ESR, where
+`ESL`/`ESR` overrides would have to be typed and sourced. Choosing the case
+size that detection *already* found stores nothing, so a later footprint
+rename is still free to change it. The canonical imperial key is what
+persists, never the metric display label, so the choice survives a change of
+**Case size convention**.
+
+**`ESL (nH)` / `ESR (mΩ)`** pin the parasitics themselves. Supplying both is
+the way to admit a capacitor with no case size at all — a tantalum brick, an
+electrolytic — where the picker has nothing to offer.
 
 Overrides live on the same per-designator record as the include and target
 choices, so setting one never disturbs another.
@@ -137,8 +185,8 @@ choices, so setting one never disturbs another.
   one cavity.
 * **Frequency-dependent ESR** (dielectric loss, skin effect) and the DC bias
   and temperature derating of MLCC capacitance — a 100 nF X5R at 80 % of its
-  rated voltage is not 100 nF. Use a per-part override to model the effective
-  value if it matters.
+  rated voltage is not 100 nF. Override `C (µF)` on the part to model the
+  effective value if it matters.
 * **The IC's package and die capacitance**, which take over above F_MAX.
 * **Multiple VRM phases** or a frequency-dependent regulator output impedance;
   the VRM is a single series R + L.

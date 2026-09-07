@@ -84,6 +84,16 @@ def _child_entry(job: SolveJob, q: mp.Queue) -> None:
         except Exception:  # pragma: no cover - settings without the hook
             pass
 
+        # This process solves once and exits, so keeping mesh workers warm
+        # afterwards buys nothing — and it is actively harmful: the parent
+        # may still hold its own warm pool, so persisting here doubles the
+        # live worker processes and can exhaust memory on a large board.
+        try:
+            from pdnsolver import solver as _pdn_solver_mod
+            _pdn_solver_mod._MESH_POOL_PERSIST = False
+        except Exception:  # pragma: no cover - defensive
+            pass
+
         # Forward pdnsolver's per-step INFO logs to the parent as substage
         # updates, mirroring _SolveWorker's _SubstageForwarder.
         class _QueueLogHandler(logging.Handler):
@@ -107,7 +117,22 @@ def _child_entry(job: SolveJob, q: mp.Queue) -> None:
                 job.mesher_config,
                 adaptive_regulator_gain=job.adaptive_regulator_gain,
                 stage_callback=lambda m: q.put(("stage", m)),
+                thermal_config=job.settings.thermal_config(),
             )
+        except Exception as exc:
+            # Mesh failures must open the same stub + markers as the in-process
+            # worker — not a raw fail traceback.
+            from pdnsolver import mesh as _pdn_mesh
+            if not isinstance(exc, _pdn_mesh.MeshingException):
+                raise
+            from fypa.altium.loader import package_mesh_failure
+            q.put(("stage", "Meshing failed — opening design…"))
+            stub, fail_md = package_mesh_failure(
+                job.loaded, exc, job.mesher_config,
+                settings=job.settings,
+            )
+            q.put(("ok", stub, fail_md))
+            return
         finally:
             for lg in loggers:
                 lg.removeHandler(handler)
@@ -143,7 +168,8 @@ def run_solve_in_subprocess(
 ) -> tuple[object, object] | None:
     """Run ``job`` in a spawned child, forwarding progress to the callbacks.
 
-    Returns ``(lean_solution, metadata)`` on success, or ``None`` if the caller
+    Returns ``(lean_solution, metadata)`` on success (including a mesh-failure
+    stub with ``metadata["mesh_failures"]``), or ``None`` if the caller
     asked to cancel (``is_cancelled()`` went True) — in which case the child is
     terminated. Raises :class:`SolveSubprocessError` if the child fails or dies
     without a result.
@@ -159,6 +185,15 @@ def run_solve_in_subprocess(
     # daemonic processes may not have children. We terminate the child
     # explicitly (on cancel, on failure, and in the finally below), so it never
     # outlives its use despite not being a daemon.
+    # Release our own warm mesh workers first: the child is about to spawn a
+    # full pool of its own, and holding both at once is what makes a large
+    # board run out of memory.
+    try:
+        from pdnsolver.solver import shutdown_idle_mesh_pool
+        shutdown_idle_mesh_pool()
+    except Exception:  # pragma: no cover - defensive
+        pass
+
     proc = ctx.Process(target=_child_entry, args=(job, q), daemon=False)
     proc.start()
     if register_process is not None:

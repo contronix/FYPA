@@ -14,6 +14,11 @@ Conventions
   module-level sentinel `NO_NET = -1` for unassigned. `NO_POLYGON = 65535` is
   the sentinel returned by altium_monkey on tracks that are not part of a
   polygon outline.
+- A primitive owned by a polygon pour inherits that polygon's net when it
+  carries none of its own — Altium keeps the net on the `Polygons6` record for
+  poured copper (regions for a solid fill, tracks/arcs for a hatched one).
+  Tracks and arcs also record whether that parent pour is hatched, because a
+  hatched pour's perimeter is real copper rather than boundary artwork.
 
 Public entry: :func:`extract_project`.
 """
@@ -85,6 +90,11 @@ class RawTrack:
     is_polygon_outline: bool
     component_index: int      # -1 if not part of a component
     is_keepout: bool
+    # True when the parent polygon pour is *not* solid-filled (any hatch
+    # style, or "outlines only"). A hatched pour's copper IS its tracks —
+    # including the perimeter — so `is_polygon_outline` must not exclude
+    # them the way it does for a solid pour. See `_polygon_lookup`.
+    polygon_hatched: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,12 +107,14 @@ class RawArc:
     layer_id: int
     net_index: int
     is_keepout: bool
-    # An arc that forms part of a polygon-pour *outline* (flags1 & 0x02) is
-    # boundary artwork, not copper — the poured copper is the region/fill. Like
-    # is_polygon_outline tracks, these must be excluded from the copper geometry
-    # or a rounded-corner pour gains a spurious band of copper along its outline.
+    # An arc that forms part of a *solid* polygon-pour outline (flags1 & 0x02)
+    # is boundary artwork, not copper — the poured copper is the region/fill.
+    # Like is_polygon_outline tracks, these must be excluded from the copper
+    # geometry or a rounded-corner pour gains a spurious band of copper along
+    # its outline. A hatched pour is the exception: see `polygon_hatched`.
     is_polygon_outline: bool = False
     polygon_index: int = NO_POLYGON
+    polygon_hatched: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,6 +367,20 @@ class RawPcbComponent:
     # schematic→PCB ECO; carries Blanket/Parameter-Set directives among others).
     parameters: dict[str, str] = field(default_factory=dict)
     unique_id: str = ""
+    # Altium ``ComponentKind`` as stored on the PCB record (COMPONENTKIND /
+    # VERSION2 / VERSION3). Same encoding as
+    # :attr:`RawSchComponent.component_kind`. Captured on both sides because a
+    # Net Tie can exist only on the PCB — added by ECO, or a board opened
+    # without its schematics — and the auto-bridge has to see it there too.
+    component_kind: int = 0
+    # Hierarchy path of UniqueIDs from root sheet symbol(s) down to the
+    # schematic component (PCB ``SOURCEUNIQUEID``, e.g. ``\XOZXOXGE\QJGQOCLZ``).
+    # Primary key for binding sheet-symbol ``PDN_<Des>_*`` overrides.
+    source_unique_id: str = ""
+    # Human-readable hierarchy (PCB ``SOURCEHIERARCHICALPATH``), e.g.
+    # ``main\CON-AUX``. Used as fallback when ``source_unique_id`` is empty:
+    # sheet-symbol ``sheet_name`` is matched against path segments.
+    source_hierarchical_path: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,9 +424,49 @@ class RawStackupLayer:
 @dataclass(frozen=True, slots=True)
 class RawSchComponent:
     designator: str
-    schdoc_name: str          # filename only, e.g. 'Power.SchDoc'
+    # Project-relative SchDoc path (forward slashes, original casing preserved
+    # for diagnostics), e.g. ``Power.SchDoc`` or ``mod/Child.SchDoc``. Absolute
+    # path string when the file sits outside the ``.PrjPcb`` tree.
+    schdoc_name: str
     parameters: dict[str, str]  # name -> text (case-preserved keys)
     pin_designators: tuple[str, ...]
+    # Altium schematic ComponentKind (see altium_monkey.ComponentKind).
+    # 3 = Net Tie (BOM), 4 = Net Tie (No BOM); 0 = Standard.
+    component_kind: int = 0
+    # Pin designators (upper-cased) marked PDN_IGNORE on the schematic pin
+    # itself. Empty when no pin-level ignore parameters were found.
+    ignored_pins: frozenset[str] = frozenset()
+
+
+def _component_kind_value(comp) -> int:
+    """Return Altium ``ComponentKind`` as an int (0 = Standard).
+
+    Works for schematic and PCB components alike: altium_monkey exposes the
+    field as a ``ComponentKind`` enum on both, and older builds may not expose
+    it at all.
+    """
+    kind = getattr(comp, "component_kind", None)
+    if kind is None:
+        return 0
+    try:
+        return int(getattr(kind, "value", kind) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+@dataclass(frozen=True, slots=True)
+class RawSchSheetSymbol:
+    """One hierarchical sheet symbol placement (parent sheet → child SchDoc).
+
+    Carries optional ``PDN_<Designator>_*`` parameters that override child
+    component PDN directives for PCB instances whose ``SOURCEUNIQUEID`` path
+    contains this symbol's :attr:`unique_id`.
+    """
+    parent_schdoc: str        # filename of the sheet that hosts the symbol
+    sheet_name: str           # display name (may be ``REPEAT(...)``)
+    child_filename: str       # referenced child schematic filename
+    unique_id: str            # Altium UniqueID of the sheet symbol
+    parameters: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,9 +484,27 @@ class ExtractedProject:
     nets: tuple[RawNet, ...]
     stackup: tuple[RawStackupLayer, ...]
     sch_components: tuple[RawSchComponent, ...]
+    # Sheet symbols across all SchDocs (for per-instance PDN overrides).
+    # Empty default so older callers / Gerber extracts keep working.
+    sch_sheet_symbols: tuple[RawSchSheetSymbol, ...] = ()
     # Compiled schematic netlist (multi-sheet aware). Used to translate local
     # sheet net names in PDN_*_NET parameters to per-instance PCB connectivity.
     compiled_netlist: Any | None = None
+    # Absolute SchDoc paths keyed by project-relative lowercase path (forward
+    # slashes). When a basename is unique in the project it is also registered
+    # as an alias key (``"child.schdoc"``) so callers that only know the
+    # filename still resolve. Used for lazy per-sheet netlist compiles.
+    schdoc_paths: dict[str, str] = field(default_factory=dict)
+    # Lazily filled single-sheet netlists, keyed like :attr:`schdoc_paths`.
+    # Empty until a child-sheet local-net fallback needs a sheet, and dropped
+    # by ``__getstate__`` so it never reaches the design-info pickle (see
+    # there) — it is a rebuildable cache, not project data.
+    sheet_netlists: dict[str, Any] = field(default_factory=dict)
+    # altium_monkey ≥ 2026.7 maps netlist ``source_sheets`` to physical page
+    # ids (``physical:0:logical:0:main.SchDoc:child:…``). This tuple maps each
+    # physical page id → logical schematic file name (``power.SchDoc``) so
+    # local-net sheet matching stays compatible with sch_components.
+    physical_sheet_names: tuple[tuple[str, str], ...] = ()
     # User-defined Altium origin (Board6/ORIGINX,ORIGINY), in mm. Every
     # Pt2D produced above has already had this subtracted, so coordinates
     # match what Altium displays when the user has set a custom origin.
@@ -449,6 +533,31 @@ class ExtractedProject:
     plane_relief_air_gap_mm: float = 0.0
     plane_relief_conductor_width_mm: float = 0.0
     plane_relief_entries: int = 4
+
+    def __getstate__(self) -> dict:
+        """Drop :attr:`sheet_netlists` from the pickle.
+
+        ``parse_annotations`` fills it lazily during ``load_project``, i.e.
+        *before* the CLI pickles the whole ``LoadedProject`` into the
+        design-info cache. On a project with many repeated child sheets that
+        would write one fully compiled netlist per sheet on top of the
+        project-wide ``compiled_netlist``, inflating both the cache write and
+        every subsequent cache-hit load. Each entry is recomputed on demand.
+        """
+        state = {
+            name: getattr(self, name)
+            for cls in type(self).__mro__
+            for name in getattr(cls, "__slots__", ())
+            if hasattr(self, name)
+        }
+        state["sheet_netlists"] = {}
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        # frozen=True blocks setattr, and slots=True means there is no
+        # __dict__ to update — set each slot directly.
+        for name, value in state.items():
+            object.__setattr__(self, name, value)
 
     def enabled_copper_layer_ids(self) -> list[int]:
         """Layer ids forming the actually-enabled copper stack, in Top→Bottom order.
@@ -503,6 +612,69 @@ def _component_index(raw) -> int:
     return -1 if raw is None else int(raw)
 
 
+# HATCHSTYLE values Altium writes for a *solid* pour, lower-cased. Everything
+# else ("45degree", "90degree", "horizontal", "vertical", "none") means the
+# pour's copper is drawn as tracks/arcs rather than poured as regions.
+_SOLID_HATCH_STYLES: frozenset[str] = frozenset({"solid", ""})
+
+
+def _polygon_net_of(poly) -> int | None:
+    """One polygon's net index, or ``None`` when it carries no net.
+
+    Deliberately does *not* trust ``polygon.net`` alone: altium_monkey parses a
+    missing ``NET`` field as ``int(record.get('NET', 0))``, so a net-less
+    polygon is indistinguishable from one genuinely on net index 0. Inheriting
+    that would silently attach pour copper to whichever net happens to sit at
+    index 0 — 27 of Corvette's 134 polygons carry no ``NET`` field at all, and
+    were landing on ``PWR_I2C.SDA``. The raw record is consulted so "absent"
+    stays absent; a polygon built programmatically has no raw record, and there
+    ``poly.net`` is all we have.
+    """
+    raw = getattr(poly, "_raw_record", None) or {}
+    if raw and not str(raw.get("NET") or "").strip():
+        return None
+    try:
+        value = int(poly.net)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return None if value < 0 else value
+
+
+def _polygon_is_hatched(poly) -> bool:
+    """True when a pour is not solid-filled, so its copper is tracks and arcs.
+
+    Note the two distinct "None"s: a *missing* ``hatch_style`` attribute
+    (Python ``None``) means solid — that is altium_monkey's own default —
+    whereas the *string* ``'None'`` is Altium's "outlines only" fill, whose
+    copper really is just the perimeter tracks.
+    """
+    style = str(getattr(poly, "hatch_style", None) or "Solid").strip()
+    return style.lower() not in _SOLID_HATCH_STYLES
+
+
+def _polygon_lookup(pcb):
+    """Return ``(net_of, hatched_of)`` resolvers mapping a primitive's
+    ``polygon_index`` to facts about its parent ``Polygons6`` record.
+
+    Both are resolved once per polygon up front — a board has a hundred or so
+    pours but tens of thousands of primitives asking about them.
+    """
+    polygons = list(getattr(pcb, "polygons", None) or ())
+    nets = [_polygon_net_of(p) for p in polygons]
+    hatched = [_polygon_is_hatched(p) for p in polygons]
+
+    # 65535 is the documented "no polygon" sentinel; split-plane and
+    # board-outline tracks carry 65534. Both land outside the record list, so
+    # one range check covers every sentinel Altium writes.
+    def net_of(idx: int) -> int | None:
+        return nets[idx] if 0 <= idx < len(nets) else None
+
+    def hatched_of(idx: int) -> bool:
+        return hatched[idx] if 0 <= idx < len(hatched) else False
+
+    return net_of, hatched_of
+
+
 def _pt_from_mils(x_mils: float, y_mils: float,
                   ox_mm: float = 0.0, oy_mm: float = 0.0) -> Pt2D:
     return Pt2D(mils_to_mm(x_mils) - ox_mm, mils_to_mm(y_mils) - oy_mm)
@@ -517,25 +689,47 @@ def _pad_height_mm(pad) -> float:
 
 
 def _extract_tracks(pcb, ox_mm: float, oy_mm: float) -> tuple[RawTrack, ...]:
+    """Extract ``Tracks6`` records, inheriting the parent polygon's net.
+
+    A hatched (or outlines-only) pour renders its copper as tracks, and Altium
+    leaves those tracks' own ``net_index`` unlinked (0xFFFF) because the net
+    assignment lives on the parent ``Polygons6`` record — the same split
+    :func:`_extract_regions` already handles for solid pours. Without this the
+    hatch lines arrive as NO_NET and drop out of the per-net pipeline.
+    """
+    poly_net, poly_hatched = _polygon_lookup(pcb)
     out: list[RawTrack] = []
     for t in pcb.tracks:
+        raw_net = t.net_index
+        poly_idx = int(t.polygon_index)
+        if raw_net is None:
+            raw_net = poly_net(poly_idx)
         out.append(RawTrack(
             a=_pt_from_mils(t.start_x_mils, t.start_y_mils, ox_mm, oy_mm),
             b=_pt_from_mils(t.end_x_mils, t.end_y_mils, ox_mm, oy_mm),
             width_mm=mils_to_mm(t.width_mils),
             layer_id=int(t.layer),
-            net_index=_net_index(t.net_index),
-            polygon_index=int(t.polygon_index),
+            net_index=_net_index(raw_net),
+            polygon_index=poly_idx,
             is_polygon_outline=bool(t.is_polygon_outline),
             component_index=_component_index(t.component_index),
             is_keepout=bool(t.is_keepout),
+            polygon_hatched=poly_hatched(poly_idx),
         ))
     return tuple(out)
 
 
 def _extract_arcs(pcb, ox_mm: float, oy_mm: float) -> tuple[RawArc, ...]:
+    """Extract ``Arcs6`` records, inheriting the parent polygon's net exactly
+    as :func:`_extract_tracks` does — a hatched pour's rounded corners and
+    curved perimeter arrive as polygon-owned arcs with no net of their own."""
+    poly_net, poly_hatched = _polygon_lookup(pcb)
     out: list[RawArc] = []
     for a in pcb.arcs:
+        raw_net = a.net_index
+        poly_idx = int(getattr(a, "polygon_index", NO_POLYGON))
+        if raw_net is None:
+            raw_net = poly_net(poly_idx)
         out.append(RawArc(
             center=_pt_from_mils(a.center_x_mils, a.center_y_mils, ox_mm, oy_mm),
             radius_mm=mils_to_mm(a.radius_mils),
@@ -543,10 +737,11 @@ def _extract_arcs(pcb, ox_mm: float, oy_mm: float) -> tuple[RawArc, ...]:
             end_angle_deg=float(a.end_angle),
             width_mm=mils_to_mm(a.width_mils),
             layer_id=int(a.layer),
-            net_index=_net_index(a.net_index),
+            net_index=_net_index(raw_net),
             is_keepout=bool(a.is_keepout),
             is_polygon_outline=bool(getattr(a, "is_polygon_outline", False)),
-            polygon_index=int(getattr(a, "polygon_index", NO_POLYGON)),
+            polygon_index=poly_idx,
+            polygon_hatched=poly_hatched(poly_idx),
         ))
     return tuple(out)
 
@@ -791,16 +986,7 @@ def _extract_regions(pcb, ox_mm: float, oy_mm: float) -> tuple[RawRegion, ...]:
     Polygons6 record. Without this inheritance, the largest copper pours on
     the board come out unassigned — wreaking havoc on per-net-aware FEM.
     """
-    polygons = list(pcb.polygons)
-
-    def _polygon_net(idx: int):
-        # polygon_index == 65535 → sentinel for "not part of a polygon".
-        if idx < 0 or idx >= len(polygons):
-            return None
-        try:
-            return polygons[idx].net
-        except (AttributeError, IndexError):
-            return None
+    _polygon_net, _ = _polygon_lookup(pcb)
 
     out: list[RawRegion] = []
     for r in pcb.regions:
@@ -874,15 +1060,7 @@ def _extract_shape_based_regions(pcb, ox_mm: float, oy_mm: float,
     shape_based = getattr(pcb, "shapebased_regions", None)
     if not shape_based:
         return ()
-    polygons = list(pcb.polygons)
-
-    def _polygon_net(idx: int):
-        if idx < 0 or idx >= len(polygons):
-            return None
-        try:
-            return polygons[idx].net
-        except (AttributeError, IndexError):
-            return None
+    _polygon_net, _ = _polygon_lookup(pcb)
 
     out: list[RawShapeBasedRegion] = []
     for r in shape_based:
@@ -975,6 +1153,7 @@ def _extract_pcb_components(pcb, ox_mm: float, oy_mm: float,
         # skip it. A dropped component only loses its designator overlay /
         # any PDN annotations it carried; the copper geometry is unaffected.
         try:
+            rr = getattr(c, "raw_record", None) or {}
             out.append(RawPcbComponent(
                 designator=str(c.designator),
                 center=Pt2D(parse_mil_string(c.x) - ox_mm,
@@ -983,10 +1162,14 @@ def _extract_pcb_components(pcb, ox_mm: float, oy_mm: float,
                 layer_name=str(c.layer),
                 footprint=str(c.footprint),
                 source_designator=str(
-                    c.raw_record.get("SOURCEDESIGNATOR", "") or ""),
+                    rr.get("SOURCEDESIGNATOR", "") or ""),
                 parameters=_normalise_pcb_parameters(
                     getattr(c, "parameters", None)),
                 unique_id=str(getattr(c, "unique_id", "") or ""),
+                component_kind=_component_kind_value(c),
+                source_unique_id=str(rr.get("SOURCEUNIQUEID", "") or ""),
+                source_hierarchical_path=str(
+                    rr.get("SOURCEHIERARCHICALPATH", "") or ""),
             ))
         except Exception as exc:
             desig = getattr(c, "designator", "?")
@@ -1305,11 +1488,131 @@ def _splice_plane_layers(
     return rebuilt
 
 
-def _extract_sch_component(comp, schdoc_name: str) -> RawSchComponent | None:
+def _is_pdn_ignore_param(name: str | None, text: str | None) -> bool:
+    """True when a schematic pin parameter means "exclude from PDN terminals".
+
+    Accepts ``PDN_IGNORE`` with a truthy value (``1`` / ``TRUE`` / ``YES`` /
+    ``IGNORE``) or the alias name ``PDN`` with value ``IGNORE``. Empty values
+    do not count.
+    """
+    if name is None:
+        return False
+    n = str(name).strip().upper()
+    v = str(text).strip().upper() if text is not None else ""
+    if not v:
+        return False
+    if n == "PDN_IGNORE":
+        return v in ("1", "TRUE", "YES", "IGNORE")
+    if n == "PDN":
+        return v == "IGNORE"
+    return False
+
+
+def _sch_component_pins(comp) -> list:
+    """Typed pin objects for a schematic component (``pins`` or children)."""
+    pins = list(getattr(comp, "pins", ()) or ())
+    if pins:
+        return pins
+    return [
+        c for c in (getattr(comp, "children", ()) or ())
+        if type(c).__name__ == "AltiumSchPin"
+    ]
+
+
+def _is_pin_owned_parameter(obj) -> bool:
+    """True for AltiumSchParameter or a duck-typed name/text/owner_index object."""
+    cls = type(obj).__name__
+    if cls == "AltiumSchPin":
+        return False
+    if cls == "AltiumSchParameter":
+        return True
+    return (
+        hasattr(obj, "name")
+        and hasattr(obj, "text")
+        and hasattr(obj, "owner_index")
+    )
+
+
+def _sheet_ignored_pins_by_component(
+    components: list,
+    all_objects,
+) -> list[frozenset[str]]:
+    """One pass over ``all_objects``: ignored pin sets parallel to ``components``.
+
+    Builds a sheet-wide pin-index → (component index, designator) map, then
+    scans parameters once instead of re-scanning the sheet per component.
+
+    Pin-owned ``PDN_IGNORE`` is discovered two ways (both match altium_monkey
+    SchDoc layout): ``pin.pin_parameters`` when the library attached them, and
+    sheet ``all_objects`` parameters whose ``owner_index`` equals the pin's
+    ``_record_index``. Component-owned parameters (owner → component record)
+    are ignored here — use ``PDN_IGNORE_PINS`` on the part when pin-level
+    ownership cannot be resolved.
+    """
+    ignored: list[set[str]] = [set() for _ in components]
+    pin_index_to_comp_des: dict[int, tuple[int, str]] = {}
+
+    for ci, comp in enumerate(components):
+        for pin in _sch_component_pins(comp):
+            des = getattr(pin, "designator", None)
+            if not des:
+                continue
+            des_s = str(des)
+            idx = getattr(pin, "_record_index", None)
+            if idx is not None:
+                try:
+                    pin_index_to_comp_des[int(idx)] = (ci, des_s)
+                except (TypeError, ValueError):
+                    pass
+            for param in getattr(pin, "pin_parameters", ()) or ():
+                if _is_pdn_ignore_param(
+                    getattr(param, "name", None), getattr(param, "text", None),
+                ):
+                    ignored[ci].add(des_s.upper())
+
+    if pin_index_to_comp_des:
+        for obj in all_objects or ():
+            if not _is_pin_owned_parameter(obj):
+                continue
+            owner = getattr(obj, "owner_index", None)
+            if owner is None:
+                continue
+            try:
+                owner_i = int(owner)
+            except (TypeError, ValueError):
+                continue
+            hit = pin_index_to_comp_des.get(owner_i)
+            if hit is None:
+                continue
+            if _is_pdn_ignore_param(
+                getattr(obj, "name", None), getattr(obj, "text", None),
+            ):
+                ci, des_s = hit
+                ignored[ci].add(des_s.upper())
+
+    return [frozenset(s) for s in ignored]
+
+
+def _ignored_pins_from_sch_component(comp, all_objects) -> frozenset[str]:
+    """Collect pin designators with a pin-owned PDN_IGNORE parameter.
+
+    Thin wrapper around :func:`_sheet_ignored_pins_by_component` for a single
+    component (unit tests and callers that already have one part).
+    """
+    return _sheet_ignored_pins_by_component([comp], all_objects)[0]
+
+
+def _extract_sch_component(
+    comp, schdoc_name: str, ignored_pins: frozenset[str] | None = None,
+) -> RawSchComponent | None:
     """Extract one component's designator + parameters + pin list from its children.
 
     Returns None if the component has no AltiumSchDesignator child (rare; usually
     means a non-instantiated symbol — safe to skip for PDN purposes).
+
+    ``ignored_pins`` comes from the sheet-level batch in
+    :func:`_extract_sch_components`; when omitted, pin-owned ignores are not
+    resolved here (callers must pass them or use the batch path).
     """
     designator: str | None = None
     parameters: dict[str, str] = {}
@@ -1329,20 +1632,174 @@ def _extract_sch_component(comp, schdoc_name: str) -> RawSchComponent | None:
                 pins.append(str(pin_designator))
     if designator is None:
         return None
+    # Prefer pin list from the typed ``pins`` collection when children
+    # enumeration missed some (OwnerIndex hierarchy).
+    if not pins:
+        for pin in getattr(comp, "pins", ()) or ():
+            des = getattr(pin, "designator", None)
+            if des:
+                pins.append(str(des))
     return RawSchComponent(
         designator=designator,
         schdoc_name=schdoc_name,
         parameters=parameters,
         pin_designators=tuple(pins),
+        component_kind=_component_kind_value(comp),
+        ignored_pins=ignored_pins if ignored_pins is not None else frozenset(),
     )
 
 
-def _extract_sch_components(design) -> tuple[RawSchComponent, ...]:
+def _schdoc_storage_key(abs_path: Path, project_root: Path) -> str:
+    """Stable lowercase dict key for one SchDoc path.
+
+    Prefer a path relative to the ``.PrjPcb`` directory (lowercase, ``/``).
+    Files outside that tree use the absolute path so two external sheets with
+    the same basename do not collide.
+    """
+    return _schdoc_display_path(abs_path, project_root).lower()
+
+
+def _schdoc_display_path(abs_path: Path, project_root: Path) -> str:
+    """Case-preserving relative (or absolute) SchDoc path for annotations/UI."""
+    abs_path = abs_path.resolve()
+    root = project_root.resolve()
+    try:
+        return str(abs_path.relative_to(root)).replace("\\", "/")
+    except ValueError:
+        return str(abs_path).replace("\\", "/")
+
+
+def _extract_sch_components(
+    design,
+    prjpcb_path: Path,
+) -> tuple[RawSchComponent, ...]:
     out: list[RawSchComponent] = []
+    root = prjpcb_path.parent
     for sd in design.schdocs:
-        schdoc_name = sd.filepath.name
-        for comp in sd.components:
-            rec = _extract_sch_component(comp, schdoc_name)
+        if not getattr(sd, "filepath", None):
+            continue
+        # Preserve casing for diagnostics; lookups lower-case on compare.
+        schdoc_name = _schdoc_display_path(Path(sd.filepath), root)
+        all_objects = getattr(sd, "all_objects", None) or ()
+        components = list(sd.components)
+        ignored_sets = _sheet_ignored_pins_by_component(components, all_objects)
+        for comp, ignored in zip(components, ignored_sets):
+            rec = _extract_sch_component(comp, schdoc_name, ignored)
+            if rec is not None:
+                out.append(rec)
+    return tuple(out)
+
+
+def _parameters_from_sch_children(children) -> dict[str, str]:
+    """Collect ``AltiumSchParameter`` name→text from a parent object's children."""
+    parameters: dict[str, str] = {}
+    for child in children or ():
+        if type(child).__name__ != "AltiumSchParameter":
+            continue
+        name = getattr(child, "name", None)
+        if not name:
+            continue
+        parameters[str(name).strip()] = str(getattr(child, "text", ""))
+    return parameters
+
+
+def _parameters_owned_by_index(schdoc, owner_index: int) -> dict[str, str]:
+    """Parameters on ``schdoc.parameters`` whose ``owner_index`` matches.
+
+    altium_monkey attaches sheet-symbol parameters this way (OwnerIndex →
+    sheet symbol ``index_in_sheet``). They are *not* placed on
+    ``symbol.children`` — that list only holds entries / name / filename.
+    """
+    parameters: dict[str, str] = {}
+    for param in getattr(schdoc, "parameters", ()) or ():
+        if getattr(param, "owner_index", None) != owner_index:
+            continue
+        name = getattr(param, "name", None)
+        if not name:
+            continue
+        parameters[str(name).strip()] = str(getattr(param, "text", "") or "")
+    return parameters
+
+
+# Sheet-symbol PDN overrides are ``PDN_<DesignatorWithDigit>_*`` (e.g.
+# ``PDN_J1_I``, ``PDN_U12A_I``). BOM / library params on the same symbol
+# are dropped.
+_PDN_SHEET_OVERRIDE_NAME_RE = re.compile(
+    r"^PDN_[A-Za-z]*\d[A-Za-z0-9]*_", re.IGNORECASE,
+)
+
+
+def _filter_sheet_pdn_parameters(parameters: dict[str, str]) -> dict[str, str]:
+    """Keep only designator-targeted ``PDN_<Des>_*`` sheet-symbol keys."""
+    return {
+        k: v for k, v in parameters.items()
+        if _PDN_SHEET_OVERRIDE_NAME_RE.match(str(k).strip())
+    }
+
+
+def _extract_sch_sheet_symbol(
+    info, parent_schdoc: str, schdoc=None,
+) -> RawSchSheetSymbol | None:
+    """Extract one sheet symbol's identity + parameters."""
+    record = getattr(info, "record", None)
+    if record is None:
+        return None
+    unique_id = str(getattr(info, "unique_id", "") or "").strip()
+    if not unique_id:
+        unique_id = str(getattr(record, "unique_id", "") or "").strip()
+    child_filename = str(getattr(info, "file_name", "") or "").strip()
+    if not child_filename:
+        return None
+    sheet_name = str(getattr(info, "designator", "") or "").strip()
+    # Children rarely carry parameters for sheet symbols; OwnerIndex on the
+    # schdoc's flat parameter list is the authoritative path.
+    parameters = _parameters_from_sch_children(getattr(record, "children", ()))
+    owner_index = getattr(record, "index_in_sheet", None)
+    if schdoc is not None and owner_index is not None:
+        parameters.update(_parameters_owned_by_index(schdoc, owner_index))
+    parameters = _filter_sheet_pdn_parameters(parameters)
+    return RawSchSheetSymbol(
+        parent_schdoc=parent_schdoc,
+        sheet_name=sheet_name,
+        child_filename=child_filename,
+        unique_id=unique_id,
+        parameters=parameters,
+    )
+
+
+def _sheet_symbol_info_wrapper(record):
+    """Adapt a bare ``AltiumSchSheetSymbol`` to the info-wrapper interface."""
+    class _Info:
+        def __init__(self, rec):
+            self.record = rec
+
+        @property
+        def designator(self):
+            sn = getattr(self.record, "sheet_name", None)
+            return getattr(sn, "text", "") if sn is not None else ""
+
+        @property
+        def file_name(self):
+            fn = getattr(self.record, "file_name", None)
+            return getattr(fn, "text", "") if fn is not None else ""
+
+        @property
+        def unique_id(self):
+            return getattr(self.record, "unique_id", "") or ""
+
+    return _Info(record)
+
+
+def _extract_sch_sheet_symbols(design) -> tuple[RawSchSheetSymbol, ...]:
+    out: list[RawSchSheetSymbol] = []
+    for sd in design.schdocs:
+        parent_name = sd.filepath.name if getattr(sd, "filepath", None) else ""
+        getter = getattr(sd, "get_sheet_symbols", None)
+        symbols = getter() if callable(getter) else getattr(sd, "sheet_symbols", ())
+        for info in symbols or ():
+            if type(info).__name__ == "AltiumSchSheetSymbol":
+                info = _sheet_symbol_info_wrapper(info)
+            rec = _extract_sch_sheet_symbol(info, parent_name, schdoc=sd)
             if rec is not None:
                 out.append(rec)
     return tuple(out)
@@ -1369,23 +1826,109 @@ def list_pcbdoc_paths(prjpcb_path: str | Path) -> list[Path]:
     return list(AltiumPrjPcb(prjpcb_path).get_pcbdoc_paths())
 
 
-def _compile_schematic_netlist(design: AltiumDesign) -> Netlist | None:
-    """Compile the project schematic netlist for local-net name resolution."""
-    if not design.schdocs:
-        return None
-    try:
-        from altium_monkey.altium_netlist_compilation import compile_netlist
-        from altium_monkey.altium_netlist_options import NetlistOptions
+def _compile_schematic_netlist(
+    design: AltiumDesign,
+) -> tuple[Netlist | None, tuple[tuple[str, str], ...]]:
+    """Compile the project schematic netlist for local-net name resolution.
 
-        options = (
-            NetlistOptions.from_prjpcb(design.project)
-            if design.project is not None
-            else NetlistOptions()
-        )
-        return compile_netlist(design.schdocs, design.project, options)
-    except Exception as exc:
-        log.warning("Could not compile schematic netlist: %s", exc)
-        return None
+    Returns ``(netlist, physical_sheet_names)`` where ``physical_sheet_names``
+    maps compiled physical page ids to logical ``*.SchDoc`` names
+    (altium_monkey ≥ 2026.7). The map is empty on releases without a
+    compiled model, and callers must then degrade rather than guess a sheet
+    from an unmapped page id.
+    """
+    if not design.schdocs:
+        return None, ()
+
+    netlist = None
+    compiled = None
+    if hasattr(design, "compile"):
+        # >= 2026.7 exposes the compiled model, which carries the page map.
+        try:
+            compiled = design.compile()
+            netlist = compiled.to_netlist()
+        except Exception as exc:
+            log.warning(
+                "Could not compile schematic netlist via design.compile(): %s",
+                exc,
+            )
+            compiled = None
+    if netlist is None:
+        # Older releases have no compile(). ``to_netlist()`` reaches the same
+        # compiler through the design's OWN options, which carry the merged
+        # per-sheet parameters that net labels substitute. Rebuilding options
+        # with ``NetlistOptions.from_prjpcb()`` drops that merge -- only
+        # ``AltiumDesign.from_prjpcb`` adds it -- which silently renames nets
+        # on a project using =Parameter substitution rather than degrading.
+        try:
+            netlist = design.to_netlist()
+        except Exception as exc:
+            log.warning("Could not compile schematic netlist: %s", exc)
+            return None, ()
+    if netlist is None:
+        return None, ()
+
+    # Harvested separately from the compile: losing the page map must not
+    # throw away a netlist that built cleanly.
+    sheet_names: tuple[tuple[str, str], ...] = ()
+    if compiled is not None:
+        try:
+            sheet_names = _harvest_physical_sheet_names(compiled)
+        except Exception as exc:
+            log.warning(
+                "Could not read the compiled physical-page map (%s); local-net "
+                "sheet matching falls back to alias resolution.", exc,
+            )
+    return netlist, sheet_names
+
+
+def _harvest_physical_sheet_names(compiled) -> tuple[tuple[str, str], ...]:
+    """``(physical page id, logical sheet name)`` pairs from a compiled design.
+
+    Prefers ``source_path`` -- the project-relative path -- over ``file_name``,
+    which is the bare leaf: harvesting the leaf collapses ``SubA/Power.SchDoc``
+    and ``SubB/Power.SchDoc`` onto one name, the very directory collision
+    :func:`~fypa.altium.annotations._sheet_name_matches` exists to keep apart.
+    Falls back to ``file_name`` on a release exposing only that.
+    """
+    pairs: list[tuple[str, str]] = []
+    for doc in (getattr(compiled, "physical_documents", None) or ()):
+        doc_id = getattr(doc, "id", None)
+        name = (getattr(doc, "source_path", None)
+                or getattr(doc, "file_name", None))
+        if doc_id and name:
+            pairs.append((str(doc_id), str(name)))
+    return tuple(pairs)
+
+
+def _collect_schdoc_paths(
+    design: AltiumDesign,
+    prjpcb_path: Path,
+) -> dict[str, str]:
+    """Map unique SchDoc keys → absolute path strings for lazy sheet compiles.
+
+    Primary key is :func:`_schdoc_storage_key` (project-relative, or absolute
+    when outside the tree). When a basename is unique across the project it is
+    also registered so callers that only know ``Child.SchDoc`` still resolve.
+    """
+    root = prjpcb_path.parent
+    entries: list[tuple[str, str, str]] = []
+    basename_counts: dict[str, int] = {}
+    for sch in design.schdocs:
+        if not getattr(sch, "filepath", None):
+            continue
+        abs_path = Path(sch.filepath).resolve()
+        key = _schdoc_storage_key(abs_path, root)
+        base = abs_path.name.lower()
+        entries.append((key, str(abs_path), base))
+        basename_counts[base] = basename_counts.get(base, 0) + 1
+
+    out: dict[str, str] = {}
+    for key, abs_s, base in entries:
+        out[key] = abs_s
+        if basename_counts.get(base, 0) == 1:
+            out[base] = abs_s
+    return out
 
 
 def extract_project(prjpcb_path: str | Path,
@@ -1407,6 +1950,11 @@ def extract_project(prjpcb_path: str | Path,
         raise FileNotFoundError(f"PrjPcb not found: {prjpcb_path}")
 
     log.info("Loading Altium project: %s", prjpcb_path)
+    # Drop annotation memoization from any previous project so a reload of the
+    # same path cannot reuse stale child-sheet / resolver state.
+    from fypa.altium.annotations import clear_annotation_caches
+    clear_annotation_caches()
+
     design = AltiumDesign.from_prjpcb(str(prjpcb_path))
     pcb = design.load_pcbdoc(selector=pcbdoc_selector)
     if pcb is None:
@@ -1425,7 +1973,8 @@ def extract_project(prjpcb_path: str | Path,
     ox_mm = mils_to_mm(origin_x_mils)
     oy_mm = mils_to_mm(origin_y_mils)
 
-    compiled_netlist = _compile_schematic_netlist(design)
+    compiled_netlist, physical_sheet_names = _compile_schematic_netlist(design)
+    schdoc_paths = _collect_schdoc_paths(design, prjpcb_path)
 
     return ExtractedProject(
         prjpcb_path=prjpcb_path,
@@ -1441,8 +1990,12 @@ def extract_project(prjpcb_path: str | Path,
         pcb_components=_extract_pcb_components(pcb, ox_mm, oy_mm),
         nets=_extract_nets(pcb),
         stackup=_extract_stackup(pcb),
-        sch_components=_extract_sch_components(design),
+        sch_components=_extract_sch_components(design, prjpcb_path),
+        sch_sheet_symbols=_extract_sch_sheet_symbols(design),
         compiled_netlist=compiled_netlist,
+        schdoc_paths=schdoc_paths,
+        sheet_netlists={},
+        physical_sheet_names=physical_sheet_names,
         board_origin_mm=Pt2D(ox_mm, oy_mm),
         board_outline=_extract_board_outline(pcb, ox_mm, oy_mm),
         **_plane_rule_kwargs(pcb),
@@ -1478,6 +2031,7 @@ def _summarise(proj: ExtractedProject) -> str:
         f"  nets         : {len(proj.nets):>6}\n"
         f"  stackup rows : {len(proj.stackup):>6}\n"
         f"  sch_components: {len(proj.sch_components):>6}\n"
+        f"  sch_sheet_symbols: {len(proj.sch_sheet_symbols):>6}\n"
         f"  enabled copper layers (Top->Bottom): {enabled_str}\n"
     )
 
