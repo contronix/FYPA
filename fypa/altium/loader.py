@@ -363,6 +363,7 @@ class LoadedProject:
         geometry: list[GeometryLayer] | None = None,
         absorbed_bridges: list[_AbsorbedBridge] | None = None,
         merged_net_names: frozenset[str] | None = None,
+        no_auto_bridge_applied: frozenset[str] | None = None,
     ) -> None:
         self.extracted = extracted
         self.annotations = annotations
@@ -377,6 +378,14 @@ class LoadedProject:
         # owning no copper — anything reasoning about "nets that exist" (the
         # rail list's alias folding, say) has to subtract them.
         self.merged_net_names: frozenset[str] = merged_net_names or frozenset()
+        # Designators the auto-bridge was told to leave open, as applied when
+        # this object was built. The opt-out takes effect during annotation
+        # parsing — the merge it suppresses has already happened by the time
+        # anything downstream could veto it — so a caller reusing a cached
+        # LoadedProject with a *different* set must reload rather than patch.
+        self.no_auto_bridge_applied: frozenset[str] = (
+            no_auto_bridge_applied or frozenset()
+        )
         if geometry is not None:
             # Seed the cached_property's slot so the lazy compute is skipped.
             # Used by altium_viewer._apply_stackup_overrides, which already
@@ -589,6 +598,8 @@ def clone_loaded_for_edit(loaded: LoadedProject) -> LoadedProject:
         annotations=new_annotations,
         geometry=loaded.__dict__.get("geometry"),
         absorbed_bridges=list(loaded.absorbed_bridges),
+        no_auto_bridge_applied=getattr(
+            loaded, "no_auto_bridge_applied", frozenset()),
     )
 
 
@@ -918,29 +929,37 @@ def _directive_to_network(
         switch_leg_nodes: list[tuple[_pp.NodeID, _pp.NodeID, float]] = []
         leg_terminals: list[tuple] = []
         for leg in getattr(d, "switch_path_legs", ()) or ():
-            if leg.coeff == 0.0:
-                continue
+            # Zero-coeff legs are kept so the element's leg list stays index-
+            # aligned with the spec's across an adaptive-gain retune; the
+            # solver stamp skips them.
             node_f, node_t = _pp.NodeID(), _pp.NodeID()
             switch_leg_nodes.append((node_f, node_t, float(leg.coeff)))
-            # Drain (switch node) → f, source (GND) → t.
+            # Current flows leg.p → f → t → leg.n, so the two couplings are
+            # in series: each carries half the part's resistance, or the whole
+            # RDSon would be counted twice.
             r_coup = (
-                float(leg.resistance)
+                float(leg.resistance) / 2.0
                 if leg.resistance and leg.resistance > 0
                 else COUPLING_RESISTANCE_OHM
             )
             leg_terminals.append((leg.p, node_f, r_coup, f"LS_{leg.kind}_P"))
             leg_terminals.append((leg.n, node_t, r_coup, f"LS_{leg.kind}_N"))
+        # An external-FET stage relocates the cut onto the part that carries
+        # the full output current, so the element spans a conductor and its
+        # input draws i_v. The conversion ratio lives in the switch legs.
+        cut_r = getattr(d, "cut_resistance", None)
         element = _pp.VoltageRegulator(
             v_p=node_vp, v_n=node_vn, s_f=node_sf, s_t=node_st,
             voltage=d.voltage, gain=d.gain,
+            input_gain=1.0 if cut_r is not None else None,
             switch_legs=tuple(switch_leg_nodes),
         )
-        # Optional inductor DCR on the input-side coupling (never bridges
-        # IN↔OUT — the lumped regulator *is* the cut).
+        # The cut part's own series resistance (inductor DCR, or RDSon for a
+        # boost's high-side FET) sits on the input-side coupling, where the
+        # element draws i_v — the current that part really carries.
         in_coup = COUPLING_RESISTANCE_OHM
-        dcr = getattr(d, "inductor_dcr", None)
-        if dcr is not None and dcr > 0:
-            in_coup = float(dcr)
+        if cut_r is not None and cut_r > 0:
+            in_coup = float(cut_r)
         conns, aux = _gather(
             (d.out_p, node_vp, SOURCE_COUPLING_RESISTANCE_OHM, "OUT_P"),
             (d.out_n, node_vn, SOURCE_COUPLING_RESISTANCE_OHM, "OUT_N"),
@@ -2002,12 +2021,25 @@ def _replace_regulator_gains(
     loaded: LoadedProject,
     new_gains: dict[tuple[str, int | None], float],
 ) -> None:
+    from fypa.altium.smps_stage import _compute_ls_coeffs
+
     updated: list[DirectiveSpec] = []
     for d in loaded.annotations.directives:
         if isinstance(d, RegulatorSpec):
             key = (d.designator, d.channel_index)
             if key in new_gains:
-                d = dataclasses.replace(d, gain=new_gains[key])
+                gain = new_gains[key]
+                legs = d.switch_path_legs
+                if legs and d.smps_topology:
+                    ls_in, ls_out = _compute_ls_coeffs(d.smps_topology, gain)
+                    legs = tuple(
+                        dataclasses.replace(
+                            leg,
+                            coeff=ls_in if leg.kind == "ls_in" else ls_out,
+                        )
+                        for leg in legs
+                    )
+                d = dataclasses.replace(d, gain=gain, switch_path_legs=legs)
         updated.append(d)
     loaded.annotations.directives = updated
 
@@ -2068,10 +2100,26 @@ def _retune_problem_regulator_gains(problem, loaded) -> bool:
             )
             return False
 
+    for spec, (_net, _i, elem) in zip(specs, sites):
+        if len(elem.switch_legs) != len(spec.switch_path_legs):
+            log.info(
+                "Adaptive gain: switch-leg count changed (%d element vs %d "
+                "spec) — rebuilding the problem instead.",
+                len(elem.switch_legs), len(spec.switch_path_legs),
+            )
+            return False
+
     changed = 0
     for spec, (net, i, elem) in zip(specs, sites):
-        if elem.gain != spec.gain:
-            net.elements[i] = _dc_replace(elem, gain=spec.gain)
+        # Leg coefficients are functions of the gain, so they move with it.
+        new_legs = tuple(
+            (f, t, float(sl.coeff))
+            for (f, t, _c), sl in zip(elem.switch_legs, spec.switch_path_legs)
+        )
+        if elem.gain != spec.gain or new_legs != elem.switch_legs:
+            net.elements[i] = _dc_replace(
+                elem, gain=spec.gain, switch_legs=new_legs,
+            )
             changed += 1
     log.debug("Adaptive gain: retuned %d regulator element(s) in place",
               changed)
@@ -3693,11 +3741,6 @@ _BRIDGE_DESIGNATOR_PREFIXES: tuple[tuple[str, str], ...] = (
     ("CN", "connector"),
     ("SW", "switch"),
 )
-# A bridging part has two terminals. Allow a few more pads for Kelvin-sense
-# shunts and multi-pin connectors that still only span two nets.
-_BRIDGE_MAX_PADS: int = 8
-
-
 def _bridge_part_kind(designator: str) -> str | None:
     """Human-readable part kind for a designator, or ``None`` when the
     prefix isn't one that conducts between nets."""
@@ -3734,6 +3777,7 @@ def collect_bridge_candidates(loaded: LoadedProject) -> list[dict]:
     """
     from fypa.altium.annotations import (
         _component_value_text,
+        _is_nettie_component_kind,
         _zero_ohm_bridge_reason,
     )
 
@@ -3746,6 +3790,15 @@ def collect_bridge_candidates(loaded: LoadedProject) -> list[dict]:
     for d in directives:
         if isinstance(d, ResistorSpec) and d.designator:
             series_by_des[d.designator.strip().upper()] = d
+    # Any directive at all means the user has already told FYPA about this
+    # part, so its copper is in the model however it got there. Narrowing
+    # this to SERIES reports a connector annotated PDN_ROLE=SOURCE as an
+    # unmodelled bridge and tells its author to annotate it.
+    annotated_des = {
+        d.designator.strip().upper()
+        for d in directives
+        if getattr(d, "designator", None)
+    }
     # Designator -> the link the net merge absorbed, if any.
     absorbed_by_des = {
         b.designator.strip().upper(): b
@@ -3809,8 +3862,25 @@ def collect_bridge_candidates(loaded: LoadedProject) -> list[dict]:
         elif absorbed is not None:
             state = "auto"
             resistance = float(absorbed.resistance)
-            why = (_zero_ohm_bridge_reason(params, comp.footprint)
-                   or "Altium ComponentKind marks it a Net Tie")
+            reason = _zero_ohm_bridge_reason(params, comp.footprint)
+            is_nettie = any(
+                _is_nettie_component_kind(getattr(c, "component_kind", 0) or 0)
+                for c in (sch, comp) if c is not None
+            )
+            if reason:
+                why = reason
+            elif is_nettie:
+                why = "Altium ComponentKind marks it a Net Tie"
+            else:
+                # A sub-threshold PDN_R the user wrote themselves lands here.
+                # Blaming Altium metadata the part does not carry sends them
+                # looking in the wrong place.
+                why = (f"its resistance is below {NET_MERGE_RESISTANCE_THRESHOLD_OHM * 1e3:g} "
+                       f"mΩ, so FYPA merged the two nets")
+        elif key in annotated_des:
+            state = "annotated"
+            resistance = None
+            why = "already annotated in Altium — its copper is in the model"
         else:
             state = "unmodelled"
             resistance = None
@@ -3818,10 +3888,15 @@ def collect_bridge_candidates(loaded: LoadedProject) -> list[dict]:
 
         a_active = pair[0] in active
         b_active = pair[1] in active
+        excluded_net = ""
         if state == "unmodelled" and (a_active != b_active):
+            # Whichever end is NOT on a solved rail is the copper the FEM
+            # never sees. Callers quote it back to the user, so it has to be
+            # carried explicitly rather than assumed to be net_b.
+            excluded_net = _net_name(pair[1] if a_active else pair[0])
             impact = (
                 f"joins the solved rail {_net_name(pair[0] if a_active else pair[1])!r} "
-                f"to {_net_name(pair[1] if a_active else pair[0])!r}, which no "
+                f"to {excluded_net!r}, which no "
                 f"directive touches — that copper is left out of the FEM, so "
                 f"the rail's return resistance reads high"
             )
@@ -3841,6 +3916,7 @@ def collect_bridge_candidates(loaded: LoadedProject) -> list[dict]:
             "resistance_ohm": resistance,
             "why": why,
             "impact": impact,
+            "excluded_net": excluded_net,
             "touches_active_rail": bool(a_active or b_active),
             "x_mm": float(anchor.center.x),
             "y_mm": float(anchor.center.y),
@@ -3869,7 +3945,7 @@ def _flag_unannotated_bridges(loaded: LoadedProject) -> list[str]:
             f"annotate it in Altium with PDN_ROLE=SERIES and PDN_R set to "
             f"its actual DC resistance — a ferrite's DCR, a fuse's cold "
             f"resistance, a shunt's marked value); the return path through "
-            f"{rec['net_b']!r} is then solved too. Ignore this if the part "
+            f"{rec['excluded_net']!r} is then solved too. Ignore this if the part "
             f"is genuinely open at DC."
         )
     messages.sort()
@@ -5024,6 +5100,9 @@ def load_project(prjpcb_path: str | Path,
     return LoadedProject(
         extracted=extracted,
         annotations=annotations,
+        no_auto_bridge_applied=frozenset(
+            d.strip().upper() for d in (no_auto_bridge or ())
+        ),
         absorbed_bridges=absorbed_bridges if net_remap else [],
         merged_net_names=frozenset(
             extracted.nets[old].name
