@@ -43,6 +43,7 @@ Vector-field arrows (drawn via the line shader, in world space):
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass
 
 import numpy as np
@@ -51,11 +52,13 @@ from PySide6.QtCore import QElapsedTimer, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
+    QCursor,
     QFont,
     QFontMetricsF,
     QMatrix4x4,
     QPainter,
     QPen,
+    QPixmap,
     QPolygonF,
     QSurfaceFormat,
     QTextDocument,
@@ -273,6 +276,168 @@ _EDITOR_SELECTION_BOX_PX = 2.0 #3.6
 _OUTLINE_WIDTH_PX = 2.0
 
 
+_MARKER_DROP_CURSOR_CACHE: dict = {}
+
+
+def _system_cursor_px() -> int:
+    """Physical pixel size of the platform's pointer image, so a custom
+    cursor matches the real arrow. Windows does NOT scale the pointer with
+    display scaling (125 % still shows a 32 px arrow); only the
+    Accessibility "pointer size" setting, stored as ``CursorBaseSize``,
+    changes it. 32 elsewhere or when the lookup fails."""
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Control Panel\Cursors") as k:
+                px = int(winreg.QueryValueEx(k, "CursorBaseSize")[0])
+            if 16 <= px <= 256:
+                return px
+        except (OSError, ValueError):
+            pass
+    return 32
+
+
+def _windows_arrow_image(px: int):
+    """The live Windows arrow pointer as ``(QImage, hot_x, hot_y)`` at
+    ``px`` physical pixels, or ``None`` off Windows / on any failure.
+    Reading the real bitmap (rather than drawing a look-alike) keeps the
+    badged cursor pixel-identical to the arrow it replaces, hotspot
+    included, under whatever pointer scheme the user has chosen."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes as W
+
+        from PySide6.QtGui import QImage
+
+        class ICONINFO(ctypes.Structure):
+            _fields_ = [("fIcon", W.BOOL), ("xHotspot", W.DWORD),
+                        ("yHotspot", W.DWORD), ("hbmMask", W.HBITMAP),
+                        ("hbmColor", W.HBITMAP)]
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [("biSize", W.DWORD), ("biWidth", W.LONG),
+                        ("biHeight", W.LONG), ("biPlanes", W.WORD),
+                        ("biBitCount", W.WORD), ("biCompression", W.DWORD),
+                        ("biSizeImage", W.DWORD), ("biXPelsPerMeter", W.LONG),
+                        ("biYPelsPerMeter", W.LONG), ("biClrUsed", W.DWORD),
+                        ("biClrImportant", W.DWORD)]
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        user32.LoadImageW.restype = W.HANDLE
+        user32.LoadImageW.argtypes = [W.HINSTANCE, W.LPVOID, W.UINT,
+                                      ctypes.c_int, ctypes.c_int, W.UINT]
+        user32.GetIconInfo.argtypes = [W.HANDLE, ctypes.c_void_p]
+        user32.GetDC.restype = W.HDC
+        user32.GetDC.argtypes = [W.HWND]
+        user32.ReleaseDC.argtypes = [W.HWND, W.HDC]
+        gdi32.GetDIBits.argtypes = [W.HDC, W.HBITMAP, W.UINT, W.UINT,
+                                    ctypes.c_void_p, ctypes.c_void_p, W.UINT]
+        gdi32.DeleteObject.argtypes = [W.HGDIOBJ]
+
+        OCR_NORMAL, IMAGE_CURSOR, LR_SHARED = 32512, 2, 0x8000
+        hcur = user32.LoadImageW(None, ctypes.c_void_p(OCR_NORMAL),
+                                 IMAGE_CURSOR, px, px, LR_SHARED)
+        ii = ICONINFO()
+        if not hcur or not user32.GetIconInfo(hcur, ctypes.byref(ii)):
+            return None
+        try:
+            if not ii.hbmColor:
+                return None  # monochrome scheme — use the drawn arrow
+            hdr = BITMAPINFOHEADER()
+            hdr.biSize = ctypes.sizeof(hdr)
+            hdc = user32.GetDC(None)
+            try:
+                # First call fills in the bitmap's real width / height.
+                if not gdi32.GetDIBits(hdc, ii.hbmColor, 0, 0, None,
+                                       ctypes.byref(hdr), 0):
+                    return None
+                w, h = hdr.biWidth, abs(hdr.biHeight)
+                hdr.biHeight = -h            # top-down rows
+                hdr.biBitCount, hdr.biCompression = 32, 0
+                buf = (ctypes.c_ubyte * (w * h * 4))()
+                if gdi32.GetDIBits(hdc, ii.hbmColor, 0, h, buf,
+                                   ctypes.byref(hdr), 0) != h:
+                    return None
+            finally:
+                user32.ReleaseDC(None, hdc)
+            if not any(buf[3::4]):
+                return None  # colour cursor without alpha — rare; fall back
+            # BGRA bytes == QImage.Format_ARGB32 on little-endian.
+            img = QImage(bytes(buf), w, h, w * 4,
+                         QImage.Format_ARGB32).copy()
+            return img, int(ii.xHotspot), int(ii.yHotspot)
+        finally:
+            for hbm in (ii.hbmMask, ii.hbmColor):
+                if hbm:
+                    gdi32.DeleteObject(hbm)
+    except Exception:
+        return None
+
+
+def _marker_drop_cursor(color: str, up: bool, dpr: float) -> QCursor:
+    """Arrow cursor badged with a small filled role triangle (up for
+    SOURCE, down for SINK) below-right of the tip, so an armed free-marker
+    drop reads at the pointer. The badge sits clear of the hotspot so it
+    never covers the copper being picked.
+
+    On Windows the arrow is the system's own bitmap and hotspot (see
+    :func:`_windows_arrow_image`), so switching cursors doesn't nudge the
+    tip; elsewhere a look-alike is drawn with its tip on pixel (0, 0).
+
+    Built at the platform pointer's *physical* size: Qt scales a cursor
+    pixmap's logical size by the screen's ``dpr``, so the pixmap carries
+    that ratio to cancel it out — otherwise it comes out ``dpr`` times
+    larger than the arrow it stands in for."""
+    px = _system_cursor_px()
+    key = (color, up, round(dpr, 2), px)
+    cur = _MARKER_DROP_CURSOR_CACHE.get(key)
+    if cur is not None:
+        return cur
+    system = _windows_arrow_image(px)
+    if system is not None:
+        img, hot_x, hot_y = system
+        pm = QPixmap.fromImage(img)
+        px = pm.width()
+    else:
+        hot_x = hot_y = 0
+        pm = QPixmap(px, px)
+        pm.fill(Qt.transparent)
+    pm.setDevicePixelRatio(dpr)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    # Drawn on a 32-unit grid (the standard pointer frame), scaled to fit.
+    unit = px / dpr / 32.0
+    p.scale(unit, unit)
+    if system is None:
+        # White-with-black-outline pointer; vertices on pixel centres so
+        # the 1 px outline lands crisp, tip pixel at (0, 0).
+        arrow = [QPointF(0.5, 0.5), QPointF(0.5, 16.5), QPointF(4.5, 12.5),
+                 QPointF(7.5, 18.5), QPointF(9.5, 17.5), QPointF(6.5, 11.5),
+                 QPointF(11.5, 11.5)]
+        p.setPen(QPen(QColor("#000000"), 1.0))
+        p.setBrush(QColor("#ffffff"))
+        p.drawPolygon(QPolygonF(arrow))
+    # Role badge, the same red / blue triangle as the viewport buttons.
+    if up:
+        tri = [QPointF(18.5, 14), QPointF(25, 25), QPointF(12, 25)]
+    else:
+        tri = [QPointF(12, 14.5), QPointF(25, 14.5), QPointF(18.5, 25.5)]
+    p.setPen(QPen(QColor("#101010"), 1.2))
+    p.setBrush(QColor(color))
+    p.drawPolygon(QPolygonF(tri))
+    p.end()
+    # Qt takes the hotspot in logical pixels and multiplies it by ``dpr``
+    # on the way to the platform, so hand it the physical hotspot divided
+    # back down.
+    cur = QCursor(pm, round(hot_x / dpr), round(hot_y / dpr))
+    _MARKER_DROP_CURSOR_CACHE[key] = cur
+    return cur
+
+
 @dataclass
 class LegendRow:
     """One clickable row in the top-right legend chip.
@@ -378,6 +543,14 @@ class GLMeshViewer(QOpenGLWidget):
     editorDragStarted = Signal(float, float)
     editorDragMoved = Signal(float, float)
     editorDragReleased = Signal(float, float)
+    # Editor-mode marquee (rubber-band) selection. A left drag that starts
+    # on empty space - not on a draggable marker - sweeps a dashed box;
+    # the release fires this with the box in world mm plus the modifier
+    # keys held at press time, so the host can replace / extend / trim its
+    # selection. 2D editor mode only, and never alongside ``clicked``
+    # (past the drag threshold the click is already suppressed).
+    #   x0_mm, y0_mm, x1_mm, y1_mm, additive, toggle
+    editorMarqueeSelected = Signal(float, float, float, float, bool, bool)
     # Top-right legend chip row clicked. Carries the row's ``key`` as
     # supplied via :meth:`set_overlay_top_right_legend`. The host uses it
     # to toggle the corresponding marker category's visibility.
@@ -679,21 +852,36 @@ class GLMeshViewer(QOpenGLWidget):
         # unmistakable which mode the user is in. ``paintGL`` picks the
         # clear colour each frame from ``_editor_mode``.
         self._editor_mode: bool = False
-        # World-space (x0, y0, x1, y1) bbox of the selected editor-mode
-        # component, drawn as a yellow selection box; None when nothing
-        # (or a non-component) is selected.
-        self._editor_selection_bbox: tuple[
-            float, float, float, float] | None = None
+        # World-space (x0, y0, x1, y1) bboxes of the selected editor-mode
+        # component(s), each drawn as a yellow selection box. Empty when
+        # nothing (or nothing component-shaped) is selected - a single
+        # click puts one box here, a marquee one per enclosed component.
+        self._editor_selection_bboxes: list[
+            tuple[float, float, float, float]] = []
+        # Live marquee rectangle in *widget pixels* while a rubber-band
+        # drag is in flight, else ``None``. Kept in pixels rather than
+        # world mm so the band tracks the cursor exactly even though a
+        # marquee drag never pans the view.
+        self._marquee_px: tuple[float, float, float, float] | None = None
+        # Modifiers held when the marquee drag began: (additive, toggle).
+        self._marquee_mods: tuple[bool, bool] = (False, False)
         # World-mm closed rings outlining a click-selected copper primitive
         # (viewer mode). Drawn as a dashed yellow polygon over the copper.
         # ``None`` when nothing is selected. A track / arc gets one ring; a
         # region-with-holes gets the outer ring plus one ring per hole.
         self._primitive_selection_rings: list[
             list[tuple[float, float]]] | None = None
+        # The same rings flattened to one (N, 2) array plus each ring's start
+        # index, so the draw projects every point in one numpy pass.
+        self._primitive_selection_xy: np.ndarray | None = None
+        self._primitive_selection_starts: np.ndarray | None = None
         # Red dashed rings around copper that failed FEM meshing — set by the
         # host when a solve aborts on invalid geometry.
         self._mesh_failure_rings: list[
             list[tuple[float, float]]] | None = None
+        # Copper ROI suggestions drawn over the heatmap (see
+        # set_roi_highlights); None when the mode is off.
+        self._roi_highlights: list[dict] | None = None
         # Free-marker drag: the host registers a pure hit-test callback
         # (``world_x, world_y -> bool``); a left press over a marker is
         # claimed as a drag gesture instead of a pan / click, and the
@@ -702,6 +890,11 @@ class GLMeshViewer(QOpenGLWidget):
         self._editor_drag_hit_test = None
         self._editor_drag_active: bool = False
         self._editor_cursor_state: str = "default"
+        # Armed free-marker drop — ``(role, colour)`` while the host's
+        # SOURCE / SINK button (or S / L hotkey) waits for a copper click,
+        # else ``None``. Swaps the idle cursor for an arrow badged with the
+        # role's triangle so the armed state is visible at the pointer.
+        self._armed_marker: tuple[str, str] | None = None
         self._bg_normal = (self._bg_r, self._bg_g, self._bg_b)
         # Editor-mode clear colour, from the coder-tunable _EDITOR_BG_HEX.
         self._bg_editor = QColor(_EDITOR_BG_HEX).getRgbF()[:3]
@@ -1811,11 +2004,28 @@ class GLMeshViewer(QOpenGLWidget):
         if on == self._editor_mode:
             return
         self._editor_mode = on
+        # A mode flip mid-drag would otherwise strand the rubber band.
+        self._marquee_px = None
         # Leaving editor mode cancels any in-progress free-marker drag.
         if not on:
             self._editor_drag_active = False
         self._apply_editor_cursor("default")
         self.update()
+
+    def set_armed_marker(self, role: str | None,
+                         color: str | None = None) -> None:
+        """Show (``role`` + ``color``) or clear (``None``) the armed
+        free-marker drop cursor: the arrow with a small SOURCE up-triangle
+        or SINK down-triangle at its lower right. Only shown in editor
+        mode and only when no other cursor (legend chip hover) applies."""
+        armed = (role, color or "#ffffff") if role else None
+        if armed == self._armed_marker:
+            return
+        self._armed_marker = armed
+        # Re-resolve the idle cursor against the new armed state.
+        if (self._editor_cursor_state == "default"
+                or self._editor_cursor_state.startswith("armed:")):
+            self._apply_editor_cursor("default")
 
     def set_editor_drag_hit_test(self, hit_test) -> None:
         """Register the host's free-marker hit-test — a callable
@@ -1830,10 +2040,17 @@ class GLMeshViewer(QOpenGLWidget):
         dragging one) and for the top-right legend chip (``"pointing"``
         hovering a clickable row). ``"default"`` resets to the inherited
         cursor. A no-op when unchanged so per-move calls don't churn."""
+        if (state == "default" and self._editor_mode
+                and self._armed_marker is not None):
+            state = "armed:" + self._armed_marker[0]
         if state == self._editor_cursor_state:
             return
         self._editor_cursor_state = state
-        if state == "open":
+        if state.startswith("armed:"):
+            role, color = self._armed_marker
+            self.setCursor(_marker_drop_cursor(
+                color, role != "SINK", self.devicePixelRatioF()))
+        elif state == "open":
             self.setCursor(Qt.OpenHandCursor)
         elif state == "closed":
             self.setCursor(Qt.ClosedHandCursor)
@@ -1843,15 +2060,22 @@ class GLMeshViewer(QOpenGLWidget):
             self.unsetCursor()
 
     def set_editor_selection_bbox(self, bbox) -> None:
-        """Set (or clear, with ``None``) the component bounding box drawn
-        as the editor-mode yellow selection box. ``bbox`` is
-        ``(x0, y0, x1, y1)`` in world mm. A no-op when unchanged so the
-        per-render push doesn't trigger a redundant repaint."""
-        new = (tuple(float(v) for v in bbox)
-               if bbox is not None else None)
-        if new == self._editor_selection_bbox:
+        """Set (or clear, with ``None``) the single component bounding box
+        drawn as the editor-mode yellow selection box. ``bbox`` is
+        ``(x0, y0, x1, y1)`` in world mm. Thin wrapper over
+        :meth:`set_editor_selection_bboxes` for single-selection callers."""
+        self.set_editor_selection_bboxes([] if bbox is None else [bbox])
+
+    def set_editor_selection_bboxes(self, bboxes) -> None:
+        """Set the component bounding boxes drawn as editor-mode yellow
+        selection boxes - one per multi-selected component, or empty to
+        clear. Each is ``(x0, y0, x1, y1)`` in world mm. A no-op when
+        unchanged so the per-render push does not trigger a redundant
+        repaint."""
+        new = [tuple(float(v) for v in b) for b in (bboxes or [])]
+        if new == self._editor_selection_bboxes:
             return
-        self._editor_selection_bbox = new
+        self._editor_selection_bboxes = new
         self.update()
 
     def set_primitive_selection_outline(self, rings) -> None:
@@ -1866,6 +2090,18 @@ class GLMeshViewer(QOpenGLWidget):
         if new == self._primitive_selection_rings:
             return
         self._primitive_selection_rings = new
+        # Flattened copy for the per-frame draw: a Tab-expanded selection
+        # can outline a whole net (thousands of rings), too many to project
+        # one point at a time in Python every repaint.
+        kept = [r for r in (new or []) if len(r) >= 2]
+        if kept:
+            self._primitive_selection_xy = np.array(
+                [p for r in kept for p in r], dtype=np.float64)
+            self._primitive_selection_starts = np.cumsum(
+                [0] + [len(r) for r in kept[:-1]], dtype=np.int64)
+        else:
+            self._primitive_selection_xy = None
+            self._primitive_selection_starts = None
         self.update()
 
     def set_mesh_failure_outline(self, rings) -> None:
@@ -1879,6 +2115,16 @@ class GLMeshViewer(QOpenGLWidget):
         if new == self._mesh_failure_rings:
             return
         self._mesh_failure_rings = new
+        self.update()
+
+    def set_roi_highlights(self, items) -> None:
+        """Set (or clear, with ``None``) the Copper ROI suggestions drawn
+        over the heatmap. Each item is a dict with ``kind`` ("widen" — an
+        open polyline along the copper edge, in ``coords``; "parallel" —
+        closed outlines of a region, in ``rings``; "via" — a point),
+        ``x`` / ``y`` (the label anchor), ``rank`` (1-based, drawn as the
+        label), ``selected`` and ``blocked``."""
+        self._roi_highlights = list(items) if items else None
         self.update()
 
     def set_measurement_line(self, x0: float, y0: float,
@@ -3032,7 +3278,9 @@ class GLMeshViewer(QOpenGLWidget):
         painter.setRenderHint(QPainter.Antialiasing, True)
         self._draw_editor_grid(painter)
         self._draw_editor_selection(painter)
+        self._draw_editor_marquee(painter)
         self._draw_mesh_failure_outline(painter)
+        self._draw_roi_highlights(painter)
         self._draw_primitive_selection(painter)
         self._draw_overlay_labels(painter, on_top=False)
         self._draw_markers(painter)
@@ -3104,26 +3352,51 @@ class GLMeshViewer(QOpenGLWidget):
         painter.restore()
 
     def _draw_editor_selection(self, painter: QPainter) -> None:
-        """Yellow box around the editor-mode component selection — the
+        """Yellow box around each editor-mode component selection - the
         component's world-space bounding box projected to the screen, so
         it tracks pan / zoom (and the camera in 3D). Same yellow + pixel
-        thickness as the selected source / sink marker's box."""
-        if not self._editor_mode or self._editor_selection_bbox is None:
+        thickness as the selected source / sink marker's box. A marquee
+        selection draws one box per enclosed component."""
+        if not self._editor_mode or not self._editor_selection_bboxes:
             return
-        x0, y0, x1, y1 = self._editor_selection_bbox
-        poly = QPolygonF()
-        for wx, wy in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
-            px, py = self.world_to_screen(wx, wy, 0.0)
-            if px < -1e8 or py < -1e8:   # a corner is behind the camera
-                return
-            poly.append(QPointF(px, py))
         painter.save()
         pen = QPen(QColor("#ffff00"))
         pen.setWidthF(_EDITOR_SELECTION_BOX_PX)
         pen.setJoinStyle(Qt.MiterJoin)
         painter.setPen(pen)
         painter.setBrush(Qt.NoBrush)
-        painter.drawPolygon(poly)
+        for x0, y0, x1, y1 in self._editor_selection_bboxes:
+            poly = QPolygonF()
+            behind = False
+            for wx, wy in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+                px, py = self.world_to_screen(wx, wy, 0.0)
+                if px < -1e8 or py < -1e8:   # a corner is behind the camera
+                    behind = True
+                    break
+                poly.append(QPointF(px, py))
+            if not behind:
+                painter.drawPolygon(poly)
+        painter.restore()
+
+    def _draw_editor_marquee(self, painter: QPainter) -> None:
+        """Dashed rubber-band rectangle for an in-flight marquee drag.
+
+        Drawn in widget pixels (the band follows the cursor, and a marquee
+        drag never pans) with a faint translucent fill so the swept area
+        reads at a glance against the copper underneath."""
+        if self._marquee_px is None:
+            return
+        x0, y0, x1, y1 = self._marquee_px
+        rect = QRectF(QPointF(min(x0, x1), min(y0, y1)),
+                      QPointF(max(x0, x1), max(y0, y1)))
+        painter.save()
+        painter.setBrush(QColor(255, 255, 0, 28))
+        pen = QPen(QColor("#ffff00"))
+        pen.setWidthF(1.0)
+        pen.setCosmetic(True)
+        pen.setStyle(Qt.DashLine)
+        painter.setPen(pen)
+        painter.drawRect(rect)
         painter.restore()
 
     def _draw_mesh_failure_outline(self, painter: QPainter) -> None:
@@ -3154,14 +3427,111 @@ class GLMeshViewer(QOpenGLWidget):
             painter.drawPolygon(poly)
         painter.restore()
 
+    # Copper ROI overlay colours: widen / parallel / via, and the blocked
+    # (not feasible as drawn) variant of any of them.
+    _ROI_COLORS: dict[str, str] = {
+        "widen": "#00e5ff", "parallel": "#ff4fd8", "via": "#ffd600",
+    }
+    _ROI_BLOCKED_COLOR: str = "#9e9e9e"
+
+    def _draw_roi_highlights(self, painter: QPainter) -> None:
+        """Copper ROI suggestions: a solid line along an edge worth widening,
+        a dashed outline round a region worth a parallel layer, a ring on a
+        via worth doubling — each tagged with its rank in the list."""
+        items = self._roi_highlights
+        if not items:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        font = painter.font()
+        font.setBold(True)
+        painter.setFont(font)
+
+        def _proj(wx, wy):
+            px, py = self.world_to_screen(wx, wy, 0.0)
+            if px < -1e8 or py < -1e8:
+                return None
+            return QPointF(px, py)
+
+        # Unselected first, so the selected one is drawn on top.
+        for item in sorted(items, key=lambda it: bool(it.get("selected"))):
+            sel = bool(item.get("selected"))
+            color = QColor(self._ROI_BLOCKED_COLOR if item.get("blocked")
+                           else self._ROI_COLORS.get(item.get("kind"), "#ffffff"))
+            pen = QPen(QColor("#ffffff") if sel else color)
+            pen.setCosmetic(True)
+            pen.setWidthF(5.0 if sel else 3.0)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            kind = item.get("kind")
+            if kind == "parallel":
+                pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            if kind == "via":
+                c = _proj(item.get("x", 0.0), item.get("y", 0.0))
+                if c is not None:
+                    r = 11.0 if sel else 8.0
+                    painter.drawEllipse(c, r, r)
+            elif kind == "parallel":
+                for ring in item.get("rings") or []:
+                    pts = [p for p in (_proj(x, y) for x, y in ring)
+                           if p is not None]
+                    if len(pts) >= 3:
+                        painter.drawPolygon(QPolygonF(pts))
+            else:
+                pts = [p for p in (_proj(x, y)
+                                   for x, y in item.get("coords") or [])
+                       if p is not None]
+                if len(pts) >= 2:
+                    painter.drawPolyline(QPolygonF(pts))
+            anchor = _proj(item.get("x", 0.0), item.get("y", 0.0))
+            if anchor is not None and item.get("rank"):
+                text = str(item["rank"])
+                rect = QRectF(anchor.x() + 8, anchor.y() - 22, 20, 18)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(0, 0, 0, 170))
+                painter.drawRoundedRect(rect, 4, 4)
+                painter.setPen(QPen(QColor("#ffffff") if sel else color))
+                painter.drawText(rect, Qt.AlignCenter, text)
+        painter.restore()
+
     def _draw_primitive_selection(self, painter: QPainter) -> None:
         """Dashed yellow outline around the click-selected copper primitive.
         World-mm rings (set via :meth:`set_primitive_selection_outline`)
         projected to screen each frame, so the dashes track pan / zoom and
         the 3D camera. Works in any view mode; same yellow + thickness as
-        the editor-mode selection box."""
-        if self._primitive_selection_rings is None:
+        the editor-mode selection box.
+
+        Projection is one numpy pass over every ring; rings wholly off
+        screen or behind the 3D camera are culled, and consecutive points
+        landing on the same pixel are dropped, so a Tab-expanded whole-net
+        outline costs roughly what is visible rather than what is selected."""
+        xy = getattr(self, "_primitive_selection_xy", None)
+        starts = getattr(self, "_primitive_selection_starts", None)
+        if xy is None or starts is None or not len(xy):
             return
+        xs, ys = self._project_points_screen(xy[:, 0], xy[:, 1])
+        n = len(xs)
+        ends = np.append(starts[1:], n)
+        # Per-ring screen bbox, and whether any point fell behind the camera.
+        min_x = np.minimum.reduceat(xs, starts)
+        max_x = np.maximum.reduceat(xs, starts)
+        min_y = np.minimum.reduceat(ys, starts)
+        max_y = np.maximum.reduceat(ys, starts)
+        w, h = float(self.width()), float(self.height())
+        on_screen = ((min_x > -1e8) & (min_y > -1e8)
+                     & (max_x >= 0.0) & (min_x <= w)
+                     & (max_y >= 0.0) & (min_y <= h))
+        if not on_screen.any():
+            return
+        # Drop a point when it rounds to the same pixel as its predecessor
+        # in the same ring (ring starts are always kept).
+        rx = np.rint(xs)
+        ry = np.rint(ys)
+        keep = np.ones(n, dtype=bool)
+        keep[1:] = (rx[1:] != rx[:-1]) | (ry[1:] != ry[:-1])
+        keep[starts] = True
         painter.save()
         pen = QPen(QColor("#ffff00"))
         pen.setWidthF(_EDITOR_SELECTION_BOX_PX)
@@ -3170,20 +3540,15 @@ class GLMeshViewer(QOpenGLWidget):
         pen.setCosmetic(True)
         painter.setPen(pen)
         painter.setBrush(Qt.NoBrush)
-        for ring in self._primitive_selection_rings:
-            if len(ring) < 2:
+        for i in np.flatnonzero(on_screen):
+            s, e = int(starts[i]), int(ends[i])
+            m = keep[s:e]
+            px = xs[s:e][m].tolist()
+            py = ys[s:e][m].tolist()
+            if len(px) < 2:
                 continue
-            poly = QPolygonF()
-            ok = True
-            for wx, wy in ring:
-                px, py = self.world_to_screen(wx, wy, 0.0)
-                if px < -1e8 or py < -1e8:   # behind 3D camera
-                    ok = False
-                    break
-                poly.append(QPointF(px, py))
-            if not ok or poly.size() < 2:
-                continue
-            painter.drawPolygon(poly)
+            painter.drawPolygon(QPolygonF(
+                [QPointF(x, y) for x, y in zip(px, py)]))
         painter.restore()
 
     def _draw_measurement_line(self, painter: QPainter) -> None:
@@ -3669,6 +4034,15 @@ class GLMeshViewer(QOpenGLWidget):
             self._press_origin = QPointF(ev.position())
             self._press_center = (self._view_center_x, self._view_center_y)
             self._is_panning = False
+            # Editor-mode marquee: the press landed on empty space (the
+            # marker hit-test above already claimed a press over a marker),
+            # so this drag becomes a rubber band. Latch the modifiers now -
+            # the user may release Shift mid-drag and still expect the
+            # gesture they started.
+            self._marquee_px = None
+            mods = ev.modifiers()
+            self._marquee_mods = (bool(mods & Qt.ShiftModifier),
+                                  bool(mods & Qt.ControlModifier))
             ev.accept()
             return
         if ev.button() == Qt.RightButton:
@@ -3741,6 +4115,15 @@ class GLMeshViewer(QOpenGLWidget):
                 or abs(dy_px) > self._CLICK_DRAG_THRESHOLD_PX
             ):
                 self._is_panning = True
+            # Past the threshold in 2D editor mode the drag is a marquee.
+            # ``_is_panning`` already suppresses the release-click, so the
+            # band costs nothing but the repaint.
+            if (self._is_panning and self._editor_mode
+                    and self._view_mode == "2d"):
+                self._marquee_px = (float(self._press_origin.x()),
+                                    float(self._press_origin.y()),
+                                    float(pos.x()), float(pos.y()))
+                self.update()
 
         # --- Right-button drag ---
         # 2D: pan the orthographic view.
@@ -3847,8 +4230,22 @@ class GLMeshViewer(QOpenGLWidget):
                 ev.accept()
                 return
             was_panning = self._is_panning
+            band = self._marquee_px
             self._press_origin = None
             self._is_panning = False
+            if band is not None:
+                # Commit the marquee. The band is in widget pixels; convert
+                # both corners to world mm here so the host never has to
+                # know about the widget's coordinate system.
+                self._marquee_px = None
+                self.update()
+                wx0, wy0 = self.screen_to_world(band[0], band[1])
+                wx1, wy1 = self.screen_to_world(band[2], band[3])
+                additive, toggle = self._marquee_mods
+                self.editorMarqueeSelected.emit(
+                    wx0, wy0, wx1, wy1, additive, toggle)
+                ev.accept()
+                return
             if not was_panning:
                 wx, wy = self.screen_to_world(ev.position().x(),
                                                 ev.position().y())

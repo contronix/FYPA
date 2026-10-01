@@ -426,6 +426,7 @@ python FYPA.py load        YourBoard.PrjPcb           # full pipeline, readiness
 python FYPA.py solve       YourBoard.PrjPcb out.pkl   # solve + pickle
 python FYPA.py show        out.pkl                    # open viewer on a saved pickle
 python FYPA.py paraview    out.pkl out_dir\           # export to ParaView VTK (writes into a folder)
+python FYPA.py report      out.pkl report.pdf         # design report (.html or .pdf); --fail-on fail for CI
 python FYPA.py gerber-gui  path\to\gerber_folder      # import a board from Gerber + Excellon files
 ```
 
@@ -590,6 +591,10 @@ Users follow the
 [Download (prebuilt Windows binary)](#download-prebuilt-windows-binary)
 instructions above.
 
+For the step-by-step version of this — the pre-tag checklist, TortoiseGit
+steps for creating and pushing the tag, and how to recover from a failed
+run — see [docs/release-process.md](docs/release-process.md).
+
 To build and share a zip without publishing a release, run
 `packaging\build_dist.bat` and send `dist\FYPA.zip` directly.
 
@@ -627,9 +632,33 @@ fypa/                    Application package:
   _clipper_fuse.py       Clipper2-based polygon fuse helper (fast union path)
   editor_directives.py   Editor-mode SOURCE / SINK / SERIES directives
   project_file.py        Read / write the sidecar .fypa project file
-  altium_viewer.py       Qt viewer (side panel, tabs, scale controller)
+  altium_viewer.py       Compatibility facade: re-exports fypa.viewer
+  viewer/                Qt viewer, split by feature:
+    window.py              PdnViewer main window, assembled from the mixins below
+    ui_build.py            Widget tree: sidebar, tab pages, heatmap canvas
+    panels/                Sidebar: physical layers / rails, overlays
+    render.py              Heatmap rendering, current arrows, scale controller
+    markers.py, vias.py    Directive-pin markers, via cylinders / current markers
+    viewport.py            Viewport, hover, 3D toggle, hotkeys
+    probes.py              Voltage-difference tool and hover probes
+    copper_pick.py         Copper click-select and Tab expansion
+    editor/                Editor mode: form, selection, marquee, net focus, ...
+    tabs/                  One module per tab (setup, nodes, vias, bridges, ...)
+    file_menu.py           File menu and project save / open
+    report_export.py       File > Export > Report… dialog and export flow
+    settings_tab.py        Settings tab (shared with the launcher)
+    launcher.py, app.py    Launcher window and the main() entry point
+    project_open.py        Opening projects / solutions / Altium imports
+    solve_worker.py        Background solve + cap-loop workers, solve cache
+    session.py             Window registry, background loaders, replace guards
+    theme.py, prefs.py     Dark / light theme; persisted preferences
+    widgets.py, ...        Shared widgets and helpers (display, overlays, ...)
   gl_mesh_viewer.py      Custom QOpenGLWidget — mesh-on-GPU heatmap canvas
   paraview_export.py     ParaView VTU export
+  report/                Design report: model, pass/fail rules, figures,
+                         HTML and PDF renderers (File > Export > Report…)
+  solution_sampling.py   Pin / via voltage sampling shared by the Nodes and
+                         Vias tabs and the report
   spacemouse_nav.py      3Dconnexion SpaceMouse integration
   navlib_camera.py       NavLib camera adapter for the SpaceMouse
   log_buffer.py          In-memory log capture for the Messages tab

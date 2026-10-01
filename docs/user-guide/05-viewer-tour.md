@@ -109,7 +109,7 @@ the Topology tab (or one of its controls) has focus.
 > On the Topology tab, plain wheel scrolls and **Ctrl**+wheel zooms,
 > matching browser and document-viewer conventions.
 
-## 5.4 The four display modes
+## 5.4 The display modes
 
 Switching the mode dropdown (or pressing **M** to cycle, **Shift+M**
 to cycle back) changes what each mesh vertex's colour represents:
@@ -120,6 +120,7 @@ to cycle back) changes what each mesh vertex's colour represents:
 | **Voltage Drop**   | V        | Signed drop relative to the rail's source. Useful for "how much voltage have I lost between J1 and U5?" |
 | **Current Density**| A / mm   | Magnitude of the current density vector `|J|` at every node. Highlights bottlenecks. |
 | **Power Density**  | W / mm²  | Resistive power dissipation per unit area. Highlights hot spots — where copper will warm up. |
+| **Via Current**    | A        | Current through each via; the copper is drawn grey as context. |
 
 > Current Density and Power Density tend to spike sharply at narrow
 > tracks and pad corners. The colour scale auto-clips the top end on
@@ -144,6 +145,45 @@ The table is sortable — click a column header to sort by it. Sorting
 by Margin ascending is the fastest way to find which pin is closest
 to falling below its limit.
 
+Right-click a SINK row and choose *Show fixes for …* to open the
+**Fixes** tab on that load.
+
+### The Fixes tab — where would copper help?
+
+The heatmap shows where current flows. The **Fixes** tab answers the
+question you ask next: *for this load, where would extra copper cut its
+drop the most?* Copper carrying another load's current, or copper beyond
+the load, scores nothing.
+
+- **Loads** (left) — every SINK, worst first, by how much of its drop
+  budget it uses. The budget is `nominal − PDN_MIN_V` when the sink has
+  a `PDN_MIN_V`, otherwise 5 % of the rail's nominal voltage. Over-budget
+  loads are red. The drop is the same number the design report shows.
+- **Fixes** (right) — for the selected load, ranked by the voltage each
+  would gain:
+  - **Widen** — push this copper edge out by 0.25 mm. For a trace,
+    either edge.
+  - **Add layer** — a stitched parallel copy of the copper, same weight,
+    on another layer. The layers with room for it are named.
+  - **Add via** — another via beside this one.
+
+  Fixes that would run into another net's copper are greyed and listed
+  last. Click **Go** to jump to a fix on the heatmap.
+
+**Show fixes on the heatmap** draws every fix of the selected load over
+whatever mode the heatmap is in — a line along an edge to widen, a dashed
+outline round copper to parallel, a ring on a via — numbered as in the
+table. **Show value map** colours the heatmap by where parallel copper
+would help the load most (volts gained per mm²) instead of the Mode
+quantity; choosing a mode turns it off.
+
+The ranking comes from one extra ("adjoint") solve per load, done with
+the main solve, so it adds little to solve time. The estimates are
+**first order**: they hold well for modest changes (a widen estimate on
+a test trace was within 1 % of re-solving with the trace widened; a
+parallel-layer estimate within 10 %) and are optimistic for large ones.
+Re-solve to confirm a fix.
+
 ## 5.6 The Vias tab
 
 One row per via on the board, with the current flowing through it.
@@ -166,7 +206,7 @@ did not abort the run but is worth knowing about. Examples:
 - Net names referenced in `PDN_*` parameters that were not found on
   the PCB (and were therefore skipped).
 - Editor directives that could not be applied (skipped, not aborted —
-  see [Section 2.8](02-sources-and-sinks-editor.md#28-troubleshooting)).
+  see [Section 2.9](02-sources-and-sinks-editor.md#29-troubleshooting)).
 - Solver warnings about near-singular matrices, suspicious gradients,
   etc.
 
@@ -195,7 +235,8 @@ controls, node / via tables, messages, and settings.
 | Clamp the colour scale          | Drag the two handles on the colour strip, or type values into the **Min** / **Max** boxes on the Setup tab. |
 | Click a piece of copper         | Selects it — the bottom bar reports the net, the area, and (where applicable) the layer-local current. |
 | Click a marker                  | Reports the directive value (source voltage, sink current, etc.) in the bottom bar. |
-| Resolve after editor edits      | Click the green **↻ Resolve** button at the top-left of the viewport (see [Section 2.6](02-sources-and-sinks-editor.md#26-re-solving-and-saving)). |
+| Left-drag on empty board (editor mode, 2D) | Rubber-band selects every PDN marker fully inside the box, for editing several sinks at once (see [Section 2.6](02-sources-and-sinks-editor.md#26-editing-several-sinks-at-once)). |
+| Resolve after editor edits      | Click the green **↻ Resolve** button at the top-left of the viewport (see [Section 2.7](02-sources-and-sinks-editor.md#27-re-solving-and-saving)). |
 
 ## 5.11 Hotkeys worth remembering
 
@@ -212,6 +253,7 @@ controls, node / via tables, messages, and settings.
 | **2 / 3**    | Switch the viewport to 2-D / 3-D mode.                                |
 | **0**        | Reset the 3-D camera.                                                 |
 | **E**        | Toggle editor mode (see [Section 2.2](02-sources-and-sinks-editor.md#22-entering-editor-mode)). |
+| **S** / **L** | In editor mode, arm a free **S**OURCE / sink (**L**oad) drop — the keyboard equivalent of the red / blue triangle buttons. |
 | **Ctrl+S**   | Save the project (the dialog offers project-only or project+solution). |
 
 The Help tab inside the viewer has the authoritative, always-current
